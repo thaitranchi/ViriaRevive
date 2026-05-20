@@ -1,5 +1,6 @@
 import yt_dlp
 from pathlib import Path
+import time
 from config import DOWNLOADS_DIR
 
 # Prefer H.264 (avc1) which every ffmpeg supports.
@@ -28,4 +29,7 @@ def download_video(url: str, output_dir: Path = DOWNLOADS_DIR) -> Path:
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
         filename = ydl.prepare_filename(info)
-        return Path(filename)
+        path = Path(filename)
+        if path.exists():
+            time.sleep(0.2) # Small breath for OS to release handle
+        return path

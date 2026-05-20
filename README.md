@@ -16,7 +16,7 @@
 <p align="center">
   <strong>Turn long-form YouTube videos into viral short-form clips — automatically.</strong>
   <br>
-  Detect the best moments, crop to 9:16, add stylish subtitles, generate AI titles, and schedule uploads to YouTube — all from one app.
+  Detect the best moments, export exact 1080x1920 Shorts, add stylish subtitles, generate AI titles, and schedule uploads to YouTube — all from one app.
 </p>
 
 <br>
@@ -39,8 +39,9 @@ No cloud services needed — everything runs locally on your machine.
 
 ### Clip Generation
 - **Smart Moment Detection** — Finds the most viral-worthy segments using audio energy analysis + scene change detection
-- **Vertical Auto-Crop (9:16)** — YOLO-powered person detection keeps subjects perfectly centered
-- **Batch Processing** — Generate 3-10 clips per video, configurable duration (15-60s)
+- **Local AI Detector** — Optionally reranks transcript-backed candidates with Ollama before clips are rendered
+- **Shorts-Ready 1080x1920 Output** — YOLO-powered 9:16 person crop with exact vertical export
+- **Batch Processing** — Generate 3-10 clips per video, capped at 60 seconds for Shorts
 - **Multi-URL Queue** — Process multiple videos in one batch
 
 ### Subtitles & Styling
@@ -48,7 +49,8 @@ No cloud services needed — everything runs locally on your machine.
 - **3 Built-in Styles** — TikTok, Clean, and Bold
 - **Whisper Transcription** — Accurate speech-to-text powered by Faster-Whisper
 
-### AI Title Generation
+### Local AI
+- **AI Detector** — Uses local Ollama to score candidate transcripts for stronger hook/payoff selection
 - **LLM-Powered Titles** — Uses local Ollama models to generate catchy YouTube Shorts titles
 - **Per-Folder Generation** — Generate titles for a specific batch of clips, not everything at once
 - **Smart Fallback** — Works without Ollama using keyword extraction heuristics
@@ -84,7 +86,7 @@ No cloud services needed — everything runs locally on your machine.
 | Video Download | [yt-dlp](https://github.com/yt-dlp/yt-dlp) |
 | Speech-to-Text | [Faster-Whisper](https://github.com/SYSTRAN/faster-whisper) |
 | Person Detection | [YOLOv8](https://github.com/ultralytics/ultralytics) + OpenCV |
-| AI Titles | [Ollama](https://ollama.ai/) (local LLM) |
+| Local AI | [Ollama](https://ollama.ai/) (local LLM) |
 | YouTube API | Google API v3 with OAuth 2.0 |
 
 ---
@@ -96,7 +98,7 @@ No cloud services needed — everything runs locally on your machine.
 1. **Python 3.8+** — [Download](https://www.python.org/downloads/)
 2. **FFmpeg** — Must be in your system PATH
    - Windows: Download from [ffmpeg.org](https://ffmpeg.org/download.html), extract, and add the `bin` folder to PATH
-3. **Ollama** *(optional, for AI titles)* — [Download](https://ollama.ai/)
+3. **Ollama** *(optional, for AI detection and titles)* — [Download](https://ollama.ai/)
 
 ### Installation
 
@@ -129,14 +131,36 @@ To enable uploading to YouTube, you need Google OAuth credentials:
 
 ### Ollama Setup *(Optional)*
 
-For AI-powered title generation:
+For AI-powered detection and title generation:
 
 ```bash
 # Install Ollama, then:
 ollama pull qwen2.5:3b
 ```
 
-The app will automatically detect Ollama and use it. Without it, titles are generated using keyword extraction.
+The app will automatically detect Ollama and use it for AI clip reranking and titles. Without it, clip detection falls back to audio/scene heuristics and titles use keyword extraction.
+
+### Performance (Hardware Acceleration)
+
+ViriaRevive auto-detects GPU hardware when available:
+
+| Component | Acceleration | Settings |
+|-----------|--------------|----------|
+| Video encode | NVENC / QSV / AMF (falls back to libx264) | **Video encoder** in Settings |
+| Video decode | D3D11VA / DXVA2 on Windows | Automatic |
+| Person tracking | YOLO on CUDA with batched inference | **Person detection (YOLO)** |
+| Transcription | Faster-Whisper on CUDA | **Whisper device** |
+
+**FFmpeg:** Use a build that includes hardware encoders (e.g. [gyan.dev Windows builds](https://www.gyan.dev/ffmpeg/builds/)). If quality looks off with GPU encoding, set **Video encoder** to **CPU (libx264)**.
+
+**Whisper GPU on Windows:** Install PyTorch with CUDA support separately if you want GPU transcription (`pip install torch` with the CUDA wheel from [pytorch.org](https://pytorch.org/)).
+
+**Manual verification checklist:**
+
+1. Process one clip with crop + subtitles; note render time in the console.
+2. Set **Video encoder** to **CPU (libx264)** and repeat; compare times.
+3. Enable vertical crop on a horizontal video; confirm person tracking still works.
+4. With an NVIDIA GPU, confirm startup log shows `encoder=h264_nvenc` and `whisper=cuda/float16`.
 
 ### Launch
 
@@ -168,6 +192,9 @@ python main.py "https://youtube.com/watch?v=VIDEO_ID"
 # With options
 python main.py "URL" --clips 5 --duration 30 --style bold
 
+# Force heuristic-only detection
+python main.py "URL" --ai-detector off
+
 # Generate + upload
 python main.py "URL" --upload --schedule 24
 ```
@@ -187,6 +214,8 @@ ViriaRevive/
 ├── main.py                 # CLI entry point
 ├── api_bridge.py           # Python <-> JS bridge
 ├── detector.py             # Viral moment detection
+├── ollama_detector.py      # Local AI candidate reranking
+├── ollama_client.py        # Shared Ollama HTTP helper
 ├── clipper.py              # FFmpeg clip extraction
 ├── cropper.py              # YOLO face detection + 9:16 crop
 ├── transcriber.py          # Faster-Whisper integration

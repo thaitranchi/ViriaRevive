@@ -1,16 +1,24 @@
 @echo off
-echo === ViriaRevive Build ===
+set "MODE=%~1"
+if "%MODE%"=="" set "MODE=release"
+
+echo === ViriaRevive Build [%MODE%] ===
 echo.
 
 REM Activate venv
 call venv\Scripts\activate.bat
 
 REM Generate tray icon first
-python -c "from tray import _create_icon_image; _create_icon_image(); print('[+] Tray icon generated')"
+python -c "from tray import _create_icon_image; _create_icon_image(); print('[+] Tray icon generated')" || (echo [!] Failed to generate tray icon. && pause && exit /b 1)
 
 REM Build with PyInstaller
 echo [*] Building with PyInstaller...
-pyinstaller viria.spec --noconfirm --clean
+if "%MODE%"=="debug" (
+    set "VIRIA_DEBUG=1"
+    pyinstaller viria.spec --noconfirm --clean --debug=all
+) else (
+    pyinstaller viria.spec --noconfirm --clean
+)
 
 echo.
 if exist "dist\ViriaRevive\ViriaRevive.exe" (

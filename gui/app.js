@@ -29,10 +29,78 @@ const state = {
     pendingDeleteFilename: null,
     pendingDeleteSource: null, // 'results' | 'library' | 'preview'
     // Batch queue
-    batchQueue: [],       // [{url, status: 'pending'|'active'|'done'|'error', label}]
+    batchQueue: [],       // [{url, label, status, isFile?}]
     batchIndex: -1,       // current index being processed (-1 = not running)
     batchSettings: null,  // settings snapshot for the batch run
+    inputMode: 'url',     // 'url' | 'file'
+    selectedVideoPath: null,
 };
+
+const ALLOWED_VIDEO_EXT = new Set(['.mp4', '.mkv', '.mov', '.webm']);
+
+function isAllowedVideoPath(p) {
+    if (!p || typeof p !== 'string') return false;
+    const lower = p.toLowerCase();
+    const dot = lower.lastIndexOf('.');
+    if (dot < 0) return false;
+    return ALLOWED_VIDEO_EXT.has(lower.slice(dot));
+}
+
+function looksLikeVideoUrl(line) {
+    const u = (line || '').trim();
+    return /^https?:\/\//i.test(u);
+}
+
+function showErrorDialog(title, message) {
+    const t = document.getElementById('error-dialog-title');
+    const m = document.getElementById('error-dialog-message');
+    if (t) t.textContent = title || 'Error';
+    if (m) m.textContent = message || '';
+    showModal('error-dialog-modal');
+}
+
+function setGenerateButtonBusy(busy) {
+    const btn = document.getElementById('btn-generate');
+    if (!btn) return;
+    btn.disabled = !!busy;
+}
+
+function setDownloadStageLabel(isLocal) {
+    const el = document.getElementById('stage-label-download');
+    if (el) el.textContent = isLocal ? 'Loading' : 'Download';
+}
+
+function clearInputStateForModeSwitch() {
+    state.batchQueue = [];
+    state.batchIndex = -1;
+    state.selectedVideoPath = null;
+    const ta = document.getElementById('url-input');
+    if (ta) { ta.value = ''; ta.style.height = 'auto'; }
+    const sp = document.getElementById('selected-file-path');
+    if (sp) {
+        sp.textContent = 'No file selected';
+        sp.removeAttribute('title');
+    }
+    const bq = document.getElementById('batch-queue');
+    if (bq) bq.classList.add('hidden');
+}
+
+function setInputMode(mode) {
+    if (mode !== 'url' && mode !== 'file') return;
+    if (mode !== state.inputMode) {
+        const hasUrl = document.getElementById('url-input')?.value.trim();
+        if (state.batchQueue.length || state.selectedVideoPath || hasUrl) {
+            clearInputStateForModeSwitch();
+        }
+    }
+    state.inputMode = mode;
+    document.getElementById('panel-input-url')?.classList.toggle('hidden', mode !== 'url');
+    document.getElementById('panel-input-file')?.classList.toggle('hidden', mode !== 'file');
+    document.querySelectorAll('input[name="input-mode"]').forEach(r => {
+        r.checked = (r.value === mode);
+    });
+    setDownloadStageLabel(mode === 'file');
+}
 
 /* ── Thumbnail generator (queued + lazy) ─────────────────────────────── */
 
@@ -159,6 +227,7 @@ window.addEventListener('pywebviewready', async () => {
     try {
         const deps = await pywebview.api.check_dependencies();
         if (!deps.ffmpeg) showModal('ffmpeg-modal');
+        updateHwEncoderStatus(deps);
 
         // Backend (viria_state.json) is the source of truth for settings.
         // localStorage is a fallback for first-run only.
@@ -201,12 +270,12 @@ window.addEventListener('pywebviewready', async () => {
 // When window is restored from minimized/hidden, flush any queued JS calls
 document.addEventListener('visibilitychange', async () => {
     if (!document.hidden && window.pywebview && pywebview.api) {
-        try { await pywebview.api.flush_pending_js(); } catch (_) {}
+        try { await pywebview.api.flush_pending_js(); } catch (_) { }
     }
 });
 window.addEventListener('focus', async () => {
     if (window.pywebview && pywebview.api) {
-        try { await pywebview.api.flush_pending_js(); } catch (_) {}
+        try { await pywebview.api.flush_pending_js(); } catch (_) { }
     }
 });
 
@@ -214,7 +283,7 @@ window.addEventListener('focus', async () => {
 document.getElementById('url-input')?.addEventListener('keydown', e => {
     if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
         e.preventDefault();
-        startProcessing();
+        if (state.inputMode === 'url') startProcessing();
     }
 });
 
@@ -228,10 +297,11 @@ document.getElementById('url-input')?.addEventListener('input', e => {
 // Auto-detect paste of multiple URLs and add to queue
 document.getElementById('url-input')?.addEventListener('paste', e => {
     setTimeout(() => {
+        if (state.inputMode !== 'url') return;
         const val = document.getElementById('url-input').value;
         const lines = val.split('\n').map(l => l.trim()).filter(l => l);
         if (lines.length > 1) {
-            lines.forEach(url => addToBatchQueue(url));
+            lines.forEach(url => addToBatchQueue(url, false));
             document.getElementById('url-input').value = '';
         }
     }, 50);
@@ -248,7 +318,7 @@ document.getElementById('set-auto-clips')?.addEventListener('change', e => {
 
 // Auto-save all settings when any setting input changes
 document.querySelectorAll('#section-settings input, #section-settings select').forEach(el => {
-    el.addEventListener('change', () => { try { gatherSettings(); } catch (_) {} });
+    el.addEventListener('change', () => { try { gatherSettings(); } catch (_) { } });
 });
 
 document.querySelectorAll('.style-option').forEach(opt => {
@@ -285,33 +355,74 @@ function navigateTo(section) {
 async function startProcessing() {
     if (state.processing) return;
 
-    const urlInput = document.getElementById('url-input').value.trim();
+    if (state.inputMode === 'url') {
+        const urlInput = document.getElementById('url-input').value.trim();
 
-    // Build queue from: existing batch queue items + url input
-    if (!state.batchQueue.length && !urlInput) {
-        return toast('Enter a YouTube URL, paste multiple links, or browse files', 'warning');
+        if (!state.batchQueue.length && !urlInput) {
+            showErrorDialog('YouTube URL required', 'Paste at least one video URL (starting with http:// or https://), or add links to the queue with the + button.');
+            return;
+        }
+
+        if (!state.batchQueue.length && urlInput) {
+            const urls = urlInput.split('\n').map(u => u.trim()).filter(u => u);
+            for (const u of urls) {
+                if (!looksLikeVideoUrl(u)) {
+                    showErrorDialog('Invalid URL', 'Each line must be a full URL starting with http:// or https://.');
+                    return;
+                }
+                addToBatchQueue(u, false);
+            }
+            document.getElementById('url-input').value = '';
+        } else if (urlInput && !state.batchQueue.some(q => q.url === urlInput)) {
+            const urls = urlInput.split('\n').map(u => u.trim()).filter(u => u);
+            for (const u of urls) {
+                if (!looksLikeVideoUrl(u)) {
+                    showErrorDialog('Invalid URL', 'Each line must be a full URL starting with http:// or https://.');
+                    return;
+                }
+                addToBatchQueue(u, false);
+            }
+            document.getElementById('url-input').value = '';
+        }
+
+        if (!state.batchQueue.length) {
+            showErrorDialog('Nothing to process', 'Add at least one URL to the queue.');
+            return;
+        }
+    } else {
+        if (!state.batchQueue.length && state.selectedVideoPath) {
+            addToBatchQueue(state.selectedVideoPath, true);
+        }
+        if (!state.batchQueue.length) {
+            showErrorDialog('No video file selected', 'Click “Browse Video File” or use “Multiple Files” to add videos to the queue.');
+            return;
+        }
+        for (const q of state.batchQueue) {
+            if (!q.isFile) {
+                showErrorDialog('Invalid queue', 'In Local File mode the queue must contain only video files.');
+                return;
+            }
+            if (!isAllowedVideoPath(q.url)) {
+                showErrorDialog('Unsupported format', 'Use MP4, MKV, MOV, or WebM only.');
+                return;
+            }
+        }
     }
 
-    // If no batch queue yet, parse the url input (could be multiple lines)
-    if (!state.batchQueue.length && urlInput) {
-        const urls = urlInput.split('\n').map(u => u.trim()).filter(u => u);
-        urls.forEach(u => addToBatchQueue(u));
-        document.getElementById('url-input').value = '';
-    } else if (urlInput && !state.batchQueue.some(q => q.url === urlInput)) {
-        // URL typed while queue exists — add it
-        const urls = urlInput.split('\n').map(u => u.trim()).filter(u => u);
-        urls.forEach(u => addToBatchQueue(u));
-        document.getElementById('url-input').value = '';
-    }
-
-    if (!state.batchQueue.length) return toast('Nothing to process', 'warning');
-
-    // Show style picker modal before starting
     openStylePicker();
 }
 
 function openStylePicker() {
     const currentStyle = document.querySelector('input[name="subtitle-style"]:checked')?.value || 'tiktok';
+
+    // Release any file locks from previous previews before starting new renders
+    const previewVideo = document.getElementById('preview-video');
+    if (previewVideo) {
+        previewVideo.pause();
+        previewVideo.src = '';
+        previewVideo.load();
+    }
+
     document.querySelectorAll('.style-pick-card').forEach(card => {
         const isActive = card.dataset.style === currentStyle;
         card.classList.toggle('active', isActive);
@@ -429,7 +540,7 @@ document.getElementById('wizard-music-enabled')?.addEventListener('change', e =>
 });
 
 async function openMusicFolder() {
-    try { await pywebview.api.open_music_folder(); } catch (_) {}
+    try { await pywebview.api.open_music_folder(); } catch (_) { }
     // Refresh the list after a short delay
     setTimeout(() => loadMusicList(), 1000);
 }
@@ -499,7 +610,7 @@ async function loadWaveform(filename) {
                 const audio = document.getElementById('trimmer-audio');
                 if (audio) audio.src = urlResult.url;
             }
-        } catch (_) {}
+        } catch (_) { }
 
     } catch (e) {
         wrap.innerHTML = '<div class="trimmer-loading">Failed to load waveform</div>';
@@ -752,6 +863,7 @@ function confirmStyleAndGenerate() {
 
     state.processing = true;
     state.batchIndex = -1;
+    setGenerateButtonBusy(true);
 
     document.getElementById('generate-idle').classList.add('hidden');
     document.getElementById('progress-area').classList.remove('hidden');
@@ -764,31 +876,56 @@ function confirmStyleAndGenerate() {
 }
 
 async function cancelProcessing() {
-    try { await pywebview.api.cancel_processing(); } catch (_) {}
-    // Cancel stops the current item; clear the rest of the queue
-    state.batchQueue.forEach(q => { if (q.status === 'pending') q.status = 'cancelled'; });
-    state.batchIndex = -1;
-    renderBatchQueue();
+    try {
+        toast('Cancelling processing...', 'warning');
+        // Signal Python to kill subprocesses
+        await pywebview.api.cancel_processing();
+        
+        // Immediately update UI so it doesn't feel stuck
+        state.batchQueue.forEach(q => { if (q.status === 'pending') q.status = 'cancelled'; });
+        state.batchIndex = -1;
+        renderBatchQueue();
+        resetGenerate();
+    } catch (_) { }
 }
 
 /* ── Batch Queue ──────────────────────────────────────────────────────── */
 
 function addUrlsFromInput() {
+    if (state.inputMode !== 'url') return;
     const textarea = document.getElementById('url-input');
     const val = textarea.value.trim();
     if (!val) return;
     const lines = val.split('\n').map(l => l.trim()).filter(l => l);
-    lines.forEach(url => addToBatchQueue(url));
+    lines.forEach(url => addToBatchQueue(url, false));
     textarea.value = '';
-    textarea.style.height = 'auto'; // reset height after clearing
+    textarea.style.height = 'auto';
 }
 
-function addToBatchQueue(url) {
+function addToBatchQueue(url, isFile = false) {
     if (!url) return;
-    // Avoid duplicates
-    if (state.batchQueue.some(q => q.url === url)) return;
-    const label = url.length > 60 ? url.slice(0, 57) + '...' : url;
-    state.batchQueue.push({ url, label, status: 'pending' });
+    if (state.inputMode === 'url' && !isFile) {
+        if (!looksLikeVideoUrl(url)) {
+            showErrorDialog('Invalid URL', 'URLs must start with http:// or https://.');
+            return;
+        }
+    }
+    if (isFile || state.inputMode === 'file') {
+        if (!isAllowedVideoPath(url)) {
+            showErrorDialog('Unsupported video format', 'Choose a file with extension .mp4, .mkv, .mov, or .webm.');
+            return;
+        }
+        isFile = true;
+    }
+    if (state.batchQueue.some(q => q.url === url && !!q.isFile === !!isFile)) return;
+    let label;
+    if (isFile) {
+        const base = url.replace(/\\/g, '/').split('/').pop() || url;
+        label = base.length > 60 ? base.slice(0, 57) + '...' : base;
+    } else {
+        label = url.length > 60 ? url.slice(0, 57) + '...' : url;
+    }
+    state.batchQueue.push({ url, label, status: 'pending', isFile: !!isFile });
     renderBatchQueue();
 }
 
@@ -805,6 +942,12 @@ function clearBatchQueue() {
     if (state.processing) return toast('Cannot clear queue while processing', 'warning');
     state.batchQueue = [];
     state.batchIndex = -1;
+    state.selectedVideoPath = null;
+    const sp = document.getElementById('selected-file-path');
+    if (sp) {
+        sp.textContent = 'No file selected';
+        sp.removeAttribute('title');
+    }
     renderBatchQueue();
     document.getElementById('batch-queue').classList.add('hidden');
 }
@@ -862,12 +1005,22 @@ async function processNextInQueue() {
     setProgress(0, `Starting${queueLabel}...`);
     document.getElementById('clip-cards').innerHTML = '';
 
+    const isLocal = !!item.isFile;
+    setDownloadStageLabel(isLocal);
+
     try {
-        let r = await pywebview.api.start_processing(item.url, state.batchSettings);
-        // Retry once if "Already processing" (race with previous pipeline's finally block)
+        let r = await pywebview.api.start_processing(
+            isLocal ? '' : item.url,
+            state.batchSettings,
+            isLocal ? item.url : null,
+        );
         if (r.error && r.error.includes('Already processing')) {
             await new Promise(ok => setTimeout(ok, 1500));
-            r = await pywebview.api.start_processing(item.url, state.batchSettings);
+            r = await pywebview.api.start_processing(
+                isLocal ? '' : item.url,
+                state.batchSettings,
+                isLocal ? item.url : null,
+            );
         }
         if (r.error) {
             item.status = 'error';
@@ -888,6 +1041,7 @@ async function processNextInQueue() {
 function _onBatchComplete() {
     state.processing = false;
     state.batchIndex = -1;
+    setGenerateButtonBusy(false);
     document.getElementById('btn-cancel').classList.add('hidden');
 
     const done = state.batchQueue.filter(q => q.status === 'done').length;
@@ -906,39 +1060,53 @@ function _onBatchComplete() {
     pywebview.api.get_results().then(r => {
         state.results = r.clips || [];
         state.moments = r.moments || state.moments;
-    }).catch(() => {});
+    }).catch(() => { });
 }
 
 async function browseFilesMulti() {
     try {
         const r = await pywebview.api.select_files_multiple();
-        if (r && r.paths && r.paths.length) {
-            r.paths.forEach(p => addToBatchQueue(p));
-            // Clear single URL input since we're using queue
-            document.getElementById('url-input').value = '';
+        if (!r || !r.paths || !r.paths.length) return;
+        let bad = 0;
+        for (const p of r.paths) {
+            if (!isAllowedVideoPath(p)) {
+                bad++;
+                continue;
+            }
+            addToBatchQueue(p, true);
         }
-    } catch (_) {}
+        if (bad && bad === r.paths.length) {
+            showErrorDialog('Unsupported format', 'All selected files must be MP4, MKV, MOV, or WebM.');
+        } else if (bad) {
+            toast(`${bad} file(s) skipped — unsupported format`, 'warning');
+        }
+    } catch (_) { }
+}
+
+async function browseVideoFile() {
+    try {
+        const r = await pywebview.api.select_file();
+        if (r && r.path) {
+            if (!isAllowedVideoPath(r.path)) {
+                showErrorDialog('Unsupported format', 'Please choose an MP4, MKV, MOV, or WebM file.');
+                return;
+            }
+            state.selectedVideoPath = r.path;
+            const el = document.getElementById('selected-file-path');
+            if (el) {
+                el.textContent = r.path;
+                el.title = r.path;
+            }
+        }
+    } catch (_) { }
 }
 
 function resetGenerate() {
     state.processing = false;
+    setGenerateButtonBusy(false);
     document.getElementById('generate-idle').classList.remove('hidden');
     document.getElementById('progress-area').classList.add('hidden');
     document.getElementById('btn-cancel').classList.add('hidden');
-}
-
-async function browseFile() {
-    try {
-        const r = await pywebview.api.select_file();
-        if (r && r.path) {
-            if (state.batchQueue.length) {
-                // If queue already has items, add to queue instead
-                addToBatchQueue(r.path);
-            } else {
-                document.getElementById('url-input').value = r.path;
-            }
-        }
-    } catch (_) {}
 }
 
 /* ── Console Panel ────────────────────────────────────────────────────── */
@@ -1053,7 +1221,7 @@ window.onPipelineComplete = function (success, doneCount, totalCount, errorMsg) 
         pywebview.api.get_results().then(r => {
             state.results = r.clips || [];
             state.moments = r.moments || state.moments;
-        }).catch(() => {});
+        }).catch(() => { });
     } else {
         toast(errorMsg || 'Processing failed', 'error');
         addNotification('Processing Failed', errorMsg || 'An error occurred during clip generation', 'error');
@@ -1072,6 +1240,7 @@ window.onPipelineComplete = function (success, doneCount, totalCount, errorMsg) 
 
 window.onPipelineCancelled = function () {
     state.processing = false;
+    setGenerateButtonBusy(false);
     if (state.batchIndex >= 0 && state.batchIndex < state.batchQueue.length) {
         state.batchQueue[state.batchIndex].status = 'error';
     }
@@ -1153,7 +1322,7 @@ window.onScheduleUpdated = function () {
         if (r.scheduled) state.scheduled = r.scheduled;
         renderCalendar();
         renderTimeline();
-    }).catch(() => {});
+    }).catch(() => { });
 };
 
 /* ── Progress Helpers ──────────────────────────────────────────────────── */
@@ -1203,10 +1372,10 @@ function createClipCard(num, total, moment) {
 
 function updateClipCard(num, total, substep, percent, message) {
     let card = document.getElementById(`clip-card-${num}`);
-    if (!card) { const grid = document.getElementById('clip-cards'); card = createClipCard(num, total, state.moments[num-1] || {start:0,end:0,score:0}); grid.appendChild(card); }
-    const labels = { audio: 'Extracting audio', transcribe: 'Transcribing', subtitle: 'Generating subtitles', render: 'Rendering clip' };
+    if (!card) { const grid = document.getElementById('clip-cards'); card = createClipCard(num, total, state.moments[num - 1] || { start: 0, end: 0, score: 0 }); grid.appendChild(card); }
+    const labels = { audio: 'Extracting audio', transcribe: 'Transcribing', subtitle: 'Generating subtitles', render: 'Rendering clips' };
     card.querySelector('.clip-substep').textContent = (percent >= 100 && substep === 'render') ? 'Complete' : (labels[substep] || substep) + '...';
-    card.querySelector('.clip-bar-fill').style.width = (['audio','transcribe','subtitle','render'].indexOf(substep) * 25 + (percent/100) * 25) + '%';
+    card.querySelector('.clip-bar-fill').style.width = (['audio', 'transcribe', 'subtitle', 'render'].indexOf(substep) * 25 + (percent / 100) * 25) + '%';
     card.classList.remove('processing', 'done');
     if (percent >= 100 && substep === 'render') { card.classList.add('done'); card.querySelector('.clip-bar-fill').style.width = '100%'; }
     else card.classList.add('processing');
@@ -1256,13 +1425,17 @@ function _buildResultCard(clip, i) {
         </div>
         <div class="result-card-info">
             <div class="result-card-top">
-                <span class="result-clip-num">Clip ${i+1}</span>
+                <span class="result-clip-num">Clip ${i + 1}</span>
                 <span class="clip-score ${sc}">${score.toFixed(2)}</span>
             </div>
             <div class="result-filename">${escHtml(clip.filename)}</div>
             <div class="result-meta">
                 ${m.start !== undefined ? `<span>${fmtTime(m.start)} - ${fmtTime(m.end)}</span>` : ''}
                 <span>${clip.size_mb} MB</span>
+            </div>
+            <div class="score-breakdown">
+                ${m.ai_score !== undefined ? `<span class="score-tag ai">AI <b>${(m.ai_score * 1).toFixed(1)}</b></span>` : ''}
+                ${m.visual_score !== undefined ? `<span class="score-tag vis">Visual <b>${(m.visual_score * 10).toFixed(1)}</b></span>` : ''}
             </div>
         </div>`;
     return card;
@@ -1274,7 +1447,7 @@ function toggleFolder(headerEl) {
 }
 
 async function loadResults() {
-    try { const r = await pywebview.api.get_results(); state.results = r.clips || []; state.moments = r.moments || state.moments; } catch (_) {}
+    try { const r = await pywebview.api.get_results(); state.results = r.clips || []; state.moments = r.moments || state.moments; } catch (_) { }
     const grid = document.getElementById('results-grid');
     const empty = document.getElementById('results-empty');
     const countEl = document.getElementById('results-count');
@@ -1337,7 +1510,7 @@ async function loadResults() {
         }
     });
 }
-async function openFolder() { try { await pywebview.api.open_output_folder(); } catch (_) {} }
+async function openFolder() { try { await pywebview.api.open_output_folder(); } catch (_) { } }
 
 /* ── Video Preview ─────────────────────────────────────────────────────── */
 
@@ -1350,7 +1523,7 @@ async function previewClip(idx) {
             video.src = r.url;
             document.getElementById('preview-modal-title').textContent = `Clip ${idx + 1}`;
             showModal('preview-modal');
-            video.play().catch(() => {});
+            video.play().catch(() => { });
         } else {
             toast('Video file not found', 'error');
         }
@@ -1571,7 +1744,7 @@ function previewLibraryClip(filename, url) {
     // Hide delete button in preview for library (use library's own delete)
     document.getElementById('preview-delete-btn').style.display = 'none';
     showModal('preview-modal');
-    video.play().catch(() => {});
+    video.play().catch(() => { });
 }
 
 /* ── YouTube Connection ───────────────────────────────────────────────── */
@@ -1606,7 +1779,7 @@ async function disconnectAccount(accountId) {
         state.ytConnected = hasAccounts;
         updateYtUI(hasAccounts);
         toast('Account removed', 'success');
-    } catch (_) {}
+    } catch (_) { }
 }
 
 function updateYtUI(connected) {
@@ -1718,7 +1891,7 @@ async function loadUploadSection() {
                 state.results = r.clips;
                 state.moments = r.moments || state.moments;
             }
-        } catch (_) {}
+        } catch (_) { }
     }
 
     if (!state.results.length) { empty.style.display = ''; content.classList.add('hidden'); return; }
@@ -1730,7 +1903,7 @@ async function loadUploadSection() {
         const d = await pywebview.api.get_delete_after_upload();
         const cb = document.getElementById('auto-delete-toggle');
         if (cb) cb.checked = !!d.enabled;
-    } catch (_) {}
+    } catch (_) { }
 
     renderClipTray();
     renderTimeline();
@@ -1841,7 +2014,7 @@ function _createTrayClipEl(clip, idx) {
     el.dataset.clipIdx = idx;
     const isScheduled = state.scheduled.some(s => s.clipIdx === idx && !s.uploaded);
     if (isScheduled) el.classList.add('scheduled');
-    el.innerHTML = `<span class="tray-clip-num">C${idx+1}</span><span class="tray-clip-name">${clip.filename}</span><span class="tray-clip-size">${clip.size_mb} MB</span>`;
+    el.innerHTML = `<span class="tray-clip-num">C${idx + 1}</span><span class="tray-clip-name">${clip.filename}</span><span class="tray-clip-size">${clip.size_mb} MB</span>`;
     el.addEventListener('dragstart', e => {
         e.dataTransfer.setData('text/plain', String(idx));
         e.dataTransfer.effectAllowed = 'copy';
@@ -1948,7 +2121,7 @@ function calGoToday() {
 }
 
 function renderCalendar() {
-    const months = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+    const months = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
     document.getElementById('cal-month-label').textContent = `${months[state.calMonth]} ${state.calYear}`;
 
     // Update channel filter tabs
@@ -2156,7 +2329,7 @@ function openDayDetailView(dateStr, dayItems) {
         if (thumbEl) {
             pywebview.api.get_video_url(s.clipIdx).then(r => {
                 if (r && r.url) lazyThumb(thumbEl, r.url);
-            }).catch(() => {});
+            }).catch(() => { });
         }
     });
 
@@ -2595,7 +2768,7 @@ function renderTimeline() {
         else if (s.date < nowStr) missedCount++;
         return { ...s, _idx: i };
     }).filter(s => filter === 'all' || !s.channel_id || s.channel_id === filter)
-      .sort((a, b) => (`${a.date}T${a.time}` > `${b.date}T${b.time}` ? 1 : -1));
+        .sort((a, b) => (`${a.date}T${a.time}` > `${b.date}T${b.time}` ? 1 : -1));
 
     const pendingCount = state.scheduled.length - uploadedCount - missedCount;
 
@@ -2715,7 +2888,7 @@ function uploadOverdueNow() {
 
     if (count > 0) {
         toast(`${count} clip${count > 1 ? 's' : ''} queued for immediate upload`, 'success');
-        try { pywebview.api.start_scheduler(); } catch (_) {}
+        try { pywebview.api.start_scheduler(); } catch (_) { }
     }
 }
 
@@ -2761,7 +2934,7 @@ function openClipPicker(dateStr) {
     state.results.forEach((clip, i) => {
         const item = document.createElement('div');
         item.className = 'clip-picker-item';
-        item.innerHTML = `<span class="tray-clip-num">Clip ${i+1}</span><span class="tray-clip-name">${clip.filename}</span>`;
+        item.innerHTML = `<span class="tray-clip-num">Clip ${i + 1}</span><span class="tray-clip-name">${clip.filename}</span>`;
         item.onclick = () => pickClipForDate(i);
         list.appendChild(item);
     });
@@ -2802,7 +2975,7 @@ function persistSchedule() {
     _cachedNextUpload = null; _nextUploadCacheTime = 0; // invalidate scheduler cache
     try {
         pywebview.api.save_scheduled(state.scheduled);
-    } catch (_) {}
+    } catch (_) { }
 }
 
 /* ── Meta Modal (edit scheduled item) ─────────────────────────────────── */
@@ -2856,7 +3029,7 @@ function removeScheduledItem() {
 /* ── Upload ───────────────────────────────────────────────────────────── */
 
 async function toggleAutoDelete(enabled) {
-    try { await pywebview.api.set_delete_after_upload(enabled); } catch (_) {}
+    try { await pywebview.api.set_delete_after_upload(enabled); } catch (_) { }
 }
 
 async function refreshUploadClips() {
@@ -2866,7 +3039,7 @@ async function refreshUploadClips() {
 }
 
 // Called from Python when a clip is auto-deleted after upload
-window.onClipDeleted = function(clipIdx, filename) {
+window.onClipDeleted = function (clipIdx, filename) {
     toast(`Deleted "${filename}" from disk`, 'info');
     // Refresh the library if visible
     if (document.getElementById('section-library')?.classList.contains('active')) {
@@ -2896,7 +3069,7 @@ async function startUpload() {
     let interval = 24;
     if (sorted.length > 1) {
         const first = new Date(`${sorted[0].date}T${sorted[0].time}`);
-        const last = new Date(`${sorted[sorted.length-1].date}T${sorted[sorted.length-1].time}`);
+        const last = new Date(`${sorted[sorted.length - 1].date}T${sorted[sorted.length - 1].time}`);
         interval = Math.max(1, (last - first) / (3600000 * (sorted.length - 1)));
     }
 
@@ -2933,6 +3106,7 @@ function showYouTubeSetup() { showModal('youtube-modal'); }
 /* ── Settings ──────────────────────────────────────────────────────────── */
 
 function populateSettings(s) {
+    s.clip_duration = parseInt(s.clip_duration || 30);
     // Restore auto-clips checkbox state
     const autoClipsEl = document.getElementById('set-auto-clips');
     const isAuto = s.num_clips === 'auto';
@@ -2953,9 +3127,16 @@ function populateSettings(s) {
     setSlider('set-crf', s.video_crf);
     setSelect('set-model', s.whisper_model);
     setSelect('set-preset', s.ffmpeg_preset);
+    setSelect('set-encoder', s.video_encoder || 'auto');
+    setSelect('set-whisper-device', s.whisper_device || 'auto');
+    setSelect('set-yolo-device', s.yolo_device || 'auto');
+    setSelect('set-ai-detector', s.ai_detector || 'auto');
+    const mode = s.shorts_mode || (s.crop_vertical !== false ? 'crop' : 'none');
+    const shortsToggle = document.getElementById('set-shorts-enabled');
+    if (shortsToggle) shortsToggle.checked = (mode !== 'none');
     setVal('set-language', s.whisper_language || '');
-    const crop = document.getElementById('set-crop-vertical');
-    if (crop) crop.checked = s.crop_vertical !== false;
+    setVal('set-title-language', s.title_language || '');
+    updateEncoderPresetUI();
     const style = s.subtitle_style || 'tiktok';
     document.querySelectorAll('.style-option').forEach(opt => {
         opt.classList.toggle('active', opt.dataset.style === style);
@@ -2971,20 +3152,59 @@ function gatherSettings() {
         min_gap: parseInt(getVal('set-min-gap')),
         whisper_model: getVal('set-model'),
         whisper_language: getVal('set-language') || null,
+        title_language: getVal('set-title-language') || null,
         subtitle_style: document.querySelector('input[name="subtitle-style"]:checked')?.value || 'tiktok',
         ffmpeg_preset: getVal('set-preset'),
         video_crf: getVal('set-crf'),
-        crop_vertical: document.getElementById('set-crop-vertical')?.checked ?? true,
+        video_encoder: getVal('set-encoder'),
+        whisper_device: getVal('set-whisper-device'),
+        yolo_device: getVal('set-yolo-device'),
+        ai_detector: getVal('set-ai-detector') || 'auto',
+        shorts_mode: document.getElementById('set-shorts-enabled')?.checked ? 'crop' : 'none',
+        crop_vertical: document.getElementById('set-shorts-enabled')?.checked
     };
     saveLocal('settings', s);
     // Also persist to Python backend (survives localStorage clears)
-    try { pywebview.api.save_settings(s); } catch (_) {}
+    try { pywebview.api.save_settings(s); } catch (_) { }
     return s;
+}
+
+function setLanguage(lang) {
+    const el = document.getElementById('set-language');
+    if (el) { el.value = lang; gatherSettings(); }
+}
+
+function setTitleLanguage(lang) {
+    const el = document.getElementById('set-title-language');
+    if (el) { el.value = lang; gatherSettings(); }
 }
 
 function resetSettings() {
     localStorage.removeItem('viria_settings');
     pywebview.api.get_settings().then(s => { state.settings = s; populateSettings(s); toast('Settings reset', 'success'); });
+}
+
+function updateHwEncoderStatus(deps) {
+    const el = document.getElementById('hw-encoder-status');
+    if (!el || !deps) return;
+    if (deps.video_encoder_label) {
+        el.textContent = `Detected: ${deps.video_encoder_label}`;
+    } else if (deps.ffmpeg) {
+        el.textContent = 'Encoder will be auto-detected on first render';
+    }
+}
+
+function updateEncoderPresetUI() {
+    const encoder = getVal('set-encoder');
+    const presetRow = document.getElementById('preset-row');
+    const presetLabel = presetRow?.querySelector('label');
+    if (presetRow) {
+        const isCpu = encoder === 'cpu';
+        presetRow.style.display = '';
+        if (presetLabel) {
+            presetLabel.textContent = isCpu ? 'x264 preset' : 'Encoding speed';
+        }
+    }
 }
 
 function updateSliderLabel(el) {
@@ -3008,15 +3228,15 @@ function updateSliderLabel(el) {
 
 /* ── Helpers ───────────────────────────────────────────────────────────── */
 
-function fmtTime(s) { s = Math.round(s); return Math.floor(s/60) + ':' + String(s%60).padStart(2,'0'); }
-function formatNumber(n) { n = parseInt(n)||0; if (n >= 1e6) return (n/1e6).toFixed(1)+'M'; if (n >= 1e3) return (n/1e3).toFixed(1)+'K'; return String(n); }
-function escHtml(s) { return String(s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function fmtTime(s) { s = Math.round(s); return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0'); }
+function formatNumber(n) { n = parseInt(n) || 0; if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M'; if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K'; return String(n); }
+function escHtml(s) { return String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
 function setSlider(id, val) { const el = document.getElementById(id); if (el) { el.value = val; updateSliderLabel(el); } }
 function setSelect(id, val) { const el = document.getElementById(id); if (el) el.value = val; }
 function setVal(id, val) { const el = document.getElementById(id); if (el) el.value = val; }
 function getVal(id) { return document.getElementById(id)?.value ?? ''; }
-function saveLocal(k, d) { try { localStorage.setItem('viria_'+k, JSON.stringify(d)); } catch (_) {} }
-function loadLocal(k, fb) { try { const d = localStorage.getItem('viria_'+k); return d ? JSON.parse(d) : fb; } catch (_) { return fb; } }
+function saveLocal(k, d) { try { localStorage.setItem('viria_' + k, JSON.stringify(d)); } catch (_) { } }
+function loadLocal(k, fb) { try { const d = localStorage.getItem('viria_' + k); return d ? JSON.parse(d) : fb; } catch (_) { return fb; } }
 
 /* ── Toast / Modal ─────────────────────────────────────────────────────── */
 

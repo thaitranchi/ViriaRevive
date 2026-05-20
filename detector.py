@@ -1,9 +1,23 @@
 import subprocess
+import shutil
 import numpy as np
 from pydub import AudioSegment
+import time
 from pathlib import Path
 
-from subprocess_utils import run as _run
+from subprocess_utils import run as _run, is_cancelled, CancelledError
+from hwaccel import input_hwaccel_args
+
+# Explicitly point pydub to ffmpeg/ffprobe binaries found in PATH
+def _sync_pydub_paths():
+    _ffmpeg_path = shutil.which("ffmpeg")
+    _ffprobe_path = shutil.which("ffprobe")
+    if _ffmpeg_path:
+        AudioSegment.converter = _ffmpeg_path
+    if _ffprobe_path:
+        AudioSegment.ffprobe = _ffprobe_path
+
+_sync_pydub_paths()
 
 
 def find_viral_moments(
@@ -14,20 +28,53 @@ def find_viral_moments(
 ) -> list:
     """Find viral moments using audio energy + scene change analysis (no AI)."""
 
-    print("[*] Analyzing audio energy...")
-    audio = AudioSegment.from_file(str(video_path))
-    total_seconds = len(audio) // 1000
+    print("[*] Analyzing audio energy (waiting for file access)...")
+    
+    # Windows can sometimes hold a lock on newly downloaded files (antivirus/indexing).
+    # Wait up to 5 seconds for the file to become readable.
+    for _ in range(10):
+        try:
+            with open(video_path, 'rb'): break
+        except OSError:
+            time.sleep(0.5)
+
+    _sync_pydub_paths()  # Refresh paths in case they were updated during runtime
+    try:
+        if not video_path.exists():
+            raise FileNotFoundError(f"Video file not found: {video_path}")
+            
+        resolved_path = str(video_path.resolve())
+        audio = AudioSegment.from_file(resolved_path)
+    except Exception as e:
+        if isinstance(e, IndexError):
+            detail = " (no audio stream found or file corrupted)"
+        else:
+            error_msg = str(e).lower()
+            detail = " (ffprobe/ffmpeg missing or path issue)" if "ffprobe" in error_msg or "ffmpeg" in error_msg or "no such file" in error_msg else f" ({e})"
+        print(f"[!] Audio analysis unavailable{detail}. Using fallback detection.")
+        total_seconds = _video_duration_seconds(video_path)
+        audio = None
+    else:
+        total_seconds = len(audio) // 1000
 
     if total_seconds < 10:
         print("[!] Video too short for analysis")
         return []
 
-    # --- Audio RMS energy (1-second windows) ---
-    window_ms = 1000
-    energies = np.array(
-        [audio[i : i + window_ms].rms for i in range(0, len(audio), window_ms)],
-        dtype=float,
-    )
+    if audio is None:
+        energies = np.zeros(total_seconds, dtype=float)
+    else:
+        # --- Audio RMS energy (1-second windows) ---
+        window_ms = 1000
+        energies_list = []
+        for i in range(0, len(audio), window_ms):
+            if is_cancelled():
+                raise CancelledError("Audio analysis cancelled")
+            energies_list.append(audio[i : i + window_ms].rms)
+        energies = np.array(energies_list, dtype=float)
+
+    if len(energies) == 0:
+        return _fallback_moments(total_seconds, num_clips, clip_duration, min_gap)
 
     # Smooth
     kernel = np.ones(5) / 5
@@ -44,6 +91,9 @@ def find_viral_moments(
 
     # --- Scene change density ---
     print("[*] Analyzing scene changes...")
+    if is_cancelled():
+        raise CancelledError("Moment detection cancelled before scene analysis")
+        
     scene_density = _scene_change_density(video_path, len(energies))
 
     # --- Combine (normalize each to 0-1) ---
@@ -80,6 +130,9 @@ def find_viral_moments(
 
     clips.sort(key=lambda c: c["start"])
 
+    if not clips:
+        clips = _fallback_moments(total_seconds, num_clips, clip_duration, min_gap)
+
     print(f"[+] Found {len(clips)} viral moments")
     for i, c in enumerate(clips):
         print(f"    Clip {i+1}: {_fmt(c['start'])} - {_fmt(c['end'])}  (score {c['score']:.2f})")
@@ -93,14 +146,20 @@ def _scene_change_density(video_path: Path, length: int) -> np.ndarray:
     """Count scene changes per second using ffmpeg."""
     try:
         cmd = [
-            "ffmpeg", "-i", str(video_path),
+            "ffmpeg",
+            *input_hwaccel_args(),
+            "-i", str(video_path),
+            "-an", "-sn",
             "-vf", "fps=2,select='gt(scene,0.3)',showinfo",
             "-vsync", "vfr", "-f", "null", "-",
             "-threads", "4",
         ]
         r = _run(cmd, capture_output=True, text=True, timeout=600, errors="replace")
+        if r.returncode != 0:
+            print("[!] Scene detection unavailable, using audio only")
+            return np.zeros(length + 1)
         timestamps = []
-        for line in r.stderr.split("\n"):
+        for line in (r.stderr or "").split("\n"):
             if "pts_time:" in line:
                 try:
                     timestamps.append(float(line.split("pts_time:")[1].split()[0]))
@@ -115,9 +174,72 @@ def _scene_change_density(video_path: Path, length: int) -> np.ndarray:
             density[lo:hi] += 1
         return density
 
-    except (subprocess.TimeoutExpired, FileNotFoundError):
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
         print("[!] Scene detection unavailable, using audio only")
         return np.zeros(length + 1)
+
+
+def _video_duration_seconds(video_path: Path) -> int:
+    try:
+        r = _run(
+            [
+                "ffprobe",
+                "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "csv=p=0",
+                str(video_path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            errors="replace",
+        )
+        out = (r.stdout or "0").strip()
+        if not out or out == "0":
+            return 0
+        # Handle cases where ffprobe might return multiple lines or non-numeric output
+        return max(0, int(float(out.split()[0])))
+    except Exception:
+        return 0
+
+
+def _fallback_moments(
+    total_seconds: int,
+    num_clips: int,
+    clip_duration: int,
+    min_gap: int,
+) -> list[dict]:
+    """Return evenly spaced clips when scoring has no usable peaks."""
+    usable_duration = min(clip_duration, total_seconds)
+    if usable_duration <= 0:
+        return []
+
+    if total_seconds <= usable_duration:
+        starts = [0]
+    else:
+        max_start = total_seconds - usable_duration
+        spacing = max(1, usable_duration + min_gap)
+        count = max(1, min(num_clips, max_start // spacing + 1))
+        if count == 1:
+            starts = [max_start // 2]
+        else:
+            starts = [round(i * max_start / (count - 1)) for i in range(count)]
+
+    clips = []
+    for start in starts[:num_clips]:
+        end = min(total_seconds, int(start) + usable_duration)
+        clips.append(
+            {
+                "start": int(start),
+                "end": int(end),
+                "duration": int(end - start),
+                "score": 0.0,
+            }
+        )
+
+    if clips:
+        print("[!] Detector scores were flat; using evenly spaced fallback clips")
+    return clips
 
 
 def _fmt(seconds: int) -> str:

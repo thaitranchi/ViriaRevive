@@ -21,6 +21,7 @@ import yt_dlp
 
 from config import (
     BASE_DIR,
+    AI_DETECTOR_MODE,
     CLIPS_DIR,
     CLIP_DURATION,
     CROP_VERTICAL,
@@ -29,20 +30,29 @@ from config import (
     MIN_GAP,
     MUSIC_DIR,
     NUM_CLIPS,
+    OLLAMA_DETECTOR_CANDIDATE_MULTIPLIER,
+    OLLAMA_DETECTOR_MODEL,
+    OLLAMA_DETECTOR_TIMEOUT,
     SUBTITLE_STYLE,
     SUBTITLES_DIR,
     VIDEO_CRF,
+    VIDEO_ENCODER,
+    WHISPER_DEVICE,
     WHISPER_LANGUAGE,
     WHISPER_MODEL,
+    YOLO_DEVICE,
 )
+from hwaccel import log_hardware_startup, probe_ffmpeg
 from detector import find_viral_moments
+from ollama_detector import detector_ready, rerank_moments
 from transcriber import transcribe_clip, find_sentence_boundary
 from subtitler import generate_subtitles, get_available_styles
 from clipper import (
     extract_clip, extract_audio_clip, ClipResult,
     add_background_music, apply_video_effect, get_effects_list,
+    validate_shorts_output,
 )
-from cropper import get_crop_params, get_crop_params_dynamic, get_dimensions
+from cropper import get_crop_params, get_crop_params_dynamic, get_dimensions, detect_all_persons
 from subprocess_utils import CancelledError
 from title_generator import generate_title, generate_titles_batch, list_ollama_models, ensure_model
 from uploader import (
@@ -58,6 +68,9 @@ from uploader import (
 )
 
 STATE_FILE = BASE_DIR / "viria_state.json"
+
+# Local video input (GUI file picker) — must match frontend allowed extensions
+ALLOWED_INPUT_VIDEO_EXT = {".mp4", ".mkv", ".mov", ".webm"}
 
 
 # ── Log interceptor — captures print() and forwards to the GUI console ───────
@@ -187,6 +200,12 @@ class ApiBridge:
         # Load persisted state from previous session
         self._load_state()
 
+        log_hardware_startup(
+            encoder_pref=self._user_settings.get("video_encoder", VIDEO_ENCODER),
+            yolo_device=self._user_settings.get("yolo_device", YOLO_DEVICE),
+            whisper_device=self._user_settings.get("whisper_device", WHISPER_DEVICE),
+        )
+
     # ── Exposed: config / deps ───────────────────────────────────────────
 
     def get_settings(self):
@@ -200,21 +219,36 @@ class ApiBridge:
             "subtitle_style": SUBTITLE_STYLE,
             "ffmpeg_preset": FFMPEG_PRESET,
             "video_crf": VIDEO_CRF,
-            "crop_vertical": CROP_VERTICAL,
+            "video_encoder": VIDEO_ENCODER,
+            "yolo_device": YOLO_DEVICE,
+            "whisper_device": WHISPER_DEVICE,
+            "crop_vertical": True,
+            "ai_detector": AI_DETECTOR_MODE,
         }
         # Merge saved user overrides (from save_settings)
         if self._user_settings:
             defaults.update(self._user_settings)
+        defaults["crop_vertical"] = True
         return defaults
 
     def save_settings(self, settings):
         """Persist user settings to disk so they survive restarts."""
         self._user_settings = settings or {}
+        self._user_settings["crop_vertical"] = True
         self._save_state()
         return {"ok": True}
 
     def check_dependencies(self):
-        return {"ffmpeg": shutil.which("ffmpeg") is not None}
+        has_ffmpeg = shutil.which("ffmpeg") is not None
+        has_ffprobe = shutil.which("ffprobe") is not None
+        info = {"ffmpeg": has_ffmpeg, "ffprobe": has_ffprobe, "audio_analysis": has_ffmpeg and has_ffprobe}
+        if has_ffmpeg:
+            enc_pref = self._user_settings.get("video_encoder", VIDEO_ENCODER)
+            prof = probe_ffmpeg(enc_pref)
+            info["video_encoder"] = prof.active_encoder
+            info["video_encoder_label"] = prof.active_encoder_label
+            info["hwaccel_decode"] = prof.active_hwaccel
+        return info
 
     def set_delete_after_upload(self, enabled):
         """Toggle auto-delete clips from disk after successful YouTube upload."""
@@ -253,8 +287,9 @@ class ApiBridge:
         if not any(transcripts):
             return {"titles": [], "error": "No transcripts available — process clips first"}
 
+        lang = self._user_settings.get("whisper_language") or WHISPER_LANGUAGE or None
         llm_available = ensure_model(DEFAULT_MODEL)
-        titles = generate_titles_batch(transcripts)
+        titles = generate_titles_batch(transcripts, language=lang)
         return {"titles": titles, "llm": llm_available}
 
     def generate_title_for_clip(self, clip_index):
@@ -275,7 +310,8 @@ class ApiBridge:
 
         if not transcript:
             return {"title": "", "error": "No transcript for this clip"}
-        title = generate_title(transcript)
+        lang = self._user_settings.get("whisper_language") or WHISPER_LANGUAGE or None
+        title = generate_title(transcript, language=lang)
         return {"title": title}
 
     def rename_clip(self, clip_index, new_title):
@@ -400,8 +436,9 @@ class ApiBridge:
             def _on_progress(done, total, title):
                 self._js(f"window.onTitleProgress && window.onTitleProgress({done}, {total}, `{self._esc(title or '')}`)")
 
+            lang = self._user_settings.get("title_language") or self._user_settings.get("whisper_language") or WHISPER_LANGUAGE or None
             titles = generate_titles_batch(
-                transcripts, DEFAULT_MODEL, on_progress=_on_progress
+                transcripts, DEFAULT_MODEL, language=lang, on_progress=_on_progress
             )
 
             renamed = 0
@@ -459,7 +496,9 @@ class ApiBridge:
             wav = Path(tempfile.gettempdir()) / f"viria_backfill_{clip_index}.wav"
             extract_audio_clip(p, 0, 60, wav)  # max 60s
             if wav.exists() and wav.stat().st_size > 1000:
-                words = transcribe_clip(wav, model_size=WHISPER_MODEL, language=None)
+                words = transcribe_clip(
+                    wav, model_size=WHISPER_MODEL, language=None, device_pref=WHISPER_DEVICE,
+                )
                 transcript = " ".join(w.get("text", "") for w in words).strip()
                 if transcript:
                     self._moments[clip_index]["transcript"] = transcript
@@ -621,7 +660,7 @@ class ApiBridge:
 
     # ── Exposed: processing ──────────────────────────────────────────────
 
-    def start_processing(self, url, settings):
+    def start_processing(self, url, settings, file_path=None):
         if self._processing:
             return {"error": "Already processing"}
         self._processing = True
@@ -630,7 +669,11 @@ class ApiBridge:
         reset_cancel()
         # Store pre-existing results count so _run_pipeline appends instead of replacing
         self._results_before = len(self._results)
-        threading.Thread(target=self._run_pipeline, args=(url, settings), daemon=True).start()
+        threading.Thread(
+            target=self._run_pipeline,
+            args=(url, settings, file_path),
+            daemon=True,
+        ).start()
         return {"ok": True}
 
     def cancel_processing(self):
@@ -668,7 +711,7 @@ class ApiBridge:
 
         result = self._window.create_file_dialog(
             webview.OPEN_DIALOG,
-            file_types=("Video files (*.mp4;*.mkv;*.avi;*.mov;*.webm)", "All files (*.*)"),
+            file_types=("Video files (*.mp4;*.mkv;*.mov;*.webm)", "All files (*.*)"),
         )
         if result and len(result) > 0:
             return {"path": result[0]}
@@ -680,7 +723,7 @@ class ApiBridge:
 
         result = self._window.create_file_dialog(
             webview.OPEN_DIALOG,
-            file_types=("Video files (*.mp4;*.mkv;*.avi;*.mov;*.webm)", "All files (*.*)"),
+            file_types=("Video files (*.mp4;*.mkv;*.mov;*.webm)", "All files (*.*)"),
             allow_multiple=True,
         )
         if result and len(result) > 0:
@@ -871,7 +914,11 @@ class ApiBridge:
 
     # ── Pipeline orchestrator (background thread) ────────────────────────
 
-    def _run_pipeline(self, url, settings):
+    def _run_pipeline(self, url, settings, local_file_path=None):
+        video_path = None
+        is_downloaded = False
+        subtitle_files = []
+        stem = None
         try:
             num_clips_raw = settings.get("num_clips", NUM_CLIPS)
             auto_clips = num_clips_raw == "auto"
@@ -884,21 +931,45 @@ class ApiBridge:
             language = settings.get("whisper_language") or None
             preset = settings.get("ffmpeg_preset", FFMPEG_PRESET)
             crf = str(settings.get("video_crf", VIDEO_CRF))
-            crop_vertical = settings.get("crop_vertical", CROP_VERTICAL)
+            video_encoder = settings.get("video_encoder", VIDEO_ENCODER)
+            yolo_device = settings.get("yolo_device", YOLO_DEVICE)
+            whisper_device = settings.get("whisper_device", WHISPER_DEVICE)
+            crop_vertical = bool(settings.get("crop_vertical", True))
+            ai_detector = settings.get("ai_detector", AI_DETECTOR_MODE)
             effect = settings.get("video_effect", "none")
             music_file = settings.get("music_file", None)
             music_volume = float(settings.get("music_volume", 0.12))
             music_start = float(settings.get("music_start", 0))
             music_end = float(settings.get("music_end", 0))
 
-            # ── 1. Download ──────────────────────────────────────────
+            # ── 1. Download or load local file ───────────────────────
             if self._cancel:
                 return self._cancelled()
-            self._push("download", 0, "Downloading video...")
 
-            video_path = self._download_with_progress(url)
-
-            self._push("download", 100, f"Downloaded: {video_path.name}")
+            if local_file_path:
+                self._push("download", 0, "Loading video...")
+                video_path = Path(local_file_path).expanduser()
+                try:
+                    video_path = video_path.resolve()
+                except OSError:
+                    return self._error("Video file not found or could not be accessed.")
+                if not video_path.is_file():
+                    return self._error("Video file not found.")
+                ext = video_path.suffix.lower()
+                stem = video_path.stem[:50]
+                if ext not in ALLOWED_INPUT_VIDEO_EXT:
+                    return self._error(
+                        "Unsupported video format. Use MP4, MKV, MOV, or WebM."
+                    )
+                self._push("download", 100, f"Loaded: {video_path.name}")
+            else:
+                if not (url or "").strip():
+                    return self._error("No video URL provided.")
+                self._push("download", 0, "Downloading video...")
+                video_path = self._download_with_progress(url.strip())
+                is_downloaded = True
+                stem = video_path.stem[:50]
+                self._push("download", 100, f"Downloaded: {video_path.name}")
 
             # ── Get video duration (needed for auto clip count + sentence snapping) ──
             try:
@@ -948,23 +1019,110 @@ class ApiBridge:
             # ── 2. Detect viral moments ──────────────────────────────
             if self._cancel:
                 return self._cancelled()
-            self._push("detect", 0, "Analyzing video for viral moments...")
+            self._push("detect", 0, "Detecting viral moments...")
+
+            ai_ready = False
+            candidate_count = num_clips
+            if ai_detector != "off":
+                ai_ready = detector_ready(OLLAMA_DETECTOR_MODEL)
+                if ai_ready:
+                    candidate_count = max(
+                        num_clips,
+                        num_clips * OLLAMA_DETECTOR_CANDIDATE_MULTIPLIER,
+                    )
+                    self._push("detect", 5, f"AI detector ready; scanning {candidate_count} candidates...")
+                elif ai_detector == "on":
+                    print("[ai-detector] Ollama detector requested but unavailable; using heuristic detector")
 
             moments = find_viral_moments(
-                video_path, num_clips=num_clips, clip_duration=clip_duration, min_gap=min_gap
+                video_path, num_clips=candidate_count, clip_duration=clip_duration, min_gap=min_gap
             )
-            # Append moments (batch mode: preserve previous video's moments)
-            self._moments.extend(moments)
 
             if not moments:
                 self._push("detect", 100, "No moments found")
                 return self._error("No viral moments found. Try a longer video or fewer clips.")
 
+            if ai_ready and len(moments) > num_clips:
+                self._push("detect", 35, "Transcribing AI detector candidates...")
+                candidate_moments: list[dict] = []
+                for cand_idx, m in enumerate(moments, 1):
+                    if self._cancel:
+                        return self._cancelled()
+                    start, end = m["start"], m["end"]
+                    wav = SUBTITLES_DIR / f"{video_path.stem[:50]}_candidate{cand_idx}.wav"
+                    subtitle_files.append(wav)
+                    pct = 35 + int((cand_idx - 1) / max(1, len(moments)) * 35)
+                    self._push("detect", pct, f"AI candidate {cand_idx}/{len(moments)}...")
+                    try:
+                        # Transcribe
+                        if extract_audio_clip(video_path, start, end, wav):
+                            words = transcribe_clip(
+                                wav, model_size=model, language=language, device_pref=whisper_device,
+                            )
+                            m["_words"] = words
+                            m["transcript"] = " ".join(
+                                w.get("word", w.get("text", "")) for w in words
+                            ).strip()
+                        
+                        # Visual check (person detection)
+                        if crop_vertical:
+                            # We use a lower sample count for candidates to keep it fast
+                            detections, _, _ = detect_all_persons(
+                                video_path, start, end, 1920, 1080, sample_count=20, yolo_device=yolo_device
+                            )
+                            if detections:
+                                hits = sum(1 for _, persons in detections if persons)
+                                m["visual_score"] = hits / len(detections)
+                            else:
+                                m["visual_score"] = 0.0
+                        else:
+                            m["visual_score"] = 1.0
+                        
+                        candidate_moments.append(m)
+                    finally:
+                        try:
+                            wav.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+
+                if candidate_moments:
+                    self._push("detect", 72, "Reranking candidates with local AI...")
+
+                    def _rank_progress(done, total_rank, score):
+                        pct = 72 + int(done / max(1, total_rank) * 22)
+                        label = "scored" if score else "skipped"
+                        self._push("detect", pct, f"AI rerank {done}/{total_rank}: {label}")
+
+                    ranked = rerank_moments(
+                        candidate_moments,
+                        clip_duration=clip_duration,
+                        keep=num_clips,
+                        model=OLLAMA_DETECTOR_MODEL,
+                        timeout=OLLAMA_DETECTOR_TIMEOUT,
+                        on_progress=_rank_progress,
+                    )
+                    if ranked:
+                        moments = ranked
+                        print(f"[ai-detector] Selected {len(moments)} clips with Ollama reranking")
+                    else:
+                        moments = moments[:num_clips]
+                        print("[ai-detector] No valid AI scores; using heuristic candidates")
+                else:
+                    moments = moments[:num_clips]
+                    print("[ai-detector] Candidate transcription failed; using heuristic candidates")
+            else:
+                moments = moments[:num_clips]
+
+            for m in moments:
+                m.pop("_words", None)
+
+            # Append moments (batch mode: preserve previous video's moments)
+            self._moments.extend(moments)
+
             self._push("detect", 100, f"Found {len(moments)} moments")
             self._js(f"window.onMomentsDetected({json.dumps(moments)})")
 
             # ── 3. Process each clip ─────────────────────────────────
-            stem = video_path.stem[:50]
             done: list[Path] = []
             total = len(moments)
 
@@ -994,7 +1152,9 @@ class ApiBridge:
                 if self._cancel:
                     return self._cancelled()
                 self._clip_push(clip_num, total, "transcribe", 0, f"Clip {clip_num}/{total}: Transcribing...")
-                words = transcribe_clip(wav, model_size=model, language=language)
+                words = transcribe_clip(
+                    wav, model_size=model, language=language, device_pref=whisper_device,
+                )
                 self._clip_push(clip_num, total, "transcribe", 100, f"{len(words)} words transcribed")
 
                 # ── 3c.1: find natural sentence boundary ──
@@ -1008,7 +1168,7 @@ class ApiBridge:
                 if new_duration is not None:
                     end = start + int(new_duration + 0.5)  # round to nearest second
                     # Trim words to the adjusted duration
-                    words = [w for w in words if w["end"] <= new_duration + 0.1]
+                    words = [w for w in words if w["end"] <= (end - start) + 0.1]
                     self._clip_push(clip_num, total, "transcribe", 100,
                                     f"Adjusted to {end - start}s (sentence end)")
                 else:
@@ -1029,7 +1189,9 @@ class ApiBridge:
                         return self._cancelled()
                     self._clip_push(clip_num, total, "audio", 0, f"Clip {clip_num}/{total}: Tracking speakers...")
                     try:
-                        crop_params = get_crop_params_dynamic(video_path, start, end)
+                        crop_params = get_crop_params_dynamic(
+                            video_path, start, end, yolo_device=yolo_device,
+                        )
                     except Exception as e:
                         print(f"[!] Crop detection failed for clip {clip_num}: {e}")
                         crop_params = None
@@ -1041,10 +1203,11 @@ class ApiBridge:
                     return self._cancelled()
                 self._clip_push(clip_num, total, "subtitle", 0, f"Clip {clip_num}/{total}: Generating subtitles...")
                 ass = SUBTITLES_DIR / f"{stem}_c{clip_num}.ass"
+                subtitle_files.append(ass)
                 generate_subtitles(
                     words, ass,
-                    video_width=crop_w,
-                    video_height=crop_h,
+                    video_width=1080,
+                    video_height=1920,
                     style=style,
                 )
                 self._clip_push(clip_num, total, "subtitle", 100, "Subtitles generated")
@@ -1058,14 +1221,16 @@ class ApiBridge:
                     video_path, start, end, out,
                     subtitle_path=ass if words else None,
                     crop_params=crop_params,
-                    preset=preset, crf=crf,
+                    preset=preset, crf=crf, encoder=video_encoder,
                 )
                 if clip_result and clip_result.path:
                     # Post-processing: apply video effect
                     if effect and effect != "none":
                         self._clip_push(clip_num, total, "render", 80,
                                         f"Clip {clip_num}/{total}: Applying {effect} effect...")
-                        apply_video_effect(clip_result.path, effect, preset, crf)
+                        apply_video_effect(
+                            clip_result.path, effect, preset, crf, encoder=video_encoder,
+                        )
 
                     # Post-processing: mix background music
                     if music_file:
@@ -1080,12 +1245,16 @@ class ApiBridge:
                                 trim_start=music_start, trim_end=music_end,
                             )
 
-                    done.append(clip_result.path)
-                    if not clip_result.subtitles_burned and clip_result.warning:
+                    if not validate_shorts_output(clip_result.path):
                         self._clip_push(clip_num, total, "render", 100,
-                                        f"Clip {clip_num} done (WARNING: {clip_result.warning})")
+                                        f"Clip {clip_num} failed Shorts validation")
                     else:
-                        self._clip_push(clip_num, total, "render", 100, f"Clip {clip_num} complete!")
+                        done.append(clip_result.path)
+                        if not clip_result.subtitles_burned and clip_result.warning:
+                            self._clip_push(clip_num, total, "render", 100,
+                                            f"Clip {clip_num} done (WARNING: {clip_result.warning})")
+                        else:
+                            self._clip_push(clip_num, total, "render", 100, f"Clip {clip_num} complete!")
                 elif clip_result and not clip_result.path:
                     self._clip_push(clip_num, total, "render", 100, f"Clip {clip_num} failed")
                 else:
@@ -1105,9 +1274,37 @@ class ApiBridge:
         except CancelledError:
             return self._cancelled()
         except Exception as e:
+            print(f"[!] Pipeline error: {e}")
             self._error(str(e))
         finally:
+            # Windows needs a moment to release handles (FFmpeg/Clipper/Whisper)
+            time.sleep(1.5)
+
+            if is_downloaded and video_path and video_path.exists():
+                try:
+                    video_path.unlink()
+                    print(f"[cleanup] Automatically cleared downloaded source: {video_path.name}")
+                except Exception as e:
+                    print(f"[cleanup] Could not clear {video_path.name}: {e}")
+
+            # Thorough cleanup of subtitles folder
+            for sf in subtitle_files:
+                try:
+                    if sf.exists():
+                        sf.unlink()
+                except Exception:
+                    pass
+
+            # Catch any orphans using the video stem
+            if stem:
+                for p in SUBTITLES_DIR.glob(f"{stem}*"):
+                    try:
+                        p.unlink()
+                    except Exception:
+                        pass
+
             self._processing = False
+            self._cancel = False
 
     # ── Download with real progress ──────────────────────────────────────
 
@@ -1198,6 +1395,7 @@ class ApiBridge:
             self._error(f"Upload failed: {e}")
         finally:
             self._processing = False
+            self._cancel = False
 
     # ── Background upload scheduler ──────────────────────────────────────
 

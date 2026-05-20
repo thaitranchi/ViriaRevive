@@ -1,41 +1,60 @@
 from pathlib import Path
 
+from hwaccel import resolve_whisper_device
+
 _model_cache = {}
 
 
-def _get_device():
-    """Auto-detect best device for whisper inference."""
-    try:
-        import torch
-        if torch.cuda.is_available():
-            return "cuda", "float16"
-    except ImportError:
-        pass
-    return "cpu", "int8"
+def _get_device(device_pref: str = "auto") -> tuple[str, str]:
+    """Resolve device and compute_type for faster-whisper."""
+    return resolve_whisper_device(device_pref)
+
+
+def _load_whisper_model(model_size: str, device: str, compute: str):
+    from faster_whisper import WhisperModel
+
+    cache_key = (model_size, device, compute)
+    if cache_key not in _model_cache:
+        print(f"[*] Loading Whisper {model_size} ({device}/{compute})...")
+        try:
+            _model_cache[cache_key] = WhisperModel(
+                model_size, device=device, compute_type=compute
+            )
+        except Exception as e:
+            if device != "cpu":
+                print(f"[!] Whisper GPU init failed ({e}), falling back to CPU...")
+                return _load_whisper_model(model_size, "cpu", "int8")
+            raise
+    return _model_cache[cache_key]
 
 
 def transcribe_clip(
-    audio_path: Path, model_size: str = "base", language: str = None
+    audio_path: Path,
+    model_size: str = "base",
+    language: str = None,
+    device_pref: str = "auto",
 ) -> list:
     """Transcribe audio and return word-level timestamps.
 
     Returns list of dicts: [{'text': str, 'start': float, 'end': float}, ...]
     """
-    from faster_whisper import WhisperModel
-
-    device, compute = _get_device()
-
-    if model_size not in _model_cache:
-        print(f"[*] Loading Whisper {model_size} ({device}/{compute})...")
-        _model_cache[model_size] = WhisperModel(
-            model_size, device=device, compute_type=compute
-        )
-    model = _model_cache[model_size]
+    device, compute = _get_device(device_pref)
+    model = _load_whisper_model(model_size, device, compute)
 
     print(f"[*] Transcribing {audio_path.name}...")
-    segments, info = model.transcribe(
-        str(audio_path), word_timestamps=True, language=language
-    )
+    try:
+        segments, info = model.transcribe(
+            str(audio_path), word_timestamps=True, language=language
+        )
+    except Exception as e:
+        if device != "cpu":
+            print(f"[!] Whisper GPU transcribe failed ({e}), retrying on CPU...")
+            model = _load_whisper_model(model_size, "cpu", "int8")
+            segments, info = model.transcribe(
+                str(audio_path), word_timestamps=True, language=language
+            )
+        else:
+            raise
 
     from subprocess_utils import is_cancelled, CancelledError
 

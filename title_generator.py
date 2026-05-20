@@ -4,77 +4,40 @@ Falls back to a simple extraction heuristic if Ollama is unavailable,
 so this never blocks the pipeline.
 """
 
-import json
-import urllib.request
-import urllib.error
+from ollama_client import (
+    DEFAULT_MODEL,
+    ensure_model,
+    generate,
+    list_models,
+    model_exists,
+    ollama_available,
+    pull_model,
+)
 
-# Default model — 3b is the sweet spot for creative titles (~2GB RAM)
-DEFAULT_MODEL = "qwen2.5:3b"
-OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
 TIMEOUT = 30  # seconds per title request
 
 
 def _ollama_available() -> bool:
     """Quick check if Ollama is running."""
-    try:
-        req = urllib.request.Request("http://127.0.0.1:11434/api/tags")
-        with urllib.request.urlopen(req, timeout=3) as resp:
-            return resp.status == 200
-    except Exception:
-        return False
+    return ollama_available()
 
 
 def _model_exists(model: str = DEFAULT_MODEL) -> bool:
     """Check if a specific model is already downloaded in Ollama."""
-    try:
-        req = urllib.request.Request("http://127.0.0.1:11434/api/tags")
-        with urllib.request.urlopen(req, timeout=3) as resp:
-            data = json.loads(resp.read())
-            names = [m["name"] for m in data.get("models", [])]
-            # Match both "qwen2.5:0.5b" and "qwen2.5:0.5b" style names
-            return model in names or f"{model}:latest" in names
-    except Exception:
-        return False
+    return model_exists(model)
 
 
 def _pull_model(model: str = DEFAULT_MODEL) -> bool:
     """Pull (download) a model via Ollama. Blocks until complete."""
-    print(f"[title-gen] Model '{model}' not found — pulling from Ollama...")
-    body = json.dumps({"name": model, "stream": False}).encode()
-    req = urllib.request.Request(
-        "http://127.0.0.1:11434/api/pull",
-        data=body,
-        headers={"Content-Type": "application/json"},
-    )
-    try:
-        # Long timeout — small models like qwen2.5:0.5b are ~400MB
-        with urllib.request.urlopen(req, timeout=300) as resp:
-            data = json.loads(resp.read())
-            status = data.get("status", "")
-            if "success" in status.lower():
-                print(f"[title-gen] Model '{model}' pulled successfully")
-                return True
-            print(f"[title-gen] Pull status: {status}")
-            return True
-    except Exception as e:
-        print(f"[title-gen] Failed to pull model '{model}': {e}")
-        return False
+    return pull_model(model)
 
 
-def ensure_model(model: str = DEFAULT_MODEL) -> bool:
-    """Ensure the model is available — download it if needed. Returns True if ready."""
-    if not _ollama_available():
-        return False
-    if _model_exists(model):
-        return True
-    return _pull_model(model)
-
-
-def _ask_ollama(transcript: str, model: str = DEFAULT_MODEL) -> str | None:
+def _ask_ollama(transcript: str, model: str = DEFAULT_MODEL, language: str = None) -> str | None:
     """Ask Ollama for a catchy short YouTube Shorts title."""
+    lang_instruction = f" and reply in {language}" if language else ""
     prompt = (
         "You are a viral YouTube Shorts title expert. "
-        "Given a transcript, create ONE clickbait title that makes people NEED to watch.\n\n"
+        f"Given a transcript, create ONE clickbait title that makes people NEED to watch{lang_instruction}.\n\n"
         "RULES:\n"
         "- Max 50 characters\n"
         "- No quotes, no hashtags, no emojis\n"
@@ -85,22 +48,15 @@ def _ask_ollama(transcript: str, model: str = DEFAULT_MODEL) -> str | None:
         f'Transcript: "{transcript[:500]}"\n\n'
         "Reply with ONLY the title. Nothing else."
     )
-    body = json.dumps({
-        "model": model,
-        "prompt": prompt,
-        "stream": False,
-        "options": {"temperature": 0.7, "num_predict": 40},
-    }).encode()
-
-    req = urllib.request.Request(
-        OLLAMA_URL,
-        data=body,
-        headers={"Content-Type": "application/json"},
+    response = generate(
+        prompt,
+        model=model,
+        timeout=TIMEOUT,
+        options={"temperature": 0.7, "num_predict": 40},
     )
     try:
-        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
-            data = json.loads(resp.read())
-            title = data.get("response", "").strip().strip('"').strip("'")
+        if response:
+            title = response.strip().strip('"').strip("'")
             # Clean up: remove hashtags, limit length
             title = title.split("\n")[0].strip()
             # Remove common LLM artifacts
@@ -119,7 +75,7 @@ def _ask_ollama(transcript: str, model: str = DEFAULT_MODEL) -> str | None:
                         title = candidate
                 return title
     except Exception as e:
-        print(f"[title-gen] Ollama error: {e}")
+        print(f"[title-gen] Ollama cleanup error: {e}")
     return None
 
 
@@ -178,15 +134,19 @@ def _heuristic_title(transcript: str) -> str:
     return title
 
 
-def generate_title(transcript: str, model: str = DEFAULT_MODEL) -> str:
+def generate_title(transcript: str, model: str = DEFAULT_MODEL, language: str = None) -> str:
     """Generate a title for a clip. Uses Ollama if available, else heuristic."""
     if not transcript:
         print("[title-gen] Skipped — empty transcript")
         return ""
+    
+    # Clean up transcript from Whisper metadata if present (e.g. [laughter], (silence))
+    import re
+    clean_transcript = re.sub(r'\[.*?\]|\(.*?\)', '', transcript).strip()
 
     # Try Ollama first — auto-pull model if needed
     if ensure_model(model):
-        result = _ask_ollama(transcript, model)
+        result = _ask_ollama(clean_transcript, model, language)
         if result:
             print(f"[title-gen] LLM: {result}")
             return result
@@ -204,6 +164,7 @@ def generate_title(transcript: str, model: str = DEFAULT_MODEL) -> str:
 def generate_titles_batch(
     transcripts: list[str],
     model: str = DEFAULT_MODEL,
+    language: str = None,
     on_progress=None,
 ) -> list[str]:
     """Generate titles for multiple clips. Uses concurrent requests for speed.
@@ -227,7 +188,7 @@ def generate_titles_batch(
         if not transcript:
             return idx, ""
         if model_ready:
-            title = _ask_ollama(transcript, model)
+            title = _ask_ollama(transcript, model, language)
             if title:
                 return idx, title
         return idx, _heuristic_title(transcript)
@@ -253,10 +214,4 @@ def generate_titles_batch(
 
 def list_ollama_models() -> list[str]:
     """Return available Ollama models, or empty list if unavailable."""
-    try:
-        req = urllib.request.Request("http://127.0.0.1:11434/api/tags")
-        with urllib.request.urlopen(req, timeout=3) as resp:
-            data = json.loads(resp.read())
-            return [m["name"] for m in data.get("models", [])]
-    except Exception:
-        return []
+    return list_models()
