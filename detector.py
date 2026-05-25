@@ -2,11 +2,15 @@ import subprocess
 import shutil
 import numpy as np
 from pydub import AudioSegment
+import tempfile
 import time
 from pathlib import Path
 
 from subprocess_utils import run as _run, is_cancelled, CancelledError
 from hwaccel import input_hwaccel_args
+
+import logging
+logger = logging.getLogger(__name__)
 
 # Explicitly point pydub to ffmpeg/ffprobe binaries found in PATH
 def _sync_pydub_paths():
@@ -28,7 +32,7 @@ def find_viral_moments(
 ) -> list:
     """Find viral moments using audio energy + scene change analysis (no AI)."""
 
-    print("[*] Analyzing audio energy (waiting for file access)...")
+    logger.info("Analyzing audio energy (waiting for file access)...")
     
     # Windows can sometimes hold a lock on newly downloaded files (antivirus/indexing).
     # Wait up to 5 seconds for the file to become readable.
@@ -39,12 +43,42 @@ def find_viral_moments(
             time.sleep(0.5)
 
     _sync_pydub_paths()  # Refresh paths in case they were updated during runtime
+    
+    total_seconds = _video_duration_seconds(video_path)
+    if total_seconds < 10:
+        print("[!] Video too short for analysis")
+        return []
+
     try:
         if not video_path.exists():
             raise FileNotFoundError(f"Video file not found: {video_path}")
             
-        resolved_path = str(video_path.resolve())
-        audio = AudioSegment.from_file(resolved_path)
+        # To handle files > 4GB and avoid MemoryErrors, we extract a downsampled 
+        # mono version of the audio for analysis instead of loading the full stream.
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+                tmp_path = tmp.name
+            
+            # Extract at 8kHz mono — plenty for energy/peak analysis
+            cmd = [
+                "ffmpeg", "-y", "-i", str(video_path),
+                "-vn", "-ac", "1", "-ar", "8000", "-acodec", "pcm_s16le",
+                "-rf64", "auto", tmp_path
+            ]
+            _run(cmd, capture_output=True, timeout=300)
+            
+            audio = AudioSegment.from_file(tmp_path)
+        finally:
+            if tmp_path:
+                # Attempt cleanup with retries for Windows locks
+                for _ in range(5):
+                    try:
+                        Path(tmp_path).unlink(missing_ok=True)
+                        break
+                    except OSError:
+                        time.sleep(0.2)
+        
     except Exception as e:
         if isinstance(e, IndexError):
             detail = " (no audio stream found or file corrupted)"
@@ -52,14 +86,7 @@ def find_viral_moments(
             error_msg = str(e).lower()
             detail = " (ffprobe/ffmpeg missing or path issue)" if "ffprobe" in error_msg or "ffmpeg" in error_msg or "no such file" in error_msg else f" ({e})"
         print(f"[!] Audio analysis unavailable{detail}. Using fallback detection.")
-        total_seconds = _video_duration_seconds(video_path)
         audio = None
-    else:
-        total_seconds = len(audio) // 1000
-
-    if total_seconds < 10:
-        print("[!] Video too short for analysis")
-        return []
 
     if audio is None:
         energies = np.zeros(total_seconds, dtype=float)
@@ -90,7 +117,7 @@ def find_viral_moments(
     )
 
     # --- Scene change density ---
-    print("[*] Analyzing scene changes...")
+    logger.info("Analyzing scene changes...") # type: ignore
     if is_cancelled():
         raise CancelledError("Moment detection cancelled before scene analysis")
         
@@ -133,7 +160,7 @@ def find_viral_moments(
     if not clips:
         clips = _fallback_moments(total_seconds, num_clips, clip_duration, min_gap)
 
-    print(f"[+] Found {len(clips)} viral moments")
+    logger.info(f"Found {len(clips)} viral moments") # type: ignore
     for i, c in enumerate(clips):
         print(f"    Clip {i+1}: {_fmt(c['start'])} - {_fmt(c['end'])}  (score {c['score']:.2f})")
     return clips
@@ -156,7 +183,7 @@ def _scene_change_density(video_path: Path, length: int) -> np.ndarray:
         ]
         r = _run(cmd, capture_output=True, text=True, timeout=600, errors="replace")
         if r.returncode != 0:
-            print("[!] Scene detection unavailable, using audio only")
+            logger.warning("Scene detection unavailable, using audio only")
             return np.zeros(length + 1)
         timestamps = []
         for line in (r.stderr or "").split("\n"):
@@ -175,7 +202,7 @@ def _scene_change_density(video_path: Path, length: int) -> np.ndarray:
         return density
 
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-        print("[!] Scene detection unavailable, using audio only")
+        logger.warning("Scene detection unavailable, using audio only")
         return np.zeros(length + 1)
 
 
@@ -237,8 +264,8 @@ def _fallback_moments(
             }
         )
 
-    if clips:
-        print("[!] Detector scores were flat; using evenly spaced fallback clips")
+    if clips: # type: ignore
+        logger.warning("Detector scores were flat; using evenly spaced fallback clips")
     return clips
 
 

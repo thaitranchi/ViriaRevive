@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 import re
 import shutil
 import sys
 from dataclasses import dataclass
 
 from subprocess_utils import run as _run
+
+logger = logging.getLogger(__name__)
 
 # User-facing encoder keys → ffmpeg codec names
 _ENCODER_MAP = {
@@ -262,6 +265,12 @@ def _swap_cmd_encode_to_cpu(cmd: list[str], preset: str, crf: str) -> list[str]:
     out: list[str] = []
     i = 0
     while i < len(cmd):
+        # 1. Strip hardware decoder flags (retry should be pure software)
+        if cmd[i] == "-hwaccel":
+            i += 2
+            continue
+
+        # 2. Identify and swap hardware encoder
         if (
             i + 1 < len(cmd)
             and cmd[i] == "-c:v"
@@ -269,11 +278,13 @@ def _swap_cmd_encode_to_cpu(cmd: list[str], preset: str, crf: str) -> list[str]:
         ):
             out.extend(video_encode_args(preset, crf, force_cpu=True))
             i += 2
+            # Skip subsequent encoder-specific flags we might have added
             while i < len(cmd):
-                if cmd[i] == "-pix_fmt":
+                if cmd[i] in ("-preset", "-rc", "-cq", "-global_quality", "-quality", "-qp_i", "-qp_p", "-pix_fmt"):
                     i += 2
                     continue
-                if cmd[i] in ("-c:a", "-map", "-movflags", "-f", "-t", "-ss"):
+                # Stop if we hit a generic ffmpeg flag or the output path
+                if cmd[i] in ("-c:a", "-map", "-movflags", "-f", "-t", "-ss", "-y", "-filter_complex", "-vf"):
                     break
                 if cmd[i].startswith("-") and i + 1 < len(cmd):
                     i += 2
@@ -295,12 +306,19 @@ def run_ffmpeg_with_encode_fallback(
     r = run_fn(cmd)
     if r.returncode == 0:
         return r
-    if not any(c in cmd for c in _HW_CODECS):
+
+    # Check if the command used HW encode or HW decode
+    has_hw = any(c in cmd for c in _HW_CODECS) or "-hwaccel" in cmd
+    if not has_hw:
         return r
-    print("[!] Hardware encode failed, retrying with libx264...")
+
+    # Log why it failed to help with debugging
+    err_msg = r.stderr.splitlines()[-1] if r.stderr else "Unknown error"
+    print(f"[!] Hardware acceleration failed: {err_msg}")
+    print("    Retrying with pure software path...")
+
     fallback = _swap_cmd_encode_to_cpu(cmd, preset, crf)
     return run_fn(fallback)
-
 
 # ── YOLO / Whisper device helpers (used by cropper & transcriber) ───────────
 

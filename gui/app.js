@@ -862,7 +862,7 @@ function confirmStyleAndGenerate() {
     state.batchSettings = settings;
 
     state.processing = true;
-    state.batchIndex = -1;
+    state.batchIndex = 0;
     setGenerateButtonBusy(true);
 
     document.getElementById('generate-idle').classList.add('hidden');
@@ -871,8 +871,20 @@ function confirmStyleAndGenerate() {
     document.getElementById('btn-cancel').classList.remove('hidden');
     document.getElementById('clip-cards').innerHTML = '';
 
-    // Start processing the first item in the queue
-    processNextInQueue();
+    // Submit all pending items to the backend task queue
+    state.batchQueue.forEach((item, i) => {
+        if (item.status === 'pending') {
+            item.status = 'queued';
+            const isLocal = !!item.isFile;
+            pywebview.api.start_processing(
+                isLocal ? '' : item.url,
+                state.batchSettings,
+                isLocal ? item.url : null,
+                i // pass index so backend can report it back
+            );
+        }
+    });
+    renderBatchQueue();
 }
 
 async function cancelProcessing() {
@@ -1175,7 +1187,19 @@ window.onConsoleLog = function (text) {
 
 /* ── Progress Callbacks ───────────────────────────────────────────────── */
 
-window.onPipelineProgress = function (stage, percent, message) {
+window.onPipelineProgress = function (stage, percent, message, itemIndex) {
+    if (itemIndex !== null && itemIndex !== undefined) {
+        state.batchIndex = itemIndex;
+        const item = state.batchQueue[itemIndex];
+        if (item && item.status !== 'active') {
+            item.status = 'active';
+            renderBatchQueue();
+            resetStages();
+            document.getElementById('clip-cards').innerHTML = '';
+            setDownloadStageLabel(!!item.isFile);
+        }
+    }
+
     const ranges = { download: [0, 15], detect: [15, 30], clips: [30, 95], upload: [0, 100] };
     const r = ranges[stage] || [0, 100];
     setProgress(r[0] + (percent / 100) * (r[1] - r[0]), message);
@@ -1184,7 +1208,8 @@ window.onPipelineProgress = function (stage, percent, message) {
     if (stage === 'detect' && percent >= 100) completeStage('detect');
 };
 
-window.onClipProgress = function (clipNum, totalClips, substep, percent, message) {
+window.onClipProgress = function (clipNum, totalClips, substep, percent, message, itemIndex) {
+    if (itemIndex !== null && itemIndex !== undefined) state.batchIndex = itemIndex;
     const sw = { audio: [0, 0.10], transcribe: [0.10, 0.40], subtitle: [0.40, 0.60], render: [0.60, 1.0] }[substep] || [0, 1];
     const clipFrac = sw[0] + (percent / 100) * (sw[1] - sw[0]);
     const perClip = 65 / totalClips;
@@ -1193,17 +1218,18 @@ window.onClipProgress = function (clipNum, totalClips, substep, percent, message
     updateClipCard(clipNum, totalClips, substep, percent, message);
 };
 
-window.onMomentsDetected = function (moments) {
+window.onMomentsDetected = function (moments, itemIndex) {
+    if (itemIndex !== null && itemIndex !== undefined) state.batchIndex = itemIndex;
     state.moments = moments;
     const grid = document.getElementById('clip-cards');
     grid.innerHTML = '';
     moments.forEach((m, i) => grid.appendChild(createClipCard(i + 1, moments.length, m)));
 };
 
-window.onPipelineComplete = function (success, doneCount, totalCount, errorMsg) {
-    // Mark current batch item
-    if (state.batchIndex >= 0 && state.batchIndex < state.batchQueue.length) {
-        state.batchQueue[state.batchIndex].status = success ? 'done' : 'error';
+window.onPipelineComplete = function (success, doneCount, totalCount, errorMsg, itemIndex) {
+    const idx = (itemIndex !== null && itemIndex !== undefined) ? itemIndex : state.batchIndex;
+    if (idx >= 0 && idx < state.batchQueue.length) {
+        state.batchQueue[idx].status = success ? 'done' : 'error';
         renderBatchQueue();
     }
 
@@ -1227,13 +1253,9 @@ window.onPipelineComplete = function (success, doneCount, totalCount, errorMsg) 
         addNotification('Processing Failed', errorMsg || 'An error occurred during clip generation', 'error');
     }
 
-    // Check if there are more items in the queue
-    const hasMore = state.batchQueue.some((q, i) => i > state.batchIndex && q.status === 'pending');
-    if (hasMore) {
-        // Short delay before starting next to let UI update
-        setTimeout(() => processNextInQueue(), 500);
-    } else {
-        // All done (or single video)
+    // Check if the entire batch is finished
+    const stillRunning = state.batchQueue.some(q => q.status === 'active' || q.status === 'queued');
+    if (!stillRunning) {
         _onBatchComplete();
     }
 };
@@ -3131,6 +3153,8 @@ function populateSettings(s) {
     setSelect('set-whisper-device', s.whisper_device || 'auto');
     setSelect('set-yolo-device', s.yolo_device || 'auto');
     setSelect('set-ai-detector', s.ai_detector || 'auto');
+    setSelect('set-ai-provider', s.ai_provider || 'gemini');
+    setVal('set-gemini-key', s.gemini_api_key || '');
     const mode = s.shorts_mode || (s.crop_vertical !== false ? 'crop' : 'none');
     const shortsToggle = document.getElementById('set-shorts-enabled');
     if (shortsToggle) shortsToggle.checked = (mode !== 'none');
@@ -3160,6 +3184,7 @@ function gatherSettings() {
         whisper_device: getVal('set-whisper-device'),
         yolo_device: getVal('set-yolo-device'),
         ai_detector: getVal('set-ai-detector') || 'auto',
+        ai_provider: getVal('set-ai-provider') || 'gemini',
         shorts_mode: document.getElementById('set-shorts-enabled')?.checked ? 'crop' : 'none',
         crop_vertical: document.getElementById('set-shorts-enabled')?.checked
     };

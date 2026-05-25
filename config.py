@@ -1,4 +1,5 @@
 import sys
+import json
 from pathlib import Path
 
 # In PyInstaller frozen builds, __file__ resolves to the temp _MEIPASS dir.
@@ -10,17 +11,39 @@ else:
 DOWNLOADS_DIR = BASE_DIR / "downloads"
 CLIPS_DIR = BASE_DIR / "clips"
 SUBTITLES_DIR = BASE_DIR / "subtitles"
-
 MUSIC_DIR = BASE_DIR / "music"
+TOKENS_DIR = BASE_DIR / "tokens"
 
-for d in [DOWNLOADS_DIR, CLIPS_DIR, SUBTITLES_DIR, MUSIC_DIR]:
+for d in [DOWNLOADS_DIR, CLIPS_DIR, SUBTITLES_DIR, MUSIC_DIR, TOKENS_DIR]:
     d.mkdir(exist_ok=True)
+
+CLIENT_SECRETS_FILE = BASE_DIR / "client_secrets.json"
+GEMINI_TOKEN_FILE = TOKENS_DIR / "gemini_key.json"
+
+# The Gemini API key is loaded from tokens/gemini_key.json to keep it out of source control.
+GEMINI_API_KEY = ""
+if GEMINI_TOKEN_FILE.exists():
+    try:
+        with open(GEMINI_TOKEN_FILE, "r", encoding="utf-8") as f:
+            _secrets = json.load(f)
+            GEMINI_API_KEY = _secrets.get("gemini_api_key", "")
+    except Exception:
+        pass
+elif CLIENT_SECRETS_FILE.exists():
+    # Migration: check old location if new one doesn't exist
+    try:
+        with open(CLIENT_SECRETS_FILE, "r", encoding="utf-8") as f:
+            _secrets = json.load(f)
+            GEMINI_API_KEY = _secrets.get("gemini_api_key", "")
+    except Exception:
+        pass
 
 # Clip detection
 NUM_CLIPS = 5
 CLIP_DURATION = 30
 MIN_GAP = 15
 AI_DETECTOR_MODE = "auto"  # auto | off | on
+AI_PROVIDER = "gemini"     # gemini | ollama
 OLLAMA_DETECTOR_MODEL = "qwen2.5:3b"
 OLLAMA_DETECTOR_CANDIDATE_MULTIPLIER = 3
 OLLAMA_DETECTOR_TIMEOUT = 20
@@ -45,6 +68,5 @@ YOLO_DEVICE = "auto"     # auto | cuda | cpu
 WHISPER_DEVICE = "auto"  # auto | cuda | cpu
 
 # YouTube
-CLIENT_SECRETS_FILE = BASE_DIR / "client_secrets.json"
 TOKEN_FILE = BASE_DIR / "token.json"
 DEFAULT_TAGS = ["shorts", "viral", "clips"]

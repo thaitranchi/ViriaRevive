@@ -1038,6 +1038,18 @@
                             AI Content Gen
                         </h3>
                         <div class="setting-row">
+                            <label for="set-ai-provider">AI Provider</label>
+                            <select id="set-ai-provider" class="form-select" onchange="gatherSettings()">
+                                <option value="gemini">Google Gemini (Cloud)</option>
+                                <option value="ollama">Ollama (Local)</option>
+                            </select>
+                        </div>
+                        <div class="setting-row">
+                            <label for="set-gemini-key">Gemini API Key</label>
+                            <input type="password" id="set-gemini-key" class="form-input" placeholder="AIza..." onchange="gatherSettings()">
+                            <span class="setting-hint">Get one for free at <a href="https://aistudio.google.com/app/apikey" target="_blank" style="text-decoration:underline">Google AI Studio</a></span>
+                        </div>
+                        <div class="setting-row">
                             <label for="set-title-language">Title language</label>
                             <div class="input-with-presets">
                                 <input type="text" id="set-title-language" class="form-input" placeholder="Same as transcription"

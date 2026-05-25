@@ -14,11 +14,13 @@ from the top ("rule of thirds"), keeping their full body visible.
 import subprocess
 import threading
 import numpy as np
+import cv2
 from pathlib import Path
 
 from subprocess_utils import run as _run, is_cancelled, CancelledError
 from hwaccel import resolve_yolo_device
 
+import logging
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
@@ -38,6 +40,8 @@ _yolo_device: str | None = None
 _yolo_checked = False
 _yolo_device_pref = "auto"
 YOLO_BATCH_SIZE = 8
+
+logger = logging.getLogger(__name__)
 
 
 # ── Public API ───────────────────────────────────────────────────────────────
@@ -65,7 +69,7 @@ def get_crop_params(video_path: Path, start: int, end: int,
 
         person_x, head_y = _detect_people(video_path, start, end, width, height, sample_count)
         if person_x is None:
-            print("[!] No person detected; returning None for fallback (Blurry Padding)")
+            logger.warning("No person detected; returning None for fallback (Blurry Padding)")
             return None
         crop_x = person_x - crop_w // 2
         crop_x = max(0, min(crop_x, width - crop_w))
@@ -78,23 +82,23 @@ def get_crop_params(video_path: Path, start: int, end: int,
 
         _, head_y = _detect_people(video_path, start, end, width, height, sample_count)
         if head_y is None:
-            print("[!] No person detected; returning None for fallback (Blurry Padding)")
+            logger.warning("No person detected; returning None for fallback (Blurry Padding)")
             return None
         
         # Rule of thirds: place head at 30% from top
         target_pos = int(crop_h * HEAD_RATIO)
-        crop_y = head_y - target_pos
+        crop_y = head_y - target_pos # type: ignore
         crop_y = max(0, min(crop_y, height - crop_h))
         crop_y -= crop_y % 2
         crop_x = 0
 
-    print(f"[+] Crop: {crop_w}x{crop_h} at ({crop_x},{crop_y})  from {width}x{height}")
+    logger.info(f"Crop: {crop_w}x{crop_h} at ({crop_x},{crop_y})  from {width}x{height}")
     return crop_w, crop_h, crop_x, crop_y
 
 
 def get_crop_params_dynamic(video_path: Path, start: int, end: int,
                             target_ratio: float = 9 / 16, sample_count: int = 50,
-                            yolo_device: str = "auto"):
+                            yolo_device: str = "auto", debug_frames: bool = False):
     """Return (crop_w, crop_h, keyframes) or None if already vertical.
 
     Dynamic crop — tracks the active person per-window with stable cuts.
@@ -121,7 +125,7 @@ def get_crop_params_dynamic(video_path: Path, start: int, end: int,
 
     # Get per-frame person tracking data
     detections, scale_x, scale_y = detect_all_persons(
-        video_path, start, end, width, height, sample_count, yolo_device=yolo_device,
+        video_path, start, end, width, height, sample_count, yolo_device=yolo_device, debug_frames=debug_frames,
     )
 
     if len(detections) < 3:
@@ -130,10 +134,10 @@ def get_crop_params_dynamic(video_path: Path, start: int, end: int,
             all_persons = []
             for t, persons in detections:
                 best = max(persons, key=lambda p: p[2])
-                all_persons.append(best)
+                all_persons.append(best) # type: ignore
             med_x = int(np.median([p[0] for p in all_persons]))
             head_y = int(np.median([p[1] for p in all_persons]))
-            print(f"[!] Few detections ({len(detections)}), using static at x={med_x} head_y={head_y}")
+            logger.warning(f"Few detections ({len(detections)}), using static at x={med_x} head_y={head_y}")
             if pan_axis == "x":
                 cx = med_x - crop_w // 2
                 cx = max(0, min(cx, width - crop_w))
@@ -150,7 +154,7 @@ def get_crop_params_dynamic(video_path: Path, start: int, end: int,
                 cy -= cy % 2
                 return crop_w, crop_h, 0, cy
         else:
-            print("[!] No person detected; returning None for fallback (Blurry Padding)")
+            logger.warning("No person detected; returning None for fallback (Blurry Padding)")
             return None
 
     duration = max(1, end - start)
@@ -173,16 +177,16 @@ def get_crop_params_dynamic(video_path: Path, start: int, end: int,
         )
 
     if not keyframes:
-        print("[!] Trajectory generation failed; returning None for fallback (Blurry Padding)")
+        logger.warning("Trajectory generation failed; returning None for fallback (Blurry Padding)")
         return None
 
     # Log detailed crop info for debugging
-    first_kf = keyframes[0]
-    print(f"[+] Dynamic crop: {crop_w}x{crop_h}, {len(keyframes)} keyframes  from {width}x{height}")
-    print(f"    First keyframe: t={first_kf[0]:.1f}s  crop_x={first_kf[1]}  crop_y={first_kf[2]}")
+    first_kf = keyframes[0] # type: ignore
+    logger.info(f"Dynamic crop: {crop_w}x{crop_h}, {len(keyframes)} keyframes  from {width}x{height}")
+    logger.info(f"    First keyframe: t={first_kf[0]:.1f}s  crop_x={first_kf[1]}  crop_y={first_kf[2]}")
     if len(keyframes) > 1:
         last_kf = keyframes[-1]
-        print(f"    Last keyframe:  t={last_kf[0]:.1f}s  crop_x={last_kf[1]}  crop_y={last_kf[2]}")
+        logger.info(f"    Last keyframe:  t={last_kf[0]:.1f}s  crop_x={last_kf[1]}  crop_y={last_kf[2]}")
     return crop_w, crop_h, keyframes
 
 
@@ -236,13 +240,13 @@ def _get_yolo_model(device_pref: str = "auto"):
             model.to(device)
         _yolo_model = model
         _yolo_device = device
-        print(f"[+] YOLO person detector loaded on {device}")
+        logger.info(f"YOLO person detector loaded on {device}")
         return _yolo_model, _yolo_device
     except ImportError:
-        print("[!] ultralytics not installed — falling back to face detection")
+        logger.warning("ultralytics not installed — falling back to face detection")
         return None, None
     except Exception as e:
-        print(f"[!] YOLO init failed: {e} — falling back to face detection")
+        logger.exception("YOLO initialization failed; falling back to face detection")
         return None, None
 
 
@@ -290,19 +294,21 @@ def _create_yunet_detector():
     try:
         import cv2
         if not YUNET_MODEL.exists():
-            return None
+            logger.warning(f"YuNet model not found at {YUNET_MODEL}")
+            return None # type: ignore
         detector = cv2.FaceDetectorYN.create(
-            str(YUNET_MODEL), "", (320, 320),
-            YUNET_CONF, YUNET_NMS, 5000,
+            str(YUNET_MODEL), "", (320, 320), YUNET_CONF, YUNET_NMS, 5000, # type: ignore
         )
         return detector
     except Exception as e:
-        print(f"[!] YuNet init failed: {e}")
+        logger.exception("YuNet initialization failed")
         return None
 
 
 def _detect_faces_yunet(frame, detector):
     """Detect faces using YuNet DNN. Returns list of (cx, cy, area, conf, face_h)."""
+    if frame is None or frame.size == 0:
+        return []
     h, w = frame.shape[:2]
     detector.setInputSize((w, h))
     _, faces = detector.detect(frame)
@@ -340,6 +346,8 @@ def _load_cascades(cv2):
 def _detect_faces_haar(frame, cascades, scale=0.5):
     """Detect faces using Haar cascades. Returns list of (cx, cy, area, conf, face_h)."""
     import cv2
+    if frame is None or frame.size == 0:
+        return []
 
     small = cv2.resize(frame, None, fx=scale, fy=scale)
     gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
@@ -381,11 +389,12 @@ def _detect_faces_haar(frame, cascades, scale=0.5):
 # ── Main detection pipeline ──────────────────────────────────────────────────
 
 
-def _read_frame_safe(cap, timeout=5.0):
+def _read_frame_safe(cap, msec=None, timeout=5.0):
     """Read a frame from VideoCapture with a timeout to avoid hangs on corrupt video."""
     result = [False, None]
 
     def _read():
+        if msec is not None: cap.set(cv2.CAP_PROP_POS_MSEC, msec)
         result[0], result[1] = cap.read()
 
     t = threading.Thread(target=_read, daemon=True)
@@ -399,7 +408,7 @@ def _read_frame_safe(cap, timeout=5.0):
 
 
 def detect_all_persons(video_path, start, end, width, height, sample_count,
-                        yolo_device: str = "auto"):
+                        yolo_device: str = "auto", debug_frames: bool = False):
     """Track persons across frames for dynamic cropping.
 
     Primary: YOLO person detection (catches ALL people regardless of pose).
@@ -412,11 +421,6 @@ def detect_all_persons(video_path, start, end, width, height, sample_count,
     (e.g. rotation metadata) and rescales coordinates to match ffprobe's
     dimensions, which are what ffmpeg uses for cropping.
     """
-    try:
-        import cv2
-    except ImportError:
-        print("[!] opencv not installed -> fallback (Blurry Padding)")
-        return []
 
     # Try YOLO first (much more reliable)
     yolo, yolo_dev = _get_yolo_model(yolo_device)
@@ -425,13 +429,13 @@ def detect_all_persons(video_path, start, end, width, height, sample_count,
     # Fallback: face detectors
     yunet = None
     cascades = None
-    if not use_yolo:
+    if not use_yolo: # type: ignore
         yunet = _create_yunet_detector()
         if yunet:
-            print("[i] Using YuNet face detector (fallback)")
+            logger.info("Using YuNet face detector (fallback)")
         else:
             cascades = _load_cascades(cv2)
-            if not cascades:
+            if not cascades: # type: ignore
                 return []
             print("[i] Using Haar cascade face detector (fallback)")
 
@@ -455,157 +459,101 @@ def detect_all_persons(video_path, start, end, width, height, sample_count,
 
     # ── Detect dimension mismatch (rotation / codec quirks) ───────────
     # Read one frame to get actual OpenCV dimensions
-    cap.set(cv2.CAP_PROP_POS_MSEC, start * 1000)
-    ok, test_frame = _read_frame_safe(cap, timeout=10.0)
+    ok, test_frame = _read_frame_safe(cap, msec=start * 1000, timeout=10.0)
     scale_x, scale_y = 1.0, 1.0
-    if ok and test_frame is not None:
+    if ok and test_frame is not None: # type: ignore
         cv_h, cv_w = test_frame.shape[:2]
         if cv_w != width or cv_h != height:
             # Dimensions differ — need to rescale coordinates
             # OpenCV reads raw coded dimensions; ffprobe may report rotated
             scale_x = width / cv_w
             scale_y = height / cv_h
-            print(f"[!] Dimension mismatch: ffprobe={width}x{height}, "
+            logger.warning(f"Dimension mismatch: ffprobe={width}x{height}, "
                   f"OpenCV={cv_w}x{cv_h} → rescaling coords by {scale_x:.2f}x{scale_y:.2f}")
             # Check if it's a 90°/270° rotation (width/height swapped)
             if abs(cv_w - height) < 4 and abs(cv_h - width) < 4:
                 print(f"[!] Detected 90° rotation — swapping coordinate axes")
 
-    debug_frame = test_frame  # save first frame for debug output
+    debug_frame = test_frame # type: ignore # save first frame for debug output
     debug_saved = False
-    last_good_persons = None  # for gap-filling frames with no detection
+    last_good_persons = None # for gap-filling frames with no detection
 
-    # Read all sample frames first (enables batched YOLO inference)
-    frame_samples: list[tuple[float, object]] = []
-    for t in sample_times:
-        if is_cancelled():
-            cap.release()
-            raise CancelledError("Person detection cancelled")
-        cap.set(cv2.CAP_PROP_POS_MSEC, (start + t) * 1000)
-        ok, frame = _read_frame_safe(cap, timeout=5.0)
-        if ok and frame is not None:
-            frame_samples.append((t, frame))
-    cap.release()
-
-    # Batched YOLO: conf 0.30, retry misses at 0.15
-    yolo_results: dict[float, list] = {}
-    if use_yolo and frame_samples:
-        times = [t for t, _ in frame_samples]
-        frames = [f for _, f in frame_samples]
-        for i in range(0, len(frames), YOLO_BATCH_SIZE):
+    # ── Process in chunks to save memory ──
+    for i in range(0, len(sample_times), YOLO_BATCH_SIZE):
+        batch_times = sample_times[i : i + YOLO_BATCH_SIZE]
+        batch_frames = []
+        
+        for t in batch_times:
             if is_cancelled():
-                raise CancelledError("Person detection cancelled")
-            batch_t = times[i:i + YOLO_BATCH_SIZE]
-            batch_f = frames[i:i + YOLO_BATCH_SIZE]
-            batch_out = _detect_persons_yolo_batch(batch_f, yolo, yolo_dev, conf=0.30)
-            for t, persons in zip(batch_t, batch_out):
-                if persons:
-                    yolo_results[t] = persons
-        missing = [(t, f) for t, f in frame_samples if t not in yolo_results]
-        if missing:
-            for i in range(0, len(missing), YOLO_BATCH_SIZE):
-                batch = missing[i:i + YOLO_BATCH_SIZE]
-                batch_out = _detect_persons_yolo_batch(
-                    [f for _, f in batch], yolo, yolo_dev, conf=0.15,
-                )
-                for (t, _), persons in zip(batch, batch_out):
-                    if persons:
-                        yolo_results[t] = persons
-
-    if not use_yolo:
-        cap = cv2.VideoCapture(str(video_path))
-
-    for t in sample_times:
-        if is_cancelled():
-            if not use_yolo:
                 cap.release()
-            raise CancelledError("Person detection cancelled")
+                raise CancelledError("Person detection cancelled")
+            ok, frame = _read_frame_safe(cap, msec=(start + t) * 1000)
+            if ok and frame is not None:
+                batch_frames.append((t, frame))
 
-        frame = None
+        if not batch_frames: continue
+
+        # Run Inference
+        batch_results = []
         if use_yolo:
-            for st, fr in frame_samples:
-                if st == t:
-                    frame = fr
-                    break
-            if frame is None:
-                continue
+            y_frames = [f for _, f in batch_frames]
+            batch_persons = _detect_persons_yolo_batch(y_frames, yolo, yolo_dev, conf=0.30)
+            for (t, frame), persons in zip(batch_frames, batch_persons):
+                if not persons: # Retry misses
+                    persons = _detect_persons_yolo(frame, yolo, yolo_dev, conf=0.15)
+                batch_results.append((t, frame, persons))
         else:
-            cap.set(cv2.CAP_PROP_POS_MSEC, (start + t) * 1000)
-            ok, frame = _read_frame_safe(cap, timeout=5.0)
-            if not ok or frame is None:
-                continue
-
-        persons = []
-
-        if use_yolo:
-            persons = yolo_results.get(t, [])
-            if persons:
-                yolo_frames += 1
-        else:
-            # Fallback chain: YuNet → Haar
-            if yunet:
-                persons = _detect_faces_yunet(frame, yunet)
-                if not persons and width > 400:
-                    try:
-                        upscaled = cv2.resize(frame, None, fx=1.5, fy=1.5)
-                        up_faces = _detect_faces_yunet(upscaled, yunet)
-                        if up_faces:
-                            persons = [
-                                (int(cx / 1.5), int(cy / 1.5), int(area / 2.25), conf, int(fh / 1.5))
-                                for cx, cy, area, conf, fh in up_faces
-                            ]
-                    except Exception:
-                        pass
-
-            if not persons:
-                if cascades is None:
-                    cascades = _load_cascades(cv2)
-                if cascades:
+            for t, frame in batch_frames:
+                persons = []
+                if yunet:
+                    persons = _detect_faces_yunet(frame, yunet)
+                if not persons and cascades:
                     persons = _detect_faces_haar(frame, cascades, scale)
+                batch_results.append((t, frame, persons))
+
+        # Post-process detections
+        for t, frame, persons in batch_results:
+            if persons and (scale_x != 1.0 or scale_y != 1.0):
+                # Check for 90/270 swap logic
+                cv_h, cv_w = frame.shape[:2]
+                is_swapped = abs(cv_w - height) < 4 and abs(cv_h - width) < 4
+                
+                new_persons = []
+                for hx, hy, a, c, h in persons:
+                    if is_swapped:
+                        # Map raw (x,y) to rotated coordinate space
+                        # This is a simplified mapping; exact transpose depends on metadata
+                        new_hx, new_hy = int(hy * scale_x), int(hx * scale_y)
+                    else:
+                        new_hx, new_hy = int(hx * scale_x), int(hy * scale_y)
+                    new_persons.append((new_hx, new_hy, int(a * scale_x * scale_y), c, int(h * scale_y)))
+                persons = new_persons
 
             if persons:
-                face_frames += 1
+                detections.append((t, persons))
+                detected_frames += 1
+                if use_yolo: yolo_frames += 1
+                else: face_frames += 1
+                last_good_persons = persons
+                # Save debug frame only once for the first detection if debug_frames is True
+                if not debug_saved and use_yolo and debug_frames:
+                    _save_debug_frame(frame, persons, width, height, scale_x, scale_y, video_path)
+                    debug_saved = True
+            elif last_good_persons is not None:
+                detections.append((t, last_good_persons))
 
-        # Rescale coordinates if dimensions don't match
-        if persons and (scale_x != 1.0 or scale_y != 1.0):
-            persons = [
-                (int(hx * scale_x), int(hy * scale_y), int(a * scale_x * scale_y),
-                 c, int(h * scale_y))
-                for hx, hy, a, c, h in persons
-            ]
-
-        if persons:
-            detections.append((t, persons))
-            detected_frames += 1
-            last_good_persons = persons  # remember for gap-filling
-
-            # Save debug frame on first detection (to verify crop visually)
-            if not debug_saved and use_yolo:
-                _save_debug_frame(frame, persons, width, height, scale_x, scale_y,
-                                  video_path)
-                debug_saved = True
-        elif last_good_persons is not None:
-            # Gap-fill: no person detected (transition/black frame).
-            # Carry forward the LAST known position so the crop holds steady
-            # instead of having a gap that could cause a jump to center.
-            detections.append((t, last_good_persons))
-
-    if not use_yolo:
-        cap.release()
+    cap.release()
 
     total_persons = sum(len(p) for _, p in detections)
     method = "YOLO" if use_yolo else "face detection"
-    extras = []
-    if yolo_frames:
-        extras.append(f"{yolo_frames} YOLO")
-    if face_frames:
-        extras.append(f"{face_frames} face")
+    extras = [f"{yolo_frames} YOLO" if yolo_frames else "", f"{face_frames} face" if face_frames else ""]
+    extras = [e for e in extras if e]
     extra = f" ({', '.join(extras)})" if extras else ""
-    print(f"[i] Tracking ({method}): {detected_frames}/{len(sample_times)} frames, "
-          f"{total_persons} total detections{extra}")
+
+    logger.info(f"Tracking ({method}): {detected_frames}/{len(sample_times)} frames, {total_persons} total detections{extra}")
 
     if detected_frames == 0:
-        print("[!] No persons detected in any frame -> fallback (Blurry Padding)")
+        logger.warning("No persons detected in any frame -> fallback (Blurry Padding)")
         return [], 1.0, 1.0
 
     return detections, scale_x, scale_y
@@ -721,7 +669,7 @@ def _refine_transitions(detections, video_path, start, width, height,
     result.sort(key=lambda e: e[0])
 
     # Remove detections that fall inside the transition gap (cut frames).
-    # These are frames near the cut boundary where YOLO may detect a person
+    # These are frames near the cut boundary where YOLO might detect a person
     # from the wrong scene, causing the crop to briefly show an empty area.
     # For each transition, suppress detections in a window around the cut
     # point — let the old crop hold through the entire transition.
@@ -730,7 +678,7 @@ def _refine_transitions(detections, video_path, start, width, height,
         # Suppress detections from [lo - HOLD_BEFORE, lo + DELAY] that look
         # like the new scene (they'd cause a premature crop switch)
         suppress_start = t_lo - CUT_HOLD_BEFORE
-        suppress_end = t_lo + CUT_DELAY_SEC
+        suppress_end = t_lo + CUT_DELAY_SEC # type: ignore
         result = [
             (t, persons) for t, persons in result
             if not (suppress_start < t < suppress_end and persons and
@@ -738,7 +686,7 @@ def _refine_transitions(detections, video_path, start, width, height,
         ]
 
     total_refined = sum(len(entries) for _, entries in insertions)
-    print(f"[+] Refined {len(insertions)} transition(s), "
+    logger.info(f"Refined {len(insertions)} transition(s), "
           f"added {total_refined} sub-frame detections")
 
     return result
@@ -748,14 +696,14 @@ def _detect_people(video_path, start, end, width, height, sample_count):
     """Detect persons for static crop. Returns (median_x, head_y) or (None, None)."""
     detections, _, _ = detect_all_persons(video_path, start, end, width, height, sample_count)
     if not detections:
-        print("[!] No persons detected -> fallback (Blurry Padding)")
+        logger.warning("No persons detected -> fallback (Blurry Padding)")
         return None, None
 
     frame_detections = []
     for t, persons in detections:
         best = max(persons, key=lambda p: p[2])
         frame_detections.append((best[0], best[1]))
-
+    # type: ignore
     xs = [d[0] for d in frame_detections]
     ys = [d[1] for d in frame_detections]
     result_x = int(np.median(xs))
@@ -953,6 +901,8 @@ def _save_debug_frame(frame, persons, ffprobe_w, ffprobe_h, scale_x, scale_y,
     """
     try:
         import cv2
+        if frame is None or frame.size == 0:
+            return
         debug = frame.copy()
         cv_h, cv_w = debug.shape[:2]
 
@@ -1016,9 +966,9 @@ def _save_debug_frame(frame, persons, ffprobe_w, ffprobe_h, scale_x, scale_y,
         # Save
         debug_path = Path(video_path).parent / "crop_debug.jpg"
         cv2.imwrite(str(debug_path), debug)
-        print(f"[i] Debug frame saved: {debug_path}")
+        logger.info(f"Debug frame saved: {debug_path}")
     except Exception as e:
-        print(f"[!] Debug frame save failed: {e}")
+        logger.exception("Debug frame save failed")
 
 
 def _frange(start, stop, step):

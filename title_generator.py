@@ -3,6 +3,8 @@
 Falls back to a simple extraction heuristic if Ollama is unavailable,
 so this never blocks the pipeline.
 """
+import re
+import random
 
 from ollama_client import (
     DEFAULT_MODEL,
@@ -81,17 +83,15 @@ def _ask_ollama(transcript: str, model: str = DEFAULT_MODEL, language: str = Non
 
 def _heuristic_title(transcript: str) -> str:
     """Fallback: generate a clickbait-style title from transcript keywords."""
-    import random
     if not transcript:
         return ""
 
-    words = transcript.lower().split()
-
-    # Extract a short key phrase (2-4 words) from the middle of the transcript
-    # Middle tends to have the core topic, not filler intro/outro
-    mid = len(words) // 2
-    start = max(0, mid - 2)
-    key_phrase = " ".join(words[start:start + 3]).strip(".,!?;:'\"")
+    # Clean and find descriptive words (longer words are usually more interesting)
+    words = re.sub(r'[^\w\s]', '', transcript).lower().split()
+    # Filter out common short filler words, sort by length
+    interesting_words = [w for w in words if len(w) > 4]
+    if not interesting_words: interesting_words = words[:5]
+    key_phrase = random.choice(interesting_words) if interesting_words else "This"
 
     # Clickbait templates — {topic} gets replaced with the key phrase
     templates = [
@@ -141,8 +141,7 @@ def generate_title(transcript: str, model: str = DEFAULT_MODEL, language: str = 
         return ""
     
     # Clean up transcript from Whisper metadata if present (e.g. [laughter], (silence))
-    import re
-    clean_transcript = re.sub(r'\[.*?\]|\(.*?\)', '', transcript).strip()
+    clean_transcript = re.sub(r'\[.*?\]|\(.*?\)', '', transcript).replace('\n', ' ').strip()
 
     # Try Ollama first — auto-pull model if needed
     if ensure_model(model):

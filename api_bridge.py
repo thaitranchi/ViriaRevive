@@ -10,18 +10,36 @@ import functools
 import http.server
 import json
 import os
+import re
+import queue
 import shutil
-import socket
+import tempfile
 import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
 import yt_dlp
+import logging
 
+try:
+    from cryptography.fernet import Fernet
+except ImportError:
+    Fernet = None
+
+try:
+    import keyring
+except ImportError:
+    keyring = None
+
+import config
 from config import (
     BASE_DIR,
     AI_DETECTOR_MODE,
+    AI_PROVIDER,
+    CLIENT_SECRETS_FILE,
+    GEMINI_TOKEN_FILE,
+    GEMINI_API_KEY,
     CLIPS_DIR,
     CLIP_DURATION,
     CROP_VERTICAL,
@@ -42,6 +60,7 @@ from config import (
     WHISPER_MODEL,
     YOLO_DEVICE,
 )
+import gemini_client
 from hwaccel import log_hardware_startup, probe_ffmpeg
 from detector import find_viral_moments
 from ollama_detector import detector_ready, rerank_moments
@@ -67,6 +86,8 @@ from uploader import (
     list_accounts,
 )
 
+logger = logging.getLogger(__name__)
+
 STATE_FILE = BASE_DIR / "viria_state.json"
 
 # Local video input (GUI file picker) — must match frontend allowed extensions
@@ -76,7 +97,6 @@ ALLOWED_INPUT_VIDEO_EXT = {".mp4", ".mkv", ".mov", ".webm"}
 # ── Log interceptor — captures print() and forwards to the GUI console ───────
 
 import sys as _sys
-import io as _io
 
 
 class _LogTee:
@@ -85,7 +105,7 @@ class _LogTee:
     def __init__(self, original, callback):
         self._orig = original
         self._cb = callback
-        self._encoding = getattr(original, 'encoding', 'utf-8')
+        self._encoding = getattr(original, 'encoding', 'utf-8') # type: ignore
 
     def write(self, text):
         try:
@@ -115,23 +135,31 @@ _log_bridge = None  # set by ApiBridge.__init__
 
 
 def _install_log_tee():
-    """Install stdout/stderr tee that pushes logs to the frontend console."""
+    """Configure Python's logging to push messages to the frontend console."""
     _forwarding = threading.local()
 
     def _forward(text):
         # Guard against recursion (if evaluate_js triggers a print)
         if getattr(_forwarding, 'active', False):
             return
-        _forwarding.active = True
+        _forwarding.active = True # type: ignore
         try:
             if _log_bridge and _log_bridge._window:
                 escaped = text.replace("\\", "\\\\").replace("`", "\\`").replace("$", "\\$")
                 _log_bridge._js(f"window.onConsoleLog(`{escaped}`)")
         finally:
-            _forwarding.active = False
+            _forwarding.active = False # type: ignore
 
-    _sys.stdout = _LogTee(_sys.__stdout__ or _sys.stdout, _forward)
-    _sys.stderr = _LogTee(_sys.__stderr__ or _sys.stderr, _forward)
+    # Create a custom handler that uses our _forward function
+    class ConsoleHandler(logging.Handler):
+        def emit(self, record):
+            _forward(self.format(record))
+
+    # Configure the root logger to use this handler
+    logging.basicConfig(level=logging.INFO, handlers=[ConsoleHandler()])
+    # Also redirect stdout/stderr to the logger for non-logging prints
+    _sys.stdout = _LogTee(_sys.__stdout__ or _sys.stdout, _forward) # type: ignore
+    _sys.stderr = _LogTee(_sys.__stderr__ or _sys.stderr, _forward) # type: ignore
 
 
 # ── Local video server (serves clip files for HTML5 <video> preview) ─────────
@@ -172,7 +200,7 @@ def _start_video_server(clips_dir: Path) -> int:
     # Bind to port 0 → OS picks a free port
     server = _SilentHTTPServer(("127.0.0.1", 0), handler)
     port = server.server_address[1]
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    threading.Thread(target=server.serve_forever, daemon=True).start() # type: ignore
     print(f"[+] Video preview server on http://127.0.0.1:{port}")
     return port
 
@@ -182,6 +210,12 @@ class ApiBridge:
         self._window = None
         self._processing = False
         self._cancel = False
+        self._pipeline_queue = queue.Queue()
+        self._worker_thread = None
+        self._worker_lock = threading.Lock()
+        self._state_lock = threading.Lock()
+        self._active_item_index = None
+
         self._results: list[Path] = []
         self._moments: list[dict] = []
         self._scheduled: list[dict] = []
@@ -208,6 +242,45 @@ class ApiBridge:
 
     # ── Exposed: config / deps ───────────────────────────────────────────
 
+    def _get_cipher(self):
+        """Initialize or retrieve the encryption cipher from Windows Credential Manager."""
+        if not Fernet:
+            return None
+
+        service_name = "ViriaRevive"
+        account_name = "MasterEncryptionKey"
+
+        # Try Windows Credential Manager first
+        if keyring:
+            try:
+                stored_key = keyring.get_password(service_name, account_name)
+                if not stored_key:
+                    new_key = Fernet.generate_key().decode()
+                    keyring.set_password(service_name, account_name, new_key)
+                    stored_key = new_key
+                return Fernet(stored_key.encode()) # type: ignore
+            except Exception as e:
+                print(f"[security] Keyring access failed: {e}. Using fallback storage.")
+
+        # Fallback to local file if keyring is unavailable or fails
+        key_file = BASE_DIR / "tokens" / ".crypt.key"
+        if not key_file.exists():
+            key_file.parent.mkdir(exist_ok=True)
+            key = Fernet.generate_key()
+            key_file.write_bytes(key)
+        return Fernet(key_file.read_bytes())
+
+    def _encrypt(self, text):
+        cipher = self._get_cipher()
+        if not text or not cipher: return text
+        return cipher.encrypt(text.encode()).decode()
+
+    def _decrypt(self, text):
+        cipher = self._get_cipher()
+        if not text or not cipher: return text
+        try: return cipher.decrypt(text.encode()).decode()
+        except Exception: return text
+
     def get_settings(self):
         """Return user settings (persisted overrides merged with defaults)."""
         defaults = {
@@ -228,12 +301,33 @@ class ApiBridge:
         # Merge saved user overrides (from save_settings)
         if self._user_settings:
             defaults.update(self._user_settings)
+        # Ensure the Gemini key is included if it exists in the token file
+        defaults["gemini_api_key"] = self._decrypt(config.GEMINI_API_KEY)
         defaults["crop_vertical"] = True
         return defaults
 
     def save_settings(self, settings):
         """Persist user settings to disk so they survive restarts."""
-        self._user_settings = settings or {}
+        new_settings = (settings or {}).copy()
+
+        # Extract Gemini key and save to tokens/gemini_key.json instead of viria_state.json
+        gemini_key = new_settings.pop("gemini_api_key", None)
+        if gemini_key is not None:
+            try:
+                secrets = {}
+                if GEMINI_TOKEN_FILE.exists():
+                    with open(GEMINI_TOKEN_FILE, 'r', encoding='utf-8') as f:
+                        secrets = json.load(f)
+                secrets["gemini_api_key"] = self._encrypt(gemini_key)
+                with open(GEMINI_TOKEN_FILE, 'w', encoding='utf-8') as f:
+                    json.dump(secrets, f, indent=2)
+                
+                # Update runtime value so changes take effect without restart
+                config.GEMINI_API_KEY = gemini_key
+            except Exception as e:
+                logger.exception("Failed to write Gemini key to tokens file")
+
+        self._user_settings = new_settings
         self._user_settings["crop_vertical"] = True
         self._save_state()
         return {"ok": True}
@@ -276,7 +370,11 @@ class ApiBridge:
             self._moments.append({})
 
         # Backfill any clips missing transcripts
-        missing = [i for i in range(num_clips)
+        # If using Gemini, we only need to backfill if we want titles right now
+        results_count = len(self._results)
+        if num_clips > results_count:
+            num_clips = results_count
+        missing = [i for i in range(results_count)
                    if not self._moments[i].get("transcript")]
         if missing:
             for i in missing:
@@ -287,9 +385,7 @@ class ApiBridge:
         if not any(transcripts):
             return {"titles": [], "error": "No transcripts available — process clips first"}
 
-        lang = self._user_settings.get("whisper_language") or WHISPER_LANGUAGE or None
-        llm_available = ensure_model(DEFAULT_MODEL)
-        titles = generate_titles_batch(transcripts, language=lang)
+        titles, llm_available = self._batch_generate_titles(transcripts)
         return {"titles": titles, "llm": llm_available}
 
     def generate_title_for_clip(self, clip_index):
@@ -310,8 +406,7 @@ class ApiBridge:
 
         if not transcript:
             return {"title": "", "error": "No transcript for this clip"}
-        lang = self._user_settings.get("whisper_language") or WHISPER_LANGUAGE or None
-        title = generate_title(transcript, language=lang)
+        title = self._generate_single_title(transcript)
         return {"title": title}
 
     def rename_clip(self, clip_index, new_title):
@@ -325,8 +420,6 @@ class ApiBridge:
         if not old_path.exists():
             return {"error": "File not found"}
 
-        # Sanitize title for filesystem
-        import re
         # Remove emojis and non-ASCII chars that cause issues on Windows
         safe = re.sub(r'[^\x20-\x7E]', '', new_title)
         safe = re.sub(r'[<>:"/\\|?*]', '', safe)
@@ -349,7 +442,7 @@ class ApiBridge:
         try:
             old_path.rename(new_path)
             self._results[clip_index] = new_path
-            self._save_state()
+            self._save_state() # type: ignore
             print(f"[rename] {old_path.name} → {new_path.name}")
             return {"filename": new_path.name, "path": str(new_path)}
         except Exception as e:
@@ -364,7 +457,7 @@ class ApiBridge:
         """
         threading.Thread(target=self._run_title_gen, daemon=True).start()
         return {"ok": True}
-
+    
     def generate_and_rename_indices(self, indices):
         """Generate AI titles only for specific clip indices (e.g. a folder).
 
@@ -372,7 +465,7 @@ class ApiBridge:
         pushed to the frontend via window.onTitleProgress and
         window.onTitlesDone callbacks.
         """
-        threading.Thread(target=self._run_title_gen, args=(indices,), daemon=True).start()
+        threading.Thread(target=self._run_title_gen, args=(indices,), daemon=True).start() # type: ignore
         return {"ok": True}
 
     def _run_title_gen(self, only_indices=None):
@@ -382,9 +475,7 @@ class ApiBridge:
         are transcribed and titled. Otherwise all clips are processed.
         """
         try:
-            from title_generator import ensure_model, DEFAULT_MODEL
-
-            num_clips = len(self._results)
+            num_clips = len(self._results) # type: ignore
             print(f"[title-gen] {num_clips} clips, {len(self._moments)} moments in state")
 
             # Trim moments to match results (moments can accumulate beyond results
@@ -398,7 +489,7 @@ class ApiBridge:
             # Determine which indices to process
             target_indices = only_indices if only_indices is not None else list(range(num_clips))
             # Filter to valid range
-            target_indices = [i for i in target_indices if 0 <= i < num_clips]
+            target_indices = [i for i in target_indices if 0 <= i < num_clips] # type: ignore
             if not target_indices:
                 self._js("window.onTitlesDone && window.onTitlesDone({error: 'No valid clips to process'})")
                 return
@@ -406,14 +497,14 @@ class ApiBridge:
             print(f"[title-gen] Processing {len(target_indices)} of {num_clips} clips")
 
             # Backfill any target clips missing transcripts
-            missing = [i for i in target_indices
-                       if not self._moments[i].get("transcript")]
+            missing = [i for i in target_indices # type: ignore
+                       if not self._moments[i].get("transcript")] # type: ignore
             if missing:
                 print(f"[title-gen] {len(missing)} clips missing transcripts, backfilling...")
                 for idx, i in enumerate(missing):
-                    self._js(f"window.onTitleProgress && window.onTitleProgress({idx}, {len(missing)}, 'Transcribing clip {i+1}...')")
+                    self._js(f"window.onTitleProgress && window.onTitleProgress({idx}, {len(missing)}, 'Transcribing clip {i+1}...')") # type: ignore
                     self._backfill_transcript_single(i)
-                self._save_state()
+                self._save_state() # type: ignore
 
             # Build transcripts list — only for target indices, empty for others
             transcripts = [""] * num_clips
@@ -423,25 +514,18 @@ class ApiBridge:
                 self._js("window.onTitlesDone && window.onTitlesDone({error: 'No transcripts available'})")
                 return
 
-            # Store original stem before renaming
-            import re
             for i in target_indices:
-                p = self._results[i]
+                p = self._results[i] # type: ignore
                 if i < len(self._moments) and not self._moments[i].get("source_stem"):
                     m = re.match(r'^(.+?)_viral\d+', p.name)
                     self._moments[i]["source_stem"] = m.group(1) if m else p.stem
 
-            llm_available = ensure_model(DEFAULT_MODEL)
-
             def _on_progress(done, total, title):
                 self._js(f"window.onTitleProgress && window.onTitleProgress({done}, {total}, `{self._esc(title or '')}`)")
 
-            lang = self._user_settings.get("title_language") or self._user_settings.get("whisper_language") or WHISPER_LANGUAGE or None
-            titles = generate_titles_batch(
-                transcripts, DEFAULT_MODEL, language=lang, on_progress=_on_progress
-            )
+            titles, llm_available = self._batch_generate_titles(transcripts, on_progress=_on_progress)
 
-            renamed = 0
+            renamed = 0 # type: ignore
             results = []
             for i in target_indices:
                 title = titles[i] if i < len(titles) else ""
@@ -450,30 +534,29 @@ class ApiBridge:
                     continue
                 r = self.rename_clip(i, title)
                 ok = "filename" in r
-                if ok:
+                if ok: # type: ignore
                     renamed += 1
                 results.append({
                     "index": i,
                     "title": title,
                     "renamed": ok,
                     "filename": r.get("filename", self._results[i].name if i < len(self._results) else ""),
-                })
+                }) # type: ignore
 
             self._save_state()
 
             # Push results to frontend
-            import json
-            payload = json.dumps({"titles": results, "renamed": renamed, "llm": llm_available, "total": len(titles)})
+            payload = json.dumps({"titles": results, "renamed": renamed, "llm": llm_available, "total": len(target_indices)})
             self._js(f"window.onTitlesDone && window.onTitlesDone({payload})")
 
         except Exception as e:
-            print(f"[title-gen] Error: {e}")
-            self._js(f"window.onTitlesDone && window.onTitlesDone({{error: `{self._esc(str(e))}`}})")
+            logger.exception("Error in title generation")
+            self._js(f"window.onTitlesDone && window.onTitlesDone({{error: `{self._esc('An internal error occurred during title generation.')}`}})")
 
-    def _backfill_transcripts(self):
+    def _backfill_transcripts(self): # type: ignore
         """Transcribe clips that are missing transcripts (e.g. from previous sessions)."""
         print("[title-gen] Backfilling missing transcripts from clip audio...")
-        for i, p in enumerate(self._results):
+        for i, p in enumerate(self._results): # type: ignore
             if i < len(self._moments) and self._moments[i].get("transcript"):
                 continue  # already has transcript
             self._backfill_transcript_single(i)
@@ -482,7 +565,7 @@ class ApiBridge:
     def _backfill_transcript_single(self, clip_index):
         """Transcribe a single clip to fill in its transcript."""
         import tempfile
-        if clip_index >= len(self._results):
+        if clip_index >= len(self._results): # type: ignore
             return
         p = self._results[clip_index]
         if not p.exists():
@@ -491,14 +574,14 @@ class ApiBridge:
         # Ensure moments slot exists
         while len(self._moments) <= clip_index:
             self._moments.append({})
-
+        
         try:
             wav = Path(tempfile.gettempdir()) / f"viria_backfill_{clip_index}.wav"
             extract_audio_clip(p, 0, 60, wav)  # max 60s
-            if wav.exists() and wav.stat().st_size > 1000:
+            if wav.exists() and wav.stat().st_size > 1000: # type: ignore
                 words = transcribe_clip(
                     wav, model_size=WHISPER_MODEL, language=None, device_pref=WHISPER_DEVICE,
-                )
+                ) # type: ignore
                 transcript = " ".join(w.get("text", "") for w in words).strip()
                 if transcript:
                     self._moments[clip_index]["transcript"] = transcript
@@ -506,9 +589,43 @@ class ApiBridge:
             try:
                 wav.unlink(missing_ok=True)
             except Exception:
-                pass
+                pass # type: ignore
         except Exception as e:
             print(f"  [!] Backfill failed for clip {clip_index + 1}: {e}")
+
+    def _batch_generate_titles(self, transcripts, on_progress=None):
+        """Helper to route batch title generation to the selected AI provider."""
+        ai_provider = self._user_settings.get("ai_provider", AI_PROVIDER)
+        gemini_key = self._decrypt(config.GEMINI_API_KEY)
+        use_gemini = ai_provider == "gemini" and gemini_client.is_available(gemini_key)
+        lang = self._user_settings.get("title_language") or self._user_settings.get("whisper_language")
+
+        if use_gemini:
+            titles = gemini_client.generate_titles_batch(
+                transcripts, gemini_key, language=lang, on_progress=on_progress
+            ) # type: ignore
+            return titles, True
+        else:
+            model = self._user_settings.get("ollama_detector_model", OLLAMA_DETECTOR_MODEL)
+            llm_ready = ensure_model(model)
+            titles = generate_titles_batch(
+                transcripts, model=model, language=lang, on_progress=on_progress
+            )
+            return titles, llm_ready
+
+    def _generate_single_title(self, transcript):
+        """Helper to route single title generation to the selected AI provider."""
+        ai_provider = self._user_settings.get("ai_provider", AI_PROVIDER)
+        gemini_key = self._decrypt(config.GEMINI_API_KEY)
+        use_gemini = ai_provider == "gemini" and gemini_client.is_available(gemini_key)
+        lang = self._user_settings.get("title_language") or self._user_settings.get("whisper_language")
+
+        if use_gemini:
+            prompt = f"Create a viral YouTube Short title in {lang or 'English'} for: {transcript}"
+            return gemini_client.generate(prompt, gemini_key)
+        else:
+            model = self._user_settings.get("ollama_detector_model", OLLAMA_DETECTOR_MODEL)
+            return generate_title(transcript, model=model, language=lang)
 
     def get_ollama_models(self):
         """Return available Ollama models for title generation."""
@@ -660,24 +777,72 @@ class ApiBridge:
 
     # ── Exposed: processing ──────────────────────────────────────────────
 
-    def start_processing(self, url, settings, file_path=None):
-        if self._processing:
-            return {"error": "Already processing"}
-        self._processing = True
-        self._cancel = False
-        from subprocess_utils import reset_cancel
-        reset_cancel()
-        # Store pre-existing results count so _run_pipeline appends instead of replacing
-        self._results_before = len(self._results)
-        threading.Thread(
-            target=self._run_pipeline,
-            args=(url, settings, file_path),
-            daemon=True,
-        ).start()
-        return {"ok": True}
+    def start_processing(self, url, settings, file_path=None, item_index=None):
+        """Add a video processing task to the queue."""
+        task = {
+            "url": url,
+            "settings": settings,
+            "file_path": file_path,
+            "item_index": item_index,
+            "results_before": len(self._results)
+        }
+        self._pipeline_queue.put(task)
+        
+        with self._worker_lock:
+            if not self._worker_thread or not self._worker_thread.is_alive():
+                self._cancel = False
+                from subprocess_utils import reset_cancel
+                reset_cancel()
+                self._worker_thread = threading.Thread(target=self._pipeline_worker, daemon=True)
+                self._worker_thread.start()
+                
+        return {"ok": True, "queued": self._pipeline_queue.qsize()}
+
+    def _pipeline_worker(self):
+        """Worker thread that pulls tasks from the queue and executes the pipeline."""
+        while not self._pipeline_queue.empty():
+            if self._cancel:
+                break
+            
+            try:
+                task = self._pipeline_queue.get_nowait()
+            except queue.Empty:
+                break
+                
+            self._processing = True
+            self._active_item_index = task["item_index"]
+            self._results_before = task["results_before"]
+            
+            # Reset cancellation state for this specific task
+            from subprocess_utils import reset_cancel
+            reset_cancel()
+            
+            try:
+                self._run_pipeline(task["url"], task["settings"], task["file_path"])
+            except Exception as e:
+                logger.exception("Critical error in pipeline")
+                self._error(f"Internal error: {e}")
+            finally:
+                self._pipeline_queue.task_done()
+                
+        self._processing = False
+        self._active_item_index = None
 
     def cancel_processing(self):
+        self._cancel = False
         self._cancel = True
+        
+        # Clear the pending queue
+        while not self._pipeline_queue.empty():
+            try:
+                task = self._pipeline_queue.get_nowait()
+                idx = task.get("item_index")
+                if idx is not None:
+                    self._js(f"window.onPipelineComplete(false, 0, 0, 'Cancelled', {idx})")
+                self._pipeline_queue.task_done()
+            except queue.Empty:
+                break
+
         from subprocess_utils import request_cancel
         request_cancel()
         return {"ok": True}
@@ -686,7 +851,7 @@ class ApiBridge:
 
     def get_results(self):
         clips = []
-        for i, p in enumerate(self._results):
+        for i, p in enumerate(self._results): # type: ignore
             clip = {
                 "path": str(p),
                 "filename": p.name,
@@ -734,7 +899,7 @@ class ApiBridge:
 
     def get_video_url(self, clip_index):
         """Return a local HTTP URL for the clip so the HTML5 <video> can play it."""
-        if 0 <= clip_index < len(self._results):
+        if 0 <= clip_index < len(self._results): # type: ignore
             p = self._results[clip_index]
             if p.exists():
                 return {"url": f"http://127.0.0.1:{self._video_port}/{p.name}"}
@@ -742,18 +907,38 @@ class ApiBridge:
 
     # ── Exposed: delete clip ────────────────────────────────────────────
 
+    def _robust_unlink(self, path: Path, retries: int = 5, delay: float = 0.3):
+        """Attempt to unlink a file with retries, handling temporary locks."""
+        if not path or not path.exists():
+            return True
+        for i in range(retries):
+            try:
+                path.unlink() # type: ignore
+                return True
+            except OSError as e:
+                if i < retries - 1:
+                    logger.warning(f"Retrying unlink of {path.name} (attempt {i+1}/{retries}): {e}")
+                    time.sleep(delay)
+                else:
+                    logger.error(f"Failed to unlink {path.name} after {retries} attempts: {e}")
+                    return False
+            except Exception as e:
+                print(f"[cleanup] Unexpected error unlinking {path.name}: {e}")
+                return False
+        return False
+
     def delete_clip(self, clip_index):
         """Delete a clip by its index in the current results list."""
-        if 0 <= clip_index < len(self._results):
+        if 0 <= clip_index < len(self._results): # type: ignore
             p = self._results[clip_index]
             try:
                 if p.exists():
-                    p.unlink()
+                    self._robust_unlink(p)
                 self._results.pop(clip_index)
                 # Remove matching moments entry
                 if clip_index < len(self._moments):
                     self._moments.pop(clip_index)
-                self._save_state()
+                self._save_state() # type: ignore
                 return {"ok": True}
             except Exception as e:
                 return {"error": str(e)}
@@ -764,11 +949,11 @@ class ApiBridge:
         target = CLIPS_DIR / filename
         if target.exists() and target.parent == CLIPS_DIR:
             try:
-                target.unlink()
+                self._robust_unlink(target)
                 # Also remove from results if it was there
                 self._results = [p for p in self._results if p.name != filename]
                 self._save_state()
-                return {"ok": True}
+                return {"ok": True} # type: ignore
             except Exception as e:
                 return {"error": str(e)}
         return {"error": "File not found"}
@@ -780,7 +965,7 @@ class ApiBridge:
         clips = []
         total_size = 0
         _exts = {'.mp4', '.mkv', '.avi', '.mov', '.webm'}
-        if CLIPS_DIR.exists():
+        if CLIPS_DIR.exists(): # type: ignore
             # Single stat() per file — cache the result
             entries = []
             for p in CLIPS_DIR.iterdir():
@@ -813,7 +998,7 @@ class ApiBridge:
         existing = {p.resolve() for p in self._results if p.exists()}
         added = 0
 
-        if CLIPS_DIR.exists():
+        if CLIPS_DIR.exists(): # type: ignore
             for p in sorted(CLIPS_DIR.iterdir(), key=lambda x: x.stat().st_mtime):
                 if p.suffix.lower() in _exts and p.resolve() not in existing:
                     self._results.append(p)
@@ -821,7 +1006,7 @@ class ApiBridge:
                     added += 1
 
         if added:
-            self._save_state()
+            self._save_state() # type: ignore
             print(f"[+] Imported {added} clip(s) from clips folder")
 
         return self.get_results()
@@ -831,7 +1016,7 @@ class ApiBridge:
     def save_scheduled(self, scheduled_list):
         """Replace the full scheduled list (called from JS on every change)."""
         self._scheduled = scheduled_list or []
-        self._save_state()
+        self._save_state() # type: ignore
         return {"ok": True}
 
     def get_all_scheduled(self):
@@ -859,7 +1044,7 @@ class ApiBridge:
 
     def upload_single_clip(self, clip_index, meta, channel_id=None):
         """Upload a single clip immediately (used by background scheduler)."""
-        if clip_index >= len(self._results):
+        if clip_index >= len(self._results): # type: ignore
             return {"error": "Invalid clip index"}
         video_path = self._results[clip_index]
         if not video_path.exists():
@@ -875,7 +1060,7 @@ class ApiBridge:
                 channel_id=channel_id,
             )
             return {"ok": True}
-        except Exception as e:
+        except Exception as e: # type: ignore
             return {"error": str(e)}
 
     # ── Exposed: background scheduler ────────────────────────────────────
@@ -885,7 +1070,7 @@ class ApiBridge:
         if self._scheduler_running:
             return {"ok": True}
         self._scheduler_running = True
-        threading.Thread(target=self._scheduler_loop, daemon=True).start()
+        threading.Thread(target=self._scheduler_loop, daemon=True).start() # type: ignore
         print("[+] Background upload scheduler started")
         return {"ok": True}
 
@@ -893,7 +1078,7 @@ class ApiBridge:
 
     def load_persisted_state(self):
         """Return persisted results/moments/scheduled for frontend init."""
-        clips = []
+        clips = [] # type: ignore
         for i, p in enumerate(self._results):
             if not p.exists():
                 continue
@@ -972,7 +1157,7 @@ class ApiBridge:
                 self._push("download", 100, f"Downloaded: {video_path.name}")
 
             # ── Get video duration (needed for auto clip count + sentence snapping) ──
-            try:
+            try: # type: ignore
                 from subprocess_utils import run as _srun
                 _r = _srun(
                     ["ffprobe", "-v", "error", "-show_entries", "format=duration",
@@ -982,7 +1167,7 @@ class ApiBridge:
                 vid_duration = float(_r.stdout.strip())
             except Exception:
                 vid_duration = 600  # default 10 min
-
+            
             # ── Auto clip count ──────────────────────────────────────
             if auto_clips:
                 vid_w, vid_h = get_dimensions(video_path)
@@ -1022,16 +1207,23 @@ class ApiBridge:
             self._push("detect", 0, "Detecting viral moments...")
 
             ai_ready = False
+            ai_provider = settings.get("ai_provider", AI_PROVIDER)
+            gemini_key = self._decrypt(config.GEMINI_API_KEY)
+            use_gemini = ai_provider == "gemini" and gemini_client.is_available(gemini_key)
             candidate_count = num_clips
             if ai_detector != "off":
-                ai_ready = detector_ready(OLLAMA_DETECTOR_MODEL)
+                if use_gemini:
+                    ai_ready = True
+                else:
+                    ai_ready = detector_ready(OLLAMA_DETECTOR_MODEL)
+                
                 if ai_ready:
                     candidate_count = max(
                         num_clips,
                         num_clips * OLLAMA_DETECTOR_CANDIDATE_MULTIPLIER,
                     )
                     self._push("detect", 5, f"AI detector ready; scanning {candidate_count} candidates...")
-                elif ai_detector == "on":
+                elif ai_detector == "on": # type: ignore
                     print("[ai-detector] Ollama detector requested but unavailable; using heuristic detector")
 
             moments = find_viral_moments(
@@ -1055,7 +1247,7 @@ class ApiBridge:
                     self._push("detect", pct, f"AI candidate {cand_idx}/{len(moments)}...")
                     try:
                         # Transcribe
-                        if extract_audio_clip(video_path, start, end, wav):
+                        if extract_audio_clip(video_path, start, end, wav): # type: ignore
                             words = transcribe_clip(
                                 wav, model_size=model, language=language, device_pref=whisper_device,
                             )
@@ -1070,7 +1262,7 @@ class ApiBridge:
                             detections, _, _ = detect_all_persons(
                                 video_path, start, end, 1920, 1080, sample_count=20, yolo_device=yolo_device
                             )
-                            if detections:
+                            if detections: # type: ignore
                                 hits = sum(1 for _, persons in detections if persons)
                                 m["visual_score"] = hits / len(detections)
                             else:
@@ -1081,29 +1273,33 @@ class ApiBridge:
                         candidate_moments.append(m)
                     finally:
                         try:
-                            wav.unlink(missing_ok=True)
+                            wav.unlink(missing_ok=True) # type: ignore
                         except Exception:
                             pass
 
                 if candidate_moments:
-                    self._push("detect", 72, "Reranking candidates with local AI...")
+                    self._push("detect", 72, f"Reranking candidates with {'Gemini' if use_gemini else 'Ollama'}...")
 
-                    def _rank_progress(done, total_rank, score):
-                        pct = 72 + int(done / max(1, total_rank) * 22)
-                        label = "scored" if score else "skipped"
-                        self._push("detect", pct, f"AI rerank {done}/{total_rank}: {label}")
+                    if use_gemini: # type: ignore
+                        ranked = gemini_client.rerank_moments(candidate_moments, gemini_key, keep=num_clips)
+                    else:
+                        def _rank_progress(done, total_rank, score):
+                            pct = 72 + int(done / max(1, total_rank) * 22)
+                            label = "scored" if score else "skipped"
+                            self._push("detect", pct, f"AI rerank {done}/{total_rank}: {label}")
 
-                    ranked = rerank_moments(
-                        candidate_moments,
-                        clip_duration=clip_duration,
-                        keep=num_clips,
-                        model=OLLAMA_DETECTOR_MODEL,
-                        timeout=OLLAMA_DETECTOR_TIMEOUT,
-                        on_progress=_rank_progress,
-                    )
-                    if ranked:
+                        ranked = rerank_moments(
+                            candidate_moments,
+                            clip_duration=clip_duration,
+                            keep=num_clips,
+                            model=OLLAMA_DETECTOR_MODEL,
+                            timeout=OLLAMA_DETECTOR_TIMEOUT,
+                            on_progress=_rank_progress,
+                        )
+                        
+                    if ranked: # type: ignore
                         moments = ranked
-                        print(f"[ai-detector] Selected {len(moments)} clips with Ollama reranking")
+                        print(f"[ai-detector] Selected {len(moments)} clips with AI reranking")
                     else:
                         moments = moments[:num_clips]
                         print("[ai-detector] No valid AI scores; using heuristic candidates")
@@ -1114,13 +1310,13 @@ class ApiBridge:
                 moments = moments[:num_clips]
 
             for m in moments:
-                m.pop("_words", None)
+                m.pop("_words", None) # type: ignore
 
             # Append moments (batch mode: preserve previous video's moments)
             self._moments.extend(moments)
 
             self._push("detect", 100, f"Found {len(moments)} moments")
-            self._js(f"window.onMomentsDetected({json.dumps(moments)})")
+            self._js(f"window.onMomentsDetected({json.dumps(moments)}, {self._active_item_index if self._active_item_index is not None else 'null'})")
 
             # ── 3. Process each clip ─────────────────────────────────
             done: list[Path] = []
@@ -1133,6 +1329,15 @@ class ApiBridge:
                 if self._cancel:
                     return self._cancelled()
                 clip_num = idx + 1
+
+                # Resume Logic: Skip if clip already exists and is valid
+                out = CLIPS_DIR / f"{stem}_viral{clip_num}.mp4"
+                if out.exists() and validate_shorts_output(out): # type: ignore
+                    if m.get("transcript"):
+                        print(f"    [+] Clip {clip_num} already processed, skipping.")
+                        done.append(out)
+                        continue
+
                 start, end = m["start"], m["end"]
                 original_duration = end - start
 
@@ -1142,7 +1347,7 @@ class ApiBridge:
                 self._clip_push(clip_num, total, "audio", 50, f"Clip {clip_num}/{total}: Extracting audio...")
                 wav = SUBTITLES_DIR / f"{stem}_c{clip_num}.wav"
                 extended_end = min(end + SENTENCE_BUFFER, int(vid_duration))
-                r = extract_audio_clip(video_path, start, extended_end, wav)
+                r = extract_audio_clip(video_path, start, extended_end, wav) # type: ignore
                 if not r:
                     self._clip_push(clip_num, total, "render", 100, f"Clip {clip_num}: failed, skipping")
                     continue
@@ -1152,7 +1357,7 @@ class ApiBridge:
                 if self._cancel:
                     return self._cancelled()
                 self._clip_push(clip_num, total, "transcribe", 0, f"Clip {clip_num}/{total}: Transcribing...")
-                words = transcribe_clip(
+                words = transcribe_clip( # type: ignore
                     wav, model_size=model, language=language, device_pref=whisper_device,
                 )
                 self._clip_push(clip_num, total, "transcribe", 100, f"{len(words)} words transcribed")
@@ -1161,7 +1366,7 @@ class ApiBridge:
                 # Adjust clip end so the speaker finishes their sentence
                 new_duration = find_sentence_boundary(
                     words,
-                    clip_duration=float(original_duration),
+                    clip_duration=float(original_duration), # type: ignore
                     min_keep=0.60,
                     max_extend=float(SENTENCE_BUFFER),
                 )
@@ -1176,7 +1381,7 @@ class ApiBridge:
                     words = [w for w in words if w["end"] <= original_duration + 0.1]
 
                 # Update moment info for UI
-                m["end"] = end
+                m["end"] = end # type: ignore
                 m["duration"] = end - start
                 # Store transcript text for LLM title generation
                 m["transcript"] = " ".join(w.get("word", w.get("text", "")) for w in words).strip()
@@ -1190,7 +1395,7 @@ class ApiBridge:
                     self._clip_push(clip_num, total, "audio", 0, f"Clip {clip_num}/{total}: Tracking speakers...")
                     try:
                         crop_params = get_crop_params_dynamic(
-                            video_path, start, end, yolo_device=yolo_device,
+                            video_path, start, end, yolo_device=yolo_device, debug_frames=True,
                         )
                     except Exception as e:
                         print(f"[!] Crop detection failed for clip {clip_num}: {e}")
@@ -1202,7 +1407,7 @@ class ApiBridge:
                 if self._cancel:
                     return self._cancelled()
                 self._clip_push(clip_num, total, "subtitle", 0, f"Clip {clip_num}/{total}: Generating subtitles...")
-                ass = SUBTITLES_DIR / f"{stem}_c{clip_num}.ass"
+                ass = SUBTITLES_DIR / f"{stem}_c{clip_num}.ass" # type: ignore
                 subtitle_files.append(ass)
                 generate_subtitles(
                     words, ass,
@@ -1216,8 +1421,7 @@ class ApiBridge:
                 if self._cancel:
                     return self._cancelled()
                 self._clip_push(clip_num, total, "render", 0, f"Clip {clip_num}/{total}: Rendering...")
-                out = CLIPS_DIR / f"{stem}_viral{clip_num}.mp4"
-                clip_result = extract_clip(
+                clip_result = extract_clip( # type: ignore
                     video_path, start, end, out,
                     subtitle_path=ass if words else None,
                     crop_params=crop_params,
@@ -1228,7 +1432,7 @@ class ApiBridge:
                     if effect and effect != "none":
                         self._clip_push(clip_num, total, "render", 80,
                                         f"Clip {clip_num}/{total}: Applying {effect} effect...")
-                        apply_video_effect(
+                        apply_video_effect( # type: ignore
                             clip_result.path, effect, preset, crf, encoder=video_encoder,
                         )
 
@@ -1237,7 +1441,7 @@ class ApiBridge:
                         music_path = Path(music_file)
                         if not music_path.is_absolute():
                             music_path = MUSIC_DIR / music_file
-                        if music_path.exists():
+                        if music_path.exists(): # type: ignore
                             self._clip_push(clip_num, total, "render", 90,
                                             f"Clip {clip_num}/{total}: Adding music...")
                             add_background_music(
@@ -1245,7 +1449,7 @@ class ApiBridge:
                                 trim_start=music_start, trim_end=music_end,
                             )
 
-                    if not validate_shorts_output(clip_result.path):
+                    if not validate_shorts_output(clip_result.path): # type: ignore
                         self._clip_push(clip_num, total, "render", 100,
                                         f"Clip {clip_num} failed Shorts validation")
                     else:
@@ -1262,49 +1466,42 @@ class ApiBridge:
 
                 # cleanup temp wav
                 try:
-                    wav.unlink(missing_ok=True)
+                    self._robust_unlink(wav) # type: ignore
                 except Exception:
                     pass
 
             # Append results (batch mode: preserve previous video's clips)
             self._results.extend(done)
             self._save_state()
-            self._js(f"window.onPipelineComplete(true, {len(done)}, {total}, null)")
+            self._js(f"window.onPipelineComplete(true, {len(done)}, {total}, null, {self._active_item_index if self._active_item_index is not None else 'null'})")
 
         except CancelledError:
-            return self._cancelled()
-        except Exception as e:
-            print(f"[!] Pipeline error: {e}")
-            self._error(str(e))
+            return self._cancelled() # type: ignore
+        except Exception:
+            logger.exception("Pipeline error")
+            self._error("An unexpected error occurred during processing.")
         finally:
             # Windows needs a moment to release handles (FFmpeg/Clipper/Whisper)
             time.sleep(1.5)
-
+            
             if is_downloaded and video_path and video_path.exists():
                 try:
-                    video_path.unlink()
+                    self._robust_unlink(video_path)
                     print(f"[cleanup] Automatically cleared downloaded source: {video_path.name}")
                 except Exception as e:
                     print(f"[cleanup] Could not clear {video_path.name}: {e}")
 
             # Thorough cleanup of subtitles folder
-            for sf in subtitle_files:
+            for sf in subtitle_files: # type: ignore
                 try:
-                    if sf.exists():
-                        sf.unlink()
+                    self._robust_unlink(sf)
                 except Exception:
                     pass
 
             # Catch any orphans using the video stem
             if stem:
                 for p in SUBTITLES_DIR.glob(f"{stem}*"):
-                    try:
-                        p.unlink()
-                    except Exception:
-                        pass
-
-            self._processing = False
-            self._cancel = False
+                    self._robust_unlink(p)
 
     # ── Download with real progress ──────────────────────────────────────
 
@@ -1344,7 +1541,7 @@ class ApiBridge:
         }
 
         # If it looks like a local file path, just use it directly
-        if Path(url).exists():
+        if Path(url).exists(): # type: ignore
             return Path(url)
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -1366,7 +1563,7 @@ class ApiBridge:
 
                 idx = meta.get("index", i)
                 if idx >= len(self._results):
-                    continue
+                    continue # type: ignore
                 video_path = self._results[idx]
 
                 scheduled = None
@@ -1389,7 +1586,7 @@ class ApiBridge:
                     self._delete_uploaded_clip(idx, video_path)
 
             self._push("upload", 100, f"All {total} clips uploaded!")
-            self._js(f"window.onPipelineComplete(true, {total}, {total}, null)")
+            self._js(f"window.onPipelineComplete(true, {total}, {total}, null)") # type: ignore
 
         except Exception as e:
             self._error(f"Upload failed: {e}")
@@ -1409,7 +1606,7 @@ class ApiBridge:
                 if item.get("uploaded"):
                     continue
                 try:
-                    sched_dt = datetime.fromisoformat(f"{item['date']}T{item['time']}")
+                    sched_dt = datetime.fromisoformat(f"{item['date']}T{item['time']}") # type: ignore
                 except (KeyError, ValueError):
                     continue
 
@@ -1417,7 +1614,7 @@ class ApiBridge:
                     clip_idx = item.get("clipIdx", -1)
                     if 0 <= clip_idx < len(self._results):
                         video_path = self._results[clip_idx]
-                        if video_path.exists():
+                        if video_path.exists(): # type: ignore
                             title = item.get("title", f"Viral Clip #{clip_idx + 1}")
                             print(f"[scheduler] Uploading Clip {clip_idx + 1}: {title}")
                             self._js(f"window.onSchedulerStatus('Uploading: {self._esc(title)}')")
@@ -1435,7 +1632,7 @@ class ApiBridge:
                                     channel_id=item.get("channel_id"),
                                 )
                                 item["uploaded"] = True
-                                changed = True
+                                changed = True # type: ignore
                                 print(f"[scheduler] Uploaded: {title}")
                                 self._js(f"window.onScheduledUploadDone({clip_idx}, true, null)")
 
@@ -1448,7 +1645,7 @@ class ApiBridge:
                                 self._js(f"window.onScheduledUploadDone({clip_idx}, false, `{self._esc(str(e))}`)")
 
             if changed:
-                self._save_state()
+                self._save_state() # type: ignore
                 self._js("window.onScheduleUpdated()")
 
             time.sleep(30)
@@ -1456,9 +1653,8 @@ class ApiBridge:
     def _delete_uploaded_clip(self, clip_idx, video_path):
         """Delete a clip file from disk after successful upload."""
         try:
-            if video_path.exists():
-                video_path.unlink()
-                print(f"[cleanup] Deleted uploaded clip: {video_path.name}")
+            if self._robust_unlink(video_path):
+                logger.info(f"Deleted uploaded clip: {video_path.name}")
                 self._js(f"window.onClipDeleted({clip_idx}, `{self._esc(video_path.name)}`)")
         except Exception as e:
             print(f"[cleanup] Failed to delete {video_path.name}: {e}")
@@ -1466,60 +1662,77 @@ class ApiBridge:
     # ── State persistence ────────────────────────────────────────────────
 
     def _save_state(self):
-        """Persist results, moments, schedule, and settings to JSON."""
-        data = {
-            "results": [str(p) for p in self._results],
-            "moments": self._moments,
-            "scheduled": self._scheduled,
-            "delete_after_upload": self._delete_after_upload,
-            "user_settings": self._user_settings,
-        }
-        try:
-            STATE_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
-        except Exception as e:
-            print(f"[!] Failed to save state: {e}")
+        """Persist results, moments, schedule, and settings to JSON with thread safety and atomic write."""
+        with self._state_lock:
+            data = {
+                "results": [str(p) for p in self._results],
+                "moments": self._moments,
+                "scheduled": self._scheduled,
+                "delete_after_upload": self._delete_after_upload,
+                "user_settings": self._user_settings,
+            }
+            # Windows: retry a few times if the file is locked by another process
+            for i in range(5):
+                try:
+                    # Use a temporary file for atomic write to prevent corruption on crash
+                    temp_state = STATE_FILE.with_suffix(".tmp")
+                    content = json.dumps(data, indent=2, default=str)
+                    temp_state.write_text(content, encoding="utf-8")
+                    
+                    # Atomic rename (shutil.move handles cross-device and existing files)
+                    shutil.move(str(temp_state), str(STATE_FILE))
+                    return
+                except Exception as e:
+                    if i == 4: # type: ignore
+                        print(f"[!] Failed to save state to {STATE_FILE} after retries: {e}")
+                    time.sleep(0.2)
 
     def _load_state(self):
         """Load persisted state from previous session."""
-        if not STATE_FILE.exists():
-            return
-        try:
-            data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-            # Restore results as Path objects, keeping moments aligned
-            paths = [Path(p) for p in data.get("results", [])]
-            all_moments = data.get("moments", [])
-            # Filter out missing files AND their corresponding moments
-            self._results = []
-            self._moments = []
-            for i, p in enumerate(paths):
-                if p.exists():
-                    self._results.append(p)
-                    self._moments.append(all_moments[i] if i < len(all_moments) else {})
-            self._scheduled = data.get("scheduled", [])
-            self._delete_after_upload = data.get("delete_after_upload", False)
-            self._user_settings = data.get("user_settings", {})
-            print(f"[+] Restored state: {len(self._results)} clips, {len(self._scheduled)} scheduled")
-            if self._user_settings:
-                print(f"[+] Restored user settings: {list(self._user_settings.keys())}")
-        except Exception as e:
-            print(f"[!] Failed to load state: {e}")
+        with self._state_lock:
+            if not STATE_FILE.exists() or STATE_FILE.stat().st_size == 0:
+                return
+            try:
+                text = STATE_FILE.read_text(encoding="utf-8").strip()
+                if not text:
+                    return
+                data = json.loads(text)
+                
+                # Restore results as Path objects, keeping moments aligned
+                paths = [Path(p) for p in data.get("results", [])] # type: ignore
+                all_moments = data.get("moments", [])
+                # Filter out missing files AND their corresponding moments
+                self._results = []
+                self._moments = []
+                for i, p in enumerate(paths):
+                    if p.exists():
+                        self._results.append(p)
+                        self._moments.append(all_moments[i] if i < len(all_moments) else {}) # type: ignore
+                self._scheduled = data.get("scheduled", [])
+                self._delete_after_upload = data.get("delete_after_upload", False)
+                self._user_settings = data.get("user_settings", {})
+                logger.info(f"Restored state: {len(self._results)} clips, {len(self._scheduled)} scheduled")
+                if self._user_settings:
+                    print(f"[+] Restored user settings: {list(self._user_settings.keys())}")
+            except Exception as e:
+                print(f"[!] Failed to load state: {e}")
 
     # ── Progress push helpers ────────────────────────────────────────────
 
     def _push(self, stage, pct, msg):
-        self._js(f"window.onPipelineProgress('{stage}', {pct}, `{self._esc(msg)}`)")
+        self._js(f"window.onPipelineProgress('{stage}', {pct}, `{self._esc(msg)}`, {self._active_item_index if self._active_item_index is not None else 'null'})")
 
     def _clip_push(self, num, total, substep, pct, msg):
         self._js(
-            f"window.onClipProgress({num}, {total}, '{substep}', {pct}, `{self._esc(msg)}`)"
+            f"window.onClipProgress({num}, {total}, '{substep}', {pct}, `{self._esc(msg)}`, {self._active_item_index if self._active_item_index is not None else 'null'})"
         )
 
     def _error(self, msg):
-        self._js(f"window.onPipelineComplete(false, 0, 0, `{self._esc(msg)}`)")
+        self._js(f"window.onPipelineComplete(false, 0, 0, `{self._esc(msg)}`, {self._active_item_index if self._active_item_index is not None else 'null'})")
         self._processing = False
 
     def _cancelled(self):
-        self._js("window.onPipelineCancelled()")
+        self._js(f"window.onPipelineCancelled({self._active_item_index if self._active_item_index is not None else 'null'})")
         self._processing = False
 
     def _js(self, code):

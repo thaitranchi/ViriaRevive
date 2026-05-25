@@ -82,15 +82,23 @@ def generate(
     timeout: int | float = 30,
     options: dict[str, Any] | None = None,
     format: str | None = None,
-) -> str | None:
-    """Generate a non-streaming response. Returns None on failure."""
+    context: list[int] | None = None,
+    return_context: bool = False,
+) -> str | tuple[str, list[int]] | None:
+    """Generate a response. If return_context is True, returns (response, context)."""
     body_data: dict[str, Any] = {
         "model": model,
         "prompt": prompt,
         "stream": False,
+        "options": {
+            "num_predict": 1024,  # Default to a higher token limit for longer responses
+            "temperature": 0.7,   # Default temperature for general generation
+        }
     }
+    if context:
+        body_data["context"] = context
     if options:
-        body_data["options"] = options
+        body_data["options"].update(options)  # Merge provided options, allowing overrides
     if format:
         body_data["format"] = format
 
@@ -103,11 +111,30 @@ def generate(
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read())
             response = data.get("response", "")
-            return response.strip() if isinstance(response, str) else None
+            text = response.strip() if isinstance(response, str) else None
+            if return_context and text is not None:
+                return text, data.get("context", [])
+            return text
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as e:
         print(f"[ollama] Generate failed: {e}")
     except Exception as e:
         print(f"[ollama] Unexpected generate error: {e}")
+    return None
+
+
+def resume(
+    context: list[int],
+    prompt: str = "",
+    model: str = DEFAULT_MODEL,
+    timeout: int | float = 30,
+    options: dict[str, Any] | None = None,
+) -> tuple[str, list[int]] | None:
+    """Continue a previous generation using the provided context."""
+    result = generate(
+        prompt, model, timeout, options, context=context, return_context=True
+    )
+    if isinstance(result, tuple):
+        return result
     return None
 
 
