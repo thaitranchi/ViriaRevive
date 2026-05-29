@@ -55,19 +55,20 @@ from config import (
     SUBTITLES_DIR,
     VIDEO_CRF,
     VIDEO_ENCODER,
+    VIDEO_DECODER,
     WHISPER_DEVICE,
     WHISPER_LANGUAGE,
     WHISPER_MODEL,
     YOLO_DEVICE,
 )
 import gemini_client
-from hwaccel import log_hardware_startup, probe_ffmpeg
+from hwaccel import log_hardware_startup, probe_ffmpeg, get_hardware_summary, video_encode_args
 from detector import find_viral_moments
 from ollama_detector import detector_ready, rerank_moments
 from transcriber import transcribe_clip, find_sentence_boundary
 from subtitler import generate_subtitles, get_available_styles
 from clipper import (
-    extract_clip, extract_audio_clip, ClipResult,
+    extract_clip, extract_audio_clip,
     add_background_music, apply_video_effect, get_effects_list,
     validate_shorts_output,
 )
@@ -84,9 +85,10 @@ from uploader import (
     list_categories,
     add_account,
     list_accounts,
+    DEFAULT_CATEGORIES,
 )
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("ViriaRevive")
 
 STATE_FILE = BASE_DIR / "viria_state.json"
 
@@ -134,33 +136,72 @@ class _LogTee:
 _log_bridge = None  # set by ApiBridge.__init__
 
 
-def _install_log_tee():
+_log_push_queue = queue.Queue()
+_forwarding = threading.local()
+
+def _install_log_tee(debug=False):
     """Configure Python's logging to push messages to the frontend console."""
-    _forwarding = threading.local()
+    level = logging.DEBUG if debug else logging.INFO
 
     def _forward(text):
-        # Guard against recursion (if evaluate_js triggers a print)
+        if not text:
+            return
+        # Guard against recursion (if the bridge pusher itself triggers a print)
         if getattr(_forwarding, 'active', False):
             return
-        _forwarding.active = True # type: ignore
-        try:
-            if _log_bridge and _log_bridge._window:
-                escaped = text.replace("\\", "\\\\").replace("`", "\\`").replace("$", "\\$")
-                _log_bridge._js(f"window.onConsoleLog(`{escaped}`)")
-        finally:
-            _forwarding.active = False # type: ignore
+        _log_push_queue.put(text)
 
     # Create a custom handler that uses our _forward function
     class ConsoleHandler(logging.Handler):
         def emit(self, record):
             _forward(self.format(record))
 
-    # Configure the root logger to use this handler
-    logging.basicConfig(level=logging.INFO, handlers=[ConsoleHandler()])
+    # Configure the logger
+    root = logging.getLogger()
+    # Remove existing handlers to avoid duplicates on re-init
+    for h in root.handlers[:]:
+        root.removeHandler(h)
+    root.setLevel(level)
+    root.addHandler(ConsoleHandler())
+    
+    # Suppress noisy third-party libraries
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+
     # Also redirect stdout/stderr to the logger for non-logging prints
     _sys.stdout = _LogTee(_sys.__stdout__ or _sys.stdout, _forward) # type: ignore
     _sys.stderr = _LogTee(_sys.__stderr__ or _sys.stderr, _forward) # type: ignore
 
+def _log_pusher_thread():
+    """Batches log messages and pushes them to JS at a controlled rate to avoid UI flooding."""
+    while True:
+        try:
+            # Wait for the first log message
+            first = _log_push_queue.get()
+            lines = [first]
+            
+            # Collect more messages for a brief period to batch them
+            start_batch = time.time()
+            while time.time() - start_batch < 0.15 and len(lines) < 100:
+                try:
+                    lines.append(_log_push_queue.get_nowait())
+                except queue.Empty:
+                    break
+            
+            if _log_bridge:
+                text = "\n".join(lines)
+                safe_text = "".join(ch for ch in text if ch.isprintable() or ch in "\n\r\t")
+                escaped = safe_text.replace("\\", "\\\\").replace("`", "\\`").replace("$", "\\$")
+                debug_val = 1 if _log_bridge._user_settings.get("debug_logging", False) else 0
+                
+                _forwarding.active = True
+                try:
+                    _log_bridge._js(f"window.onConsoleLog(`{escaped}`, {debug_val})")
+                finally:
+                    _forwarding.active = False
+        except Exception:
+            time.sleep(0.5)
+
+threading.Thread(target=_log_pusher_thread, daemon=True).start()
 
 # ── Local video server (serves clip files for HTML5 <video> preview) ─────────
 
@@ -229,18 +270,63 @@ class ApiBridge:
         # Install log interceptor so print() output goes to the GUI console
         global _log_bridge
         _log_bridge = self
-        _install_log_tee()
 
         # Load persisted state from previous session
         self._load_state()
 
-        log_hardware_startup(
-            encoder_pref=self._user_settings.get("video_encoder", VIDEO_ENCODER),
-            yolo_device=self._user_settings.get("yolo_device", YOLO_DEVICE),
-            whisper_device=self._user_settings.get("whisper_device", WHISPER_DEVICE),
-        )
+        # Initialize logging based on saved setting
+        is_debug = self._user_settings.get("debug_logging", False)
+        _install_log_tee(debug=is_debug)
+
+        # Perform hardware startup check in background so the UI doesn't hang on launch
+        threading.Thread(target=log_hardware_startup, kwargs={
+            "encoder_pref": self._user_settings.get("video_encoder", VIDEO_ENCODER),
+            "yolo_device": self._user_settings.get("yolo_device", YOLO_DEVICE),
+            "whisper_device": self._user_settings.get("whisper_device", WHISPER_DEVICE),
+        }, daemon=True).start()
 
     # ── Exposed: config / deps ───────────────────────────────────────────
+
+    def run_diagnostics(self):
+        """Execute a suite of diagnostic tests to verify the software environment."""
+        logger.info("[diag] Starting system diagnostics...")
+        diag = {
+            "ffmpeg": shutil.which("ffmpeg") is not None,
+            "ffprobe": shutil.which("ffprobe") is not None,
+            "storage": {},
+            "hardware": get_hardware_summary(
+                self._user_settings.get("video_encoder", VIDEO_ENCODER),
+                self._user_settings.get("yolo_device", YOLO_DEVICE),
+                self._user_settings.get("whisper_device", WHISPER_DEVICE)
+            ),
+            "ollama": detector_ready(OLLAMA_DETECTOR_MODEL)
+        }
+        for name, path in [("clips", CLIPS_DIR), ("temp", Path(tempfile.gettempdir()))]:
+            try:
+                test_file = path / f".viria_test_{int(time.time())}"
+                test_file.write_text("ok")
+                test_file.unlink()
+                diag["storage"][name] = "writable"
+            except Exception as e:
+                diag["storage"][name] = f"error: {str(e)}"
+        return diag
+
+    def test_ffmpeg_encoding(self):
+        """Verify if the selected FFmpeg encoder is functional with current settings."""
+        preset = self._user_settings.get("ffmpeg_preset", FFMPEG_PRESET)
+        crf = str(self._user_settings.get("video_crf", VIDEO_CRF))
+        encoder = self._user_settings.get("video_encoder", VIDEO_ENCODER)
+        test_out = CLIPS_DIR / f"test_enc_{int(time.time())}.mp4"
+        cmd = [
+            "ffmpeg", "-y", "-f", "lavfi", "-i", "testsrc=duration=1:size=1280x720:rate=30",
+            *video_encode_args(preset, crf, encoder),
+            str(test_out)
+        ]
+        from subprocess_utils import run as _srun
+        r = _srun(cmd, capture_output=True, text=True)
+        success = r.returncode == 0 and test_out.exists()
+        if test_out.exists(): test_out.unlink()
+        return {"success": success, "encoder": encoder, "error": r.stderr if not success else None}
 
     def _get_cipher(self):
         """Initialize or retrieve the encryption cipher from Windows Credential Manager."""
@@ -293,10 +379,17 @@ class ApiBridge:
             "ffmpeg_preset": FFMPEG_PRESET,
             "video_crf": VIDEO_CRF,
             "video_encoder": VIDEO_ENCODER,
+            "video_decoder": VIDEO_DECODER,
             "yolo_device": YOLO_DEVICE,
             "whisper_device": WHISPER_DEVICE,
             "crop_vertical": True,
             "ai_detector": AI_DETECTOR_MODE,
+            "upload_category": "22",
+            "upload_privacy": "public",
+            "upload_region": "US",
+            "upload_tags": "shorts, viral, clips",
+            "upload_description": "#shorts #viral",
+            "debug_logging": False,
         }
         # Merge saved user overrides (from save_settings)
         if self._user_settings:
@@ -326,6 +419,10 @@ class ApiBridge:
                 config.GEMINI_API_KEY = gemini_key
             except Exception as e:
                 logger.exception("Failed to write Gemini key to tokens file")
+
+        # Check if debug mode changed and re-install logging tee
+        if new_settings.get("debug_logging") != self._user_settings.get("debug_logging"):
+            _install_log_tee(debug=new_settings.get("debug_logging", False))
 
         self._user_settings = new_settings
         self._user_settings["crop_vertical"] = True
@@ -466,6 +563,11 @@ class ApiBridge:
         window.onTitlesDone callbacks.
         """
         threading.Thread(target=self._run_title_gen, args=(indices,), daemon=True).start() # type: ignore
+        return {"ok": True}
+
+    def open_devtools(self):
+        """Request the frontend to open developer tools."""
+        self._js("console.log('[bridge] Developer tools requested via UI')")
         return {"ok": True}
 
     def _run_title_gen(self, only_indices=None):
@@ -672,9 +774,10 @@ class ApiBridge:
 
     def get_categories(self):
         try:
-            return {"categories": list_categories()}
+            cats = list_categories()
+            return {"categories": cats if cats else DEFAULT_CATEGORIES}
         except Exception as e:
-            return {"error": str(e), "categories": []}
+            return {"error": str(e), "categories": DEFAULT_CATEGORIES}
 
     def get_subtitle_styles(self):
         """Return available subtitle styles for the UI picker."""
@@ -1006,6 +1109,9 @@ class ApiBridge:
                     added += 1
 
         if added:
+            # Ensure moments metadata list matches results length
+            while len(self._moments) < len(self._results):
+                self._moments.append({})
             self._save_state() # type: ignore
             print(f"[+] Imported {added} clip(s) from clips folder")
 
@@ -1076,6 +1182,16 @@ class ApiBridge:
 
     # ── Exposed: state persistence ───────────────────────────────────────
 
+    def clear_history(self):
+        """Wipe results, moments, and scheduled tasks from the tracking state."""
+        with self._state_lock:
+            self._results = []
+            self._moments = []
+            self._scheduled = []
+            self._save_state()
+        logger.info("History cleared (results, moments, and schedule reset)")
+        return {"ok": True}
+
     def load_persisted_state(self):
         """Return persisted results/moments/scheduled for frontend init."""
         clips = [] # type: ignore
@@ -1099,6 +1215,16 @@ class ApiBridge:
 
     # ── Pipeline orchestrator (background thread) ────────────────────────
 
+    def _get_video_duration(self, path: Path) -> float:
+        from subprocess_utils import run as _srun
+        r = _srun(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True, timeout=10,
+        )
+        out = r.stdout.strip()
+        return float(out) if out else 0.0
+
     def _run_pipeline(self, url, settings, local_file_path=None):
         video_path = None
         is_downloaded = False
@@ -1117,6 +1243,7 @@ class ApiBridge:
             preset = settings.get("ffmpeg_preset", FFMPEG_PRESET)
             crf = str(settings.get("video_crf", VIDEO_CRF))
             video_encoder = settings.get("video_encoder", VIDEO_ENCODER)
+            video_decoder = settings.get("video_decoder", VIDEO_DECODER)
             yolo_device = settings.get("yolo_device", YOLO_DEVICE)
             whisper_device = settings.get("whisper_device", WHISPER_DEVICE)
             crop_vertical = bool(settings.get("crop_vertical", True))
@@ -1126,6 +1253,7 @@ class ApiBridge:
             music_volume = float(settings.get("music_volume", 0.12))
             music_start = float(settings.get("music_start", 0))
             music_end = float(settings.get("music_end", 0))
+            debug_mode = bool(settings.get("debug_logging", False))
 
             # ── 1. Download or load local file ───────────────────────
             if self._cancel:
@@ -1158,13 +1286,8 @@ class ApiBridge:
 
             # ── Get video duration (needed for auto clip count + sentence snapping) ──
             try: # type: ignore
-                from subprocess_utils import run as _srun
-                _r = _srun(
-                    ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-                     "-of", "csv=p=0", str(video_path)],
-                    capture_output=True, text=True, timeout=10,
-                )
-                vid_duration = float(_r.stdout.strip())
+                # Using local helper or ffprobe directly via robust logic
+                vid_duration = self._get_video_duration(video_path)
             except Exception:
                 vid_duration = 600  # default 10 min
             
@@ -1425,7 +1548,7 @@ class ApiBridge:
                     video_path, start, end, out,
                     subtitle_path=ass if words else None,
                     crop_params=crop_params,
-                    preset=preset, crf=crf, encoder=video_encoder,
+                    preset=preset, crf=crf, encoder=video_encoder, decoder=video_decoder,
                 )
                 if clip_result and clip_result.path:
                     # Post-processing: apply video effect
@@ -1433,7 +1556,7 @@ class ApiBridge:
                         self._clip_push(clip_num, total, "render", 80,
                                         f"Clip {clip_num}/{total}: Applying {effect} effect...")
                         apply_video_effect( # type: ignore
-                            clip_result.path, effect, preset, crf, encoder=video_encoder,
+                            clip_result.path, effect, preset, crf, encoder=video_encoder, decoder=video_decoder,
                         )
 
                     # Post-processing: mix background music
@@ -1483,6 +1606,10 @@ class ApiBridge:
         finally:
             # Windows needs a moment to release handles (FFmpeg/Clipper/Whisper)
             time.sleep(1.5)
+
+            if debug_mode:
+                print("[debug] Skipping cleanup of temporary files.")
+                return
             
             if is_downloaded and video_path and video_path.exists():
                 try:
@@ -1684,7 +1811,7 @@ class ApiBridge:
                     return
                 except Exception as e:
                     if i == 4: # type: ignore
-                        print(f"[!] Failed to save state to {STATE_FILE} after retries: {e}")
+                        logger.error(f"Failed to save state after 5 retries: {e}")
                     time.sleep(0.2)
 
     def _load_state(self):
@@ -1705,17 +1832,15 @@ class ApiBridge:
                 self._results = []
                 self._moments = []
                 for i, p in enumerate(paths):
-                    if p.exists():
+                    if p.exists() and p.is_file():
                         self._results.append(p)
                         self._moments.append(all_moments[i] if i < len(all_moments) else {}) # type: ignore
                 self._scheduled = data.get("scheduled", [])
                 self._delete_after_upload = data.get("delete_after_upload", False)
                 self._user_settings = data.get("user_settings", {})
                 logger.info(f"Restored state: {len(self._results)} clips, {len(self._scheduled)} scheduled")
-                if self._user_settings:
-                    print(f"[+] Restored user settings: {list(self._user_settings.keys())}")
             except Exception as e:
-                print(f"[!] Failed to load state: {e}")
+                logger.error(f"Failed to load state file {STATE_FILE}: {e}")
 
     # ── Progress push helpers ────────────────────────────────────────────
 

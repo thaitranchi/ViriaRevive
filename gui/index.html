@@ -870,13 +870,34 @@
                         <div class="setting-row">
                             <label for="set-encoder">Video encoder</label>
                             <select id="set-encoder" class="form-select" onchange="updateEncoderPresetUI()">
-                                <option value="auto" selected>Auto (GPU if available)</option>
-                                <option value="nvenc">NVIDIA NVENC</option>
-                                <option value="qsv">Intel Quick Sync</option>
-                                <option value="amf">AMD AMF</option>
-                                <option value="cpu">CPU (libx264)</option>
+                                <option value="auto">Auto (H.264 GPU if available)</option>
+                                <optgroup label="H.264 (High Compatibility)">
+                                    <option value="nvenc" selected>NVIDIA NVENC</option>
+                                    <option value="qsv">Intel Quick Sync</option>
+                                    <option value="amf">AMD AMF</option>
+                                    <option value="cpu">CPU (libx264)</option>
+                                </optgroup>
+                                <optgroup label="HEVC / H.265 (Better Quality/Size)">
+                                    <option value="nvenc_hevc">NVIDIA NVENC HEVC</option>
+                                    <option value="qsv_hevc">Intel Quick Sync HEVC</option>
+                                    <option value="amf_hevc">AMD AMF HEVC</option>
+                                    <option value="cpu_hevc">CPU (libx265)</option>
+                                </optgroup>
                             </select>
                             <span class="setting-hint" id="hw-encoder-status"></span>
+                        </div>
+                        <div class="setting-row">
+                            <label for="set-decoder">Video decoder</label>
+                            <select id="set-decoder" class="form-select">
+                                <option value="auto">Auto (GPU if available)</option>
+                                <option value="cpu">CPU (software)</option>
+                                <option value="cuda" selected>NVIDIA CUDA (NVDEC)</option>
+                                <option value="d3d11va">Direct3D 11VA (Windows)</option>
+                                <option value="dxva2">DXVA2 (Windows)</option>
+                                <option value="vaapi">VAAPI (Linux)</option>
+                                <option value="v4l2m2m">V4L2 M2M (Linux)</option>
+                                <option value="h264_cuvid">NVIDIA CUVID (Legacy)</option>
+                            </select>
                         </div>
                         <div class="setting-row" id="preset-row">
                             <label for="set-preset">Encoding speed</label>
@@ -944,16 +965,16 @@
                         <div class="setting-row">
                             <label for="set-whisper-device">Whisper device</label>
                             <select id="set-whisper-device" class="form-select">
-                                <option value="auto" selected>Auto (GPU if available)</option>
-                                <option value="cuda">CUDA (NVIDIA)</option>
+                                <option value="auto">Auto (GPU if available)</option>
+                                <option value="cuda" selected>CUDA (NVIDIA)</option>
                                 <option value="cpu">CPU</option>
                             </select>
                         </div>
                         <div class="setting-row">
                             <label for="set-yolo-device">Person detection (YOLO)</label>
                             <select id="set-yolo-device" class="form-select">
-                                <option value="auto" selected>Auto (GPU if available)</option>
-                                <option value="cuda">CUDA (NVIDIA)</option>
+                                <option value="auto">Auto (GPU if available)</option>
+                                <option value="cuda" selected>CUDA (NVIDIA)</option>
                                 <option value="cpu">CPU</option>
                             </select>
                         </div>
@@ -1070,6 +1091,78 @@
                             </div>
                             <span class="setting-hint">Forces the AI to generate titles in this language.</span>
                         </div>
+                        <div class="setting-row">
+                            <label>Debug Logging</label>
+                            <label class="toggle">
+                                <input type="checkbox" id="set-debug-logging" onchange="gatherSettings()">
+                                <span class="toggle-slider"></span>
+                            </label>
+                            <span class="setting-hint">Enable verbose logs and skip temporary file cleanup.</span>
+                        </div>
+                    </div>
+
+                    <div class="card settings-card">
+                        <h3>
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                stroke-width="2">
+                                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                                <polyline points="17 8 12 3 7 8" />
+                                <line x1="12" y1="3" x2="12" y2="15" />
+                            </svg>
+                            YouTube Upload
+                        </h3>
+                        <div class="setting-row">
+                            <label for="set-category">Default Category</label>
+                            <select id="set-category" class="form-select">
+                                <option value="1">Film & Animation</option>
+                                <option value="10">Music</option>
+                                <option value="17">Sports</option>
+                                <option value="20">Gaming</option>
+                                <option value="22" selected>People & Blogs</option>
+                                <option value="23">Comedy</option>
+                                <option value="24">Entertainment</option>
+                                <option value="25">News & Politics</option>
+                                <option value="26">Howto & Style</option>
+                                <option value="27">Education</option>
+                                <option value="28">Science & Technology</option>
+                            </select>
+                            <span class="setting-hint">Default category used when scheduling new clips</span>
+                        </div>
+                        <div class="setting-row">
+                            <label for="set-upload-region">YouTube Region</label>
+                            <select id="set-upload-region" class="form-select" onchange="onRegionChange()">
+                                <option value="US">United States</option>
+                                <option value="GB">United Kingdom</option>
+                                <option value="BR">Brazil</option>
+                                <option value="IN">India</option>
+                                <option value="DE">Germany</option>
+                                <option value="FR">France</option>
+                                <option value="ES">Spain</option>
+                                <option value="JP">Japan</option>
+                                <option value="KR">South Korea</option>
+                                <option value="CA">Canada</option>
+                                <option value="AU">Australia</option>
+                                <option value="RU">Russia</option>
+                                <option value="VN">Vietnam</option>
+                            </select>
+                            <span class="setting-hint">Affects available categories in the dropdown</span>
+                        </div>
+                        <div class="setting-row">
+                            <label for="set-upload-privacy">Default Privacy</label>
+                            <select id="set-upload-privacy" class="form-select">
+                                <option value="public" selected>Public</option>
+                                <option value="unlisted">Unlisted</option>
+                                <option value="private">Private</option>
+                            </select>
+                        </div>
+                        <div class="setting-row">
+                            <label for="set-upload-tags">Default Tags</label>
+                            <input type="text" id="set-upload-tags" class="form-input" placeholder="shorts, viral, clips">
+                        </div>
+                        <div class="setting-row">
+                            <label for="set-upload-desc">Default Description</label>
+                            <textarea id="set-upload-desc" class="form-input" rows="2" placeholder="#shorts #viral"></textarea>
+                        </div>
                     </div>
 
                     <div class="card settings-card">
@@ -1111,6 +1204,14 @@
                                     Music
                                 </button>
                             </div>
+                        </div>
+                        <div class="setting-row" style="margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--glass-border);">
+                            <label>Application State</label>
+                            <button class="btn-danger btn-sm" onclick="clearAllHistory()">
+                                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+                                Clear All History
+                            </button>
+                            <span class="setting-hint">Resets Results and Schedule. Does NOT delete video files.</span>
                         </div>
                     </div>
                 </div>
@@ -1219,7 +1320,17 @@
                     <div class="meta-field">
                         <label>Category</label>
                         <select class="form-select" id="modal-meta-category">
+                            <option value="1">Film & Animation</option>
+                            <option value="10">Music</option>
+                            <option value="17">Sports</option>
+                            <option value="20">Gaming</option>
                             <option value="22" selected>People & Blogs</option>
+                            <option value="23">Comedy</option>
+                            <option value="24">Entertainment</option>
+                            <option value="25">News & Politics</option>
+                            <option value="26">Howto & Style</option>
+                            <option value="27">Education</option>
+                            <option value="28">Science & Technology</option>
                         </select>
                     </div>
                 </div>

@@ -61,11 +61,12 @@ CROP_VERTICAL = True          # auto-crop to 9:16 for Shorts
 # FFmpeg encoding
 FFMPEG_PRESET = "ultrafast"
 VIDEO_CRF = "23"
-VIDEO_ENCODER = "auto"   # auto | nvenc | qsv | amf | cpu
+VIDEO_ENCODER = "nvenc"  # auto | nvenc | qsv | amf | cpu | nvenc_hevc | qsv_hevc | amf_hevc | cpu_hevc
+VIDEO_DECODER = "cuda"   # auto | cuda | d3d11va | dxva2 | vaapi | v4l2m2m | cpu
 
 # AI / detection devices
-YOLO_DEVICE = "auto"     # auto | cuda | cpu
-WHISPER_DEVICE = "auto"  # auto | cuda | cpu
+YOLO_DEVICE = "cuda"     # auto | cuda | cpu
+WHISPER_DEVICE = "cuda"  # auto | cuda | cpu
 
 # YouTube
 TOKEN_FILE = BASE_DIR / "token.json"

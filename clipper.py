@@ -119,7 +119,7 @@ def _prepare_subtitle_file(subtitle_path: Path, output_stem: str) -> tuple[Path 
 
 def _try_subtitle_burn(input_path: Path, output_path: Path, temp_sub: Path, sub_dir: Path,
                         preset: str, crf: str, copy_audio: bool = False,
-                        encoder: str = "auto") -> bool:
+                        encoder: str = "auto", decoder: str = "auto") -> bool:
     """Try to burn subtitles into a video. Tries multiple approaches.
 
     Returns True on success.
@@ -136,7 +136,7 @@ def _try_subtitle_burn(input_path: Path, output_path: Path, temp_sub: Path, sub_
     vf = f"{filt}={temp_sub.name}{fontsdir_cwd}"
     cmd = [
         "ffmpeg", "-y",
-        *input_hwaccel_args(encoder),
+        *input_hwaccel_args(decoder),
         "-i", str(input_path),
         "-vf", vf,
         *enc_args,
@@ -152,10 +152,10 @@ def _try_subtitle_burn(input_path: Path, output_path: Path, temp_sub: Path, sub_
     if r.returncode == 0:
         if r.stderr:
             # Log stderr to catch font warnings
-            stderr_lines = [l for l in r.stderr.split('\n') if 'font' in l.lower() or 'libass' in l.lower()] # type: ignore
+            stderr_lines = [l for l in r.stderr.split('\n') if 'font' in l.lower() or 'libass' in l.lower()]
             if stderr_lines:
                 logger.info(f"Font info: {'; '.join(stderr_lines[:3])}")
-        logger.info("Subtitles burned successfully (cwd method)") # type: ignore
+        logger.info("Subtitles burned successfully (cwd method)")
         return True
 
     print(f"    [!] Attempt 1 failed: {r.stderr[-200:]}")
@@ -166,7 +166,7 @@ def _try_subtitle_burn(input_path: Path, output_path: Path, temp_sub: Path, sub_
     vf2 = f"{filt}={escaped}{fontsdir_full}"
     cmd2 = [
         "ffmpeg", "-y",
-        *input_hwaccel_args(encoder),
+        *input_hwaccel_args(decoder),
         "-i", str(input_path),
         "-vf", vf2,
         *enc_args,
@@ -181,10 +181,10 @@ def _try_subtitle_burn(input_path: Path, output_path: Path, temp_sub: Path, sub_
     )
     if r2.returncode == 0:
         if r2.stderr:
-            stderr_lines = [l for l in r2.stderr.split('\n') if 'font' in l.lower() or 'libass' in l.lower()] # type: ignore
+            stderr_lines = [l for l in r2.stderr.split('\n') if 'font' in l.lower() or 'libass' in l.lower()]
             if stderr_lines:
                 logger.info(f"Font info: {'; '.join(stderr_lines[:3])}")
-        logger.info("Subtitles burned successfully (escaped path method)") # type: ignore
+        logger.info("Subtitles burned successfully (escaped path method)")
         return True
 
     print(f"    [!] Attempt 2 failed: {r2.stderr[-200:]}")
@@ -197,7 +197,7 @@ def _try_subtitle_burn(input_path: Path, output_path: Path, temp_sub: Path, sub_
             vf3 = f"{other}={temp_sub.name}{fontsdir_cwd}"
             cmd3 = [
                 "ffmpeg", "-y",
-                *input_hwaccel_args(encoder),
+                *input_hwaccel_args(decoder),
                 "-i", str(input_path),
                 "-vf", vf3,
                 *enc_args,
@@ -215,7 +215,7 @@ def _try_subtitle_burn(input_path: Path, output_path: Path, temp_sub: Path, sub_
                     stderr_lines = [l for l in r3.stderr.split('\n') if 'font' in l.lower() or 'libass' in l.lower()]
                     if stderr_lines:
                         logger.info(f"Font info: {'; '.join(stderr_lines[:3])}")
-                logger.info(f"Subtitles burned successfully ({other} filter)") # type: ignore
+                logger.info(f"Subtitles burned successfully ({other} filter)")
                 return True
             print(f"    [!] Attempt 3 failed: {r3.stderr[-200:]}")
     except Exception:
@@ -236,12 +236,14 @@ def _build_crop_vf(crop_params: tuple, duration: float) -> str:
     if len(crop_params) == 4:
         # Static crop: (cw, ch, cx, cy)
         cw, ch, cx, cy = crop_params
+        cw, ch = (cw // 2) * 2, (ch // 2) * 2  # Ensure even for HW encoders
         return f"crop={cw}:{ch}:{cx}:{cy}"
 
     if len(crop_params) == 3 and isinstance(crop_params[2], list):
         # Dynamic crop: (cw, ch, [(t, x, y), ...])
         cw, ch, keyframes = crop_params
         if not keyframes:
+            cw, ch = (cw // 2) * 2, (ch // 2) * 2
             return f"crop={cw}:{ch}:0:0"
 
         # Downsample keyframes to max 15 to keep expression manageable.
@@ -275,6 +277,7 @@ def _build_crop_vf(crop_params: tuple, duration: float) -> str:
         x_expr = _build_lerp_expr([t for t, x, y in keyframes], [x for t, x, y in keyframes])
         y_expr = _build_lerp_expr([t for t, x, y in keyframes], [y for t, x, y in keyframes])
 
+        cw, ch = (cw // 2) * 2, (ch // 2) * 2
         return f"crop={cw}:{ch}:{x_expr}:{y_expr}"
 
     # Fallback — shouldn't happen
@@ -315,10 +318,23 @@ def _probe_dimensions(path: Path) -> tuple[int, int]:
              "-show_entries", "stream=width,height", "-of", "csv=p=0", str(path)],
             capture_output=True, text=True, timeout=10,
         )
-        parts = r.stdout.strip().split(",")
-        return int(parts[0]), int(parts[1])
+        parts = [p for p in r.stdout.strip().split(",") if p.strip()]
+        if len(parts) >= 2:
+            return int(parts[0]), int(parts[1])
     except Exception:
         return 0, 0
+
+
+def _probe_duration(path: Path) -> float:
+    try:
+        r = _run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+            capture_output=True, text=True, timeout=10,
+        )
+        return max(0.0, float((r.stdout or "").strip()))
+    except Exception:
+        return 0.0
 
 
 def validate_shorts_output(path: Path) -> bool:
@@ -369,18 +385,18 @@ def _step_recursive(times, values, idx):
 
 
 def _fallback_shorts_encode(video_path: Path, start: float, duration: float, 
-                             output_path: Path, preset: str, crf: str, encoder: str) -> Path | None:
+                             output_path: Path, preset: str, crf: str, 
+                             encoder: str, decoder: str = "auto") -> Path | None:
     """Last-resort encode using pure software (libx264) and blurry padding."""
     logger.warning("Running software fallback encode...")
+    enc_args = video_encode_args(preset, crf, force_cpu=True)
     cmd = [ # type: ignore
         "ffmpeg", "-y",
         "-ss", str(start),
         "-i", str(video_path),
         "-t", str(duration),
         "-filter_complex", _blur_pad_vf(),
-        "-c:v", "libx264",
-        "-preset", preset,
-        "-crf", str(crf),
+        *enc_args,
         "-c:a", "aac", "-b:a", "128k",
         str(output_path),
     ]
@@ -403,6 +419,7 @@ def extract_clip(
     preset: str = "ultrafast",
     crf: str = "23",
     encoder: str = "auto",
+    decoder: str = "auto",
     shorts_format: str = "crop",  # "crop" | "blur_pad" | "none"
 ) -> ClipResult:
     """Extract a clip, always exporting exact 1080x1920 Shorts video.
@@ -423,11 +440,28 @@ def extract_clip(
     output_path = Path(output_path).resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    source_duration = _probe_duration(video_path)
+    if source_duration:
+        if start < 0:
+            start = 0
+        if end > source_duration:
+            logger.warning(
+                "Clipping end %.3fs exceeds source duration %.3fs; clamping.",
+                end, source_duration,
+            )
+            end = source_duration
+        duration = end - start
+
+    if duration <= 0.25:
+        warning = f"Invalid clip range: start={start:.3f}s end={end:.3f}s"
+        logger.error(warning)
+        return ClipResult(path=None, subtitles_burned=False, warning=warning)
+
     # Ensure input file is not locked (common issue on Windows after download)
-    import time
-    for _ in range(5):
+    while True:
         try:
-            with open(video_path, 'rb'): break
+            with open(video_path, 'rb'):
+                break
         except OSError:
             time.sleep(0.5)
 
@@ -449,11 +483,13 @@ def extract_clip(
             v_filter = _chain_vf(_build_crop_vf(crop_params, duration), _shorts_vf())
 
         is_blur = shorts_format == "blur_pad" and shorts_format != "none"
+        v_args = ["-filter_complex" if is_blur else "-vf", v_filter] if v_filter else []
+
         cmd1 = [
             "ffmpeg", "-y", "-ss", str(start),
-            *input_hwaccel_args(),
+            *input_hwaccel_args(decoder),
             "-i", str(video_path), "-t", str(duration),
-            "-filter_complex" if is_blur else "-vf", v_filter if v_filter else "copy",
+            *v_args,
             *video_encode_args(preset, "18", encoder),
             "-c:a", "aac", "-strict", "-2", "-b:a", "192k",
             str(temp_cropped),
@@ -466,25 +502,26 @@ def extract_clip(
         )
 
         if r1.returncode != 0:
-            logger.error(f"Pass 1 crop failed:\n{r1.stderr[-500:]}") # type: ignore
+            logger.error(f"Pass 1 crop failed:\n{r1.stderr[-500:]}")
             _cleanup(temp_cropped)
             _cleanup(temp_sub)
-            result = _fallback_shorts_encode(video_path, start, duration, output_path, preset, crf, encoder) # type: ignore
-            if result: # type: ignore
+            result = _fallback_shorts_encode(video_path, start, duration, output_path, 
+                                             preset, crf, encoder, decoder)
+            if result:
                 return _validated_result(result, subtitles_burned=False, warning="Crop failed")
             return ClipResult(path=None, subtitles_burned=False, warning="Crop failed")
 
         # Pass 2: burn subtitles
         sub_ok = _try_subtitle_burn(temp_cropped, output_path, temp_sub, sub_dir,
-                                     preset, crf, copy_audio=True, encoder=encoder)
+                                     preset, crf, copy_audio=True, encoder=encoder, decoder=decoder)
 
         if sub_ok:
-            _cleanup(temp_cropped) # type: ignore
-            _cleanup(temp_sub) # type: ignore
+            _cleanup(temp_cropped)
+            _cleanup(temp_sub)
             logger.info(f"Saved {output_path.name}")
             return _validated_result(output_path)
         else:
-            _rename_safe(temp_cropped, output_path) # type: ignore
+            _rename_safe(temp_cropped, output_path)
             _cleanup(temp_sub)
             print(f"[!] Saved (crop only, no subs): {output_path.name}")
             return _validated_result(
@@ -503,11 +540,13 @@ def extract_clip(
             v_filter = _chain_vf(_build_crop_vf(crop_params, duration), _shorts_vf())
 
         is_blur = shorts_format == "blur_pad" and shorts_format != "none"
+        v_args = ["-filter_complex" if is_blur else "-vf", v_filter] if v_filter else []
+
         cmd = [
             "ffmpeg", "-y", "-ss", str(start),
-            *input_hwaccel_args(),
+            *input_hwaccel_args(decoder),
             "-i", str(video_path), "-t", str(duration),
-            "-filter_complex" if is_blur else "-vf", v_filter if v_filter else "copy",
+            *v_args,
             *video_encode_args(preset, crf, encoder),
             "-c:a", "aac", "-strict", "-2", "-b:a", "192k",
             str(output_path),
@@ -519,22 +558,30 @@ def extract_clip(
             preset, crf,
         )
         if r.returncode != 0:
-            logger.error(f"Crop failed:\n{r.stderr[-400:]}") # type: ignore
-            result = _fallback_shorts_encode(video_path, start, duration, output_path, preset, crf, encoder) # type: ignore
-            if result: # type: ignore
+            logger.error(f"Crop failed:\n{r.stderr[-400:]}")
+            result = _fallback_shorts_encode(video_path, start, duration, output_path, preset, crf, encoder, decoder)
+            if result:
                 return _validated_result(result)
-            return ClipResult(path=None) # type: ignore
+            return ClipResult(path=None)
         print(f"[+] Saved {output_path.name}")
         return _validated_result(output_path)
 
     # ── CASE C: subtitles only ───────────────────────────────────────────
     elif temp_sub:
         temp_input = output_path.with_name(output_path.stem + "_tmp_nosub.mp4")
-        is_blur = (shorts_format == "blur_pad" or shorts_format == "crop") and shorts_format != "none"
-        v_filter = _blur_pad_vf() if is_blur else _shorts_vf()
+        
+        if shorts_format == "blur_pad":
+            v_filter = _blur_pad_vf()
+            is_blur = True
+        elif shorts_format == "crop":
+            v_filter = _shorts_vf()
+            is_blur = False
+        else:
+            v_filter, is_blur = None, False
+
         cmd_extract = [
             "ffmpeg", "-y", "-ss", str(start),
-            *input_hwaccel_args(),
+            *input_hwaccel_args(decoder),
             "-i", str(video_path), "-t", str(duration),
             "-filter_complex" if is_blur else "-vf", v_filter,
             *video_encode_args(preset, "18", encoder),
@@ -549,21 +596,21 @@ def extract_clip(
         if r_ext.returncode != 0:
             _cleanup(temp_input)
             _cleanup(temp_sub)
-            result = _fallback_shorts_encode(video_path, start, duration, output_path, preset, crf, encoder) # type: ignore
-            if result: # type: ignore
+            result = _fallback_shorts_encode(video_path, start, duration, output_path, preset, crf, encoder, decoder)
+            if result:
                 return _validated_result(result, subtitles_burned=False, warning="Extract failed")
             return ClipResult(path=None, subtitles_burned=False, warning="Extract failed")
 
         sub_ok = _try_subtitle_burn(temp_input, output_path, temp_sub, sub_dir,
-                                     preset, crf, copy_audio=True, encoder=encoder)
-        _cleanup(temp_input) # type: ignore
-        _cleanup(temp_sub) # type: ignore
+                                     preset, crf, copy_audio=True, encoder=encoder, decoder=decoder)
+        _cleanup(temp_input)
+        _cleanup(temp_sub)
         
         if sub_ok:
             print(f"[+] Saved {output_path.name}")
             return _validated_result(output_path)
         else:
-            result = _fallback_shorts_encode(video_path, start, duration, output_path, preset, crf, encoder)
+            result = _fallback_shorts_encode(video_path, start, duration, output_path, preset, crf, encoder, decoder)
             if result:
                 return _validated_result(
                     result,
@@ -579,16 +626,21 @@ def extract_clip(
     # ── CASE D: no crop/subtitle filters → Shorts normalize ──────────────
     if shorts_format == "none":
         v_filter = None
-        is_blur = False # type: ignore
-    else: # type: ignore
-        v_filter = _blur_pad_vf() if (shorts_format == "blur_pad" or shorts_format == "crop") else _shorts_vf()
-        is_blur = (shorts_format == "blur_pad" or shorts_format == "crop")
-    
+        is_blur = False
+    elif shorts_format == "blur_pad":
+        v_filter = _blur_pad_vf()
+        is_blur = True
+    else: # "crop" (standard center crop for Shorts)
+        v_filter = _shorts_vf()
+        is_blur = False
+
+    v_args = ["-filter_complex" if is_blur else "-vf", v_filter] if v_filter else []
+
     cmd = [
         "ffmpeg", "-y", "-ss", str(start),
-        *input_hwaccel_args(),
+        *input_hwaccel_args(decoder),
         "-i", str(video_path), "-t", str(duration),
-        "-filter_complex" if is_blur else "-vf", v_filter if v_filter else "copy",
+        *v_args,
         *video_encode_args(preset, crf, encoder),
         "-c:a", "aac", "-strict", "-2", "-b:a", "192k",
         str(output_path),
@@ -599,11 +651,11 @@ def extract_clip(
         preset, crf,
     )
     if r.returncode != 0:
-        logger.error(f"Shorts encode failed:\n{r.stderr[-400:]}") # type: ignore
+        logger.error(f"Shorts encode failed:\n{r.stderr[-400:]}")
         # Try one last time with guaranteed software decoding path
         result = _fallback_shorts_encode(
-            video_path, start, duration, output_path, preset, crf, encoder
-        ) # type: ignore
+            video_path, start, duration, output_path, preset, crf, encoder, decoder
+        )
         if result:
             return _validated_result(result)
         return ClipResult(path=None)
@@ -617,11 +669,11 @@ def extract_audio_clip(video_path: Path, start: int, end: int, output_path: Path
         "ffmpeg", "-y",
         "-ss", str(start), "-i", str(video_path), "-t", str(end - start),
         "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
-        "-rf64", "auto",
+        "-f", "wav", "-rf64", "auto",
         str(output_path),
     ]
-    r = _run(cmd, capture_output=True, text=True, errors="replace") # type: ignore
-    if r.returncode != 0: # type: ignore
+    r = _run(cmd, capture_output=True, text=True, errors="replace")
+    if r.returncode != 0:
         print(f"[!] Audio extraction error:\n{r.stderr[-400:]}")
         return None
     return output_path
@@ -819,6 +871,7 @@ def apply_video_effect(
     preset: str = "ultrafast",
     crf: str = "23",
     encoder: str = "auto",
+    decoder: str = "auto",
 ) -> bool:
     """Apply a video effect preset to a clip (in-place).
 
@@ -840,7 +893,7 @@ def apply_video_effect(
 
     cmd = [
         "ffmpeg", "-y",
-        *input_hwaccel_args(encoder),
+        *input_hwaccel_args(decoder),
         "-i", str(clip_path),
         "-vf", vf,
         *video_encode_args(preset, crf, encoder),

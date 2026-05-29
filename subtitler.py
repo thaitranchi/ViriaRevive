@@ -244,7 +244,7 @@ def generate_drawtext_vf(
     else:
         fontfile_escaped = f"/usr/share/fonts/truetype/{font_file}"
 
-    visible_y = video_height - margin_v
+    # visible_y for alignment 2 (bottom center) should account for text height
     phrases = _group_phrases(words, max_words=max_words)
 
     filters = []
@@ -259,7 +259,7 @@ def generate_drawtext_vf(
         text = text.replace("'", "\u2019")  # replace apostrophe with unicode right single quote
 
         # Time-based y: visible during phrase, off-screen otherwise
-        y_expr = f"if(between(t\\,{start:.2f}\\,{end:.2f})\\,{visible_y}\\,-100)"
+        y_expr = f"if(between(t\\,{start:.2f}\\,{end:.2f})\\,h-th-{margin_v}\\,-100)"
 
         filt = (
             f"drawtext=text='{text}'"
@@ -285,6 +285,8 @@ def _clean_word_text(text: str) -> str:
     Keeps letters, digits, and apostrophes (for words like don't, it's).
     Removes: ? ! . , ; : " ( ) [ ] { } * # @ & % ^ ~ / \\ etc.
     """
+    # 1. Remove bracketed metadata [Music], (Laughter), etc.
+    text = re.sub(r'\[.*?\]|\(.*?\)', '', text)
     # Keep apostrophes/right-single-quotes inside words (e.g. don't)
     # Remove all other non-alphanumeric characters
     text = re.sub(r"[^\w'\u2019]", "", text, flags=re.UNICODE)
@@ -311,7 +313,7 @@ def _sanitize_word_times(words: list) -> list:
         # Skip words that become empty after cleaning
         if not cw["text"]:
             continue
-        # Ensure minimum word duration of 100ms
+        # Ensure minimum word duration of 100ms and logical ordering
         if cw["end"] <= cw["start"]:
             cw["end"] = cw["start"] + 0.1
         if cw["end"] - cw["start"] < 0.05:

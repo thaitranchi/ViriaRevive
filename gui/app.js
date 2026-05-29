@@ -250,8 +250,10 @@ window.addEventListener('pywebviewready', async () => {
         const yt = await pywebview.api.youtube_status();
         if (yt.connected) {
             state.ytConnected = true;
-            await loadChannelsAndCategories();
-            updateYtUI(true);
+            loadChannelsAndCategories().then(() => updateYtUI(true));
+        } else {
+            // Load categories even if not connected for default settings
+            loadChannelsAndCategories();
         }
 
         // Render peak times legend on init
@@ -1177,12 +1179,12 @@ function _appendLogLine(log, text) {
     log.scrollTop = log.scrollHeight;
 }
 
-window.onConsoleLog = function (text) {
+window.onConsoleLog = function (text, isDebug = 0) {
     // Write to both the in-progress console and the global console
     const log = document.getElementById('console-log');
-    if (log) _appendLogLine(log, text);
+    if (log) _appendLogLine(log, text, !!isDebug);
     const glog = document.getElementById('global-console-log');
-    if (glog) _appendLogLine(glog, text);
+    if (glog) _appendLogLine(glog, text, !!isDebug);
 };
 
 /* ── Progress Callbacks ───────────────────────────────────────────────── */
@@ -1868,7 +1870,7 @@ async function loadChannelsAndCategories() {
         });
 
         if (state.channels.length && !state.selectedChannel) state.selectedChannel = state.channels[0].id;
-        updateModalCategoryDropdown();
+        updateCategoryDropdowns();
         _populateScheduleChannelDropdown();
     } catch (e) { console.error('Load channels/cats error:', e); }
 }
@@ -1878,18 +1880,23 @@ function selectChannel(id) {
     document.querySelectorAll('.yt-channel-card').forEach(c => c.classList.toggle('selected', c.dataset.channelId === id));
 }
 
-function updateModalCategoryDropdown() {
-    const sel = document.getElementById('modal-meta-category');
-    if (!sel) return;
-    const cur = sel.value;
-    sel.innerHTML = '';
-    state.categories.forEach(cat => {
-        const opt = document.createElement('option');
-        opt.value = cat.id; opt.textContent = cat.title;
-        if (cat.id === '22') opt.selected = true;
-        sel.appendChild(opt);
+function updateCategoryDropdowns() {
+    const ids = ['modal-meta-category', 'set-category'];
+    const defaultCat = state.settings.upload_category || '22';
+    
+    ids.forEach(id => {
+        const sel = document.getElementById(id);
+        if (!sel) return;
+        const cur = sel.value;
+        sel.innerHTML = '';
+        state.categories.forEach(cat => {
+            const opt = document.createElement('option');
+            opt.value = cat.id; opt.textContent = cat.title;
+            if (cat.id === defaultCat) opt.selected = true;
+            sel.appendChild(opt);
+        });
+        if (cur) sel.value = cur;
     });
-    if (cur) sel.value = cur;
 }
 
 /* ── Upload / Calendar Section ────────────────────────────────────────── */
@@ -1919,6 +1926,12 @@ async function loadUploadSection() {
     if (!state.results.length) { empty.style.display = ''; content.classList.add('hidden'); return; }
     empty.style.display = 'none';
     content.classList.remove('hidden');
+
+    // Initialize Upload tab selects from settings
+    const privSel = document.getElementById('smart-sched-privacy');
+    if (privSel && state.settings.upload_privacy) {
+        privSel.value = state.settings.upload_privacy;
+    }
 
     // Sync auto-delete toggle
     try {
@@ -2528,9 +2541,9 @@ function _scheduleClipIndices(clipIndices, opts = {}) {
             date: dateStr,
             time: time,
             title: clip.filename.replace(/\.mp4$/i, ''),
-            description: '#shorts #viral',
-            tags: 'shorts, viral, clips',
-            category_id: '22',
+            description: state.settings.upload_description || '#shorts #viral',
+            tags: state.settings.upload_tags || 'shorts, viral, clips',
+            category_id: state.settings.upload_category || '22',
             privacy: privacy,
             uploaded: false,
             channel_id: resolvedChannel,
@@ -2927,9 +2940,9 @@ function dropClipOnDate(clipIdx, dateStr) {
         date: dateStr,
         time: _nextPeakTimeForDate(dateStr),
         title: clip.filename.replace(/\.mp4$/i, ''),
-        description: '#shorts #viral',
-        tags: 'shorts, viral, clips',
-        category_id: '22',
+        description: state.settings.upload_description || '#shorts #viral',
+        tags: state.settings.upload_tags || 'shorts, viral, clips',
+        category_id: state.settings.upload_category || '22',
         privacy: document.getElementById('smart-sched-privacy').value || 'public',
         uploaded: false,
         channel_id: _getScheduleChannelId() || state.selectedChannel || null,
@@ -2977,9 +2990,9 @@ function pickClipForDate(clipIdx) {
         date: dateStr,
         time: time,
         title: clip.filename.replace(/\.mp4$/i, ''),
-        description: '#shorts #viral',
-        tags: 'shorts, viral, clips',
-        category_id: '22',
+        description: state.settings.upload_description || '#shorts #viral',
+        tags: state.settings.upload_tags || 'shorts, viral, clips',
+        category_id: state.settings.upload_category || '22',
         privacy: document.getElementById('smart-sched-privacy').value || 'public',
         uploaded: false,
         channel_id: state.selectedChannel || null,
@@ -3150,11 +3163,19 @@ function populateSettings(s) {
     setSelect('set-model', s.whisper_model);
     setSelect('set-preset', s.ffmpeg_preset);
     setSelect('set-encoder', s.video_encoder || 'auto');
+    setSelect('set-decoder', s.video_decoder || 'auto'); // Add this line
     setSelect('set-whisper-device', s.whisper_device || 'auto');
+    setSelect('set-category', s.upload_category || '22');
+    setSelect('set-upload-region', s.upload_region || 'US');
+    setSelect('set-upload-privacy', s.upload_privacy || 'public');
+    setVal('set-upload-tags', s.upload_tags || '');
+    setVal('set-upload-desc', s.upload_description || '');
     setSelect('set-yolo-device', s.yolo_device || 'auto');
     setSelect('set-ai-detector', s.ai_detector || 'auto');
     setSelect('set-ai-provider', s.ai_provider || 'gemini');
     setVal('set-gemini-key', s.gemini_api_key || '');
+    const debugToggle = document.getElementById('set-debug-logging');
+    if (debugToggle) debugToggle.checked = !!s.debug_logging;
     const mode = s.shorts_mode || (s.crop_vertical !== false ? 'crop' : 'none');
     const shortsToggle = document.getElementById('set-shorts-enabled');
     if (shortsToggle) shortsToggle.checked = (mode !== 'none');
@@ -3181,10 +3202,17 @@ function gatherSettings() {
         ffmpeg_preset: getVal('set-preset'),
         video_crf: getVal('set-crf'),
         video_encoder: getVal('set-encoder'),
+        video_decoder: getVal('set-decoder'), // Add this line
         whisper_device: getVal('set-whisper-device'),
         yolo_device: getVal('set-yolo-device'),
+        upload_category: getVal('set-category') || '22',
+        upload_region: getVal('set-upload-region') || 'US',
+        upload_privacy: getVal('set-upload-privacy') || 'public',
+        upload_tags: getVal('set-upload-tags') || '',
+        upload_description: getVal('set-upload-desc') || '',
         ai_detector: getVal('set-ai-detector') || 'auto',
         ai_provider: getVal('set-ai-provider') || 'gemini',
+        debug_logging: document.getElementById('set-debug-logging')?.checked || false,
         shorts_mode: document.getElementById('set-shorts-enabled')?.checked ? 'crop' : 'none',
         crop_vertical: document.getElementById('set-shorts-enabled')?.checked
     };
@@ -3410,6 +3438,31 @@ function clearAllNotifications() {
     _notifUnreadCount = 0;
     _updateNotifBadge();
     _renderNotifList();
+}
+
+async function clearAllHistory() {
+    if (!confirm("This will clear the Results list and the entire Schedule. Video files on disk will NOT be deleted. Continue?")) return;
+    
+    try {
+        const r = await pywebview.api.clear_history();
+        if (r.ok) {
+            state.results = [];
+            state.moments = [];
+            state.scheduled = [];
+            renderTimeline();
+            renderCalendar();
+            loadResults();
+            renderClipTray();
+            toast('History cleared', 'success');
+        }
+    } catch (e) {
+        toast('Failed to clear history', 'error');
+    }
+}
+
+async function openDevTools() {
+    toast('Check for a new window or right-click > Inspect', 'info');
+    await pywebview.api.open_devtools();
 }
 
 function showModal(id) {

@@ -466,8 +466,13 @@ def detect_all_persons(video_path, start, end, width, height, sample_count,
         if cv_w != width or cv_h != height:
             # Dimensions differ — need to rescale coordinates
             # OpenCV reads raw coded dimensions; ffprobe may report rotated
-            scale_x = width / cv_w
-            scale_y = height / cv_h
+            is_swapped = abs(cv_w - height) < 4 and abs(cv_h - width) < 4
+            if is_swapped:
+                scale_x = width / cv_h
+                scale_y = height / cv_w
+            else:
+                scale_x = width / cv_w
+                scale_y = height / cv_h
             logger.warning(f"Dimension mismatch: ffprobe={width}x{height}, "
                   f"OpenCV={cv_w}x{cv_h} → rescaling coords by {scale_x:.2f}x{scale_y:.2f}")
             # Check if it's a 90°/270° rotation (width/height swapped)

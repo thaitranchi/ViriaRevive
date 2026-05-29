@@ -23,6 +23,24 @@ _SCOPES = [
 # Cache: account_id -> youtube service
 _service_cache: dict = {}
 
+# Default YouTube categories to use as fallback or before login
+DEFAULT_CATEGORIES = [
+    {"id": "2", "title": "Autos & Vehicles"},
+    {"id": "23", "title": "Comedy"},
+    {"id": "27", "title": "Education"},
+    {"id": "24", "title": "Entertainment"},
+    {"id": "1", "title": "Film & Animation"},
+    {"id": "20", "title": "Gaming"},
+    {"id": "26", "title": "Howto & Style"},
+    {"id": "10", "title": "Music"},
+    {"id": "25", "title": "News & Politics"},
+    {"id": "29", "title": "Nonprofits & Activism"},
+    {"id": "22", "title": "People & Blogs"},
+    {"id": "15", "title": "Pets & Animals"},
+    {"id": "28", "title": "Science & Technology"},
+    {"id": "17", "title": "Sports"},
+    {"id": "19", "title": "Travel & Events"},
+]
 
 # ── Authentication ───────────────────────────────────────────────────────────
 
@@ -238,14 +256,28 @@ def list_categories(region: str = "US") -> list[dict]:
     """Return assignable YouTube video categories."""
     accounts = list_accounts()
     if not accounts:
-        return []
-    yt = get_youtube_service(accounts[0]["id"])
-    resp = yt.videoCategories().list(part="snippet", regionCode=region).execute()
-    return [
-        {"id": cat["id"], "title": cat["snippet"]["title"]}
-        for cat in resp.get("items", [])
-        if cat["snippet"].get("assignable")
-    ]
+        return DEFAULT_CATEGORIES
+
+    try:
+        yt = get_youtube_service(accounts[0]["id"])
+        resp = yt.videoCategories().list(part="snippet", regionCode=region).execute()
+        api_categories = [
+            {"id": cat["id"], "title": cat["snippet"]["title"]}
+            for cat in resp.get("items", [])
+            if cat["snippet"].get("assignable")
+        ]
+        
+        if api_categories:
+            # Merge with defaults to ensure we have a comprehensive list
+            seen = {c["id"] for c in api_categories}
+            for dc in DEFAULT_CATEGORIES:
+                if dc["id"] not in seen:
+                    api_categories.append(dc)
+            return sorted(api_categories, key=lambda x: x["title"])
+    except Exception as e:
+        print(f"[!] Failed to fetch categories from API: {e}")
+    
+    return DEFAULT_CATEGORIES
 
 
 # ── Upload ───────────────────────────────────────────────────────────────────

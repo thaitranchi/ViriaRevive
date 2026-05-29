@@ -19,9 +19,14 @@ _ENCODER_MAP = {
     "nvenc": "h264_nvenc",
     "qsv": "h264_qsv",
     "amf": "h264_amf",
+    "v4l2m2m": "h264_v4l2m2m", # Added h264_v4l2m2m
+    "nvenc_hevc": "hevc_nvenc",
+    "qsv_hevc": "hevc_qsv",
+    "amf_hevc": "hevc_amf",
+    "cpu_hevc": "libx265",
 }
 
-_AUTO_PRIORITY = ("h264_nvenc", "h264_qsv", "h264_amf", "libx264")
+_AUTO_PRIORITY = ("h264_nvenc", "h264_qsv", "h264_amf", "h264_v4l2m2m", "libx264") # Added h264_v4l2m2m
 
 # libx264 preset → hardware preset mapping
 _X264_TO_NVENC = {
@@ -54,9 +59,20 @@ _X264_TO_AMF = {
     "slow": "quality",
 }
 
+# New: libx264 preset → h264_v4l2m2m preset mapping (example, adjust as needed)
+_X264_TO_V4L2M2M = {
+    "ultrafast": "ultrafast",
+    "superfast": "superfast",
+    "veryfast": "veryfast",
+    "faster": "fast",
+    "fast": "medium",
+    "medium": "slow",
+    "slow": "slow",
+}
+
 # Windows decode preference
 _WIN_HWACCEL = ("cuda", "d3d11va", "dxva2")
-_UNIX_HWACCEL = ("cuda", "videotoolbox", "vaapi")
+_UNIX_HWACCEL = ("cuda", "videotoolbox", "vaapi", "v4l2m2m")
 
 
 @dataclass
@@ -95,7 +111,7 @@ def _parse_encoders(output: str) -> frozenset[str]:
     found = set()
     for line in output.splitlines():
         # V..... h264_nvenc           NVIDIA NVENC ...
-        m = re.match(r"\s*V[.F.SX]+\s+(\S+)", line)
+        m = re.match(r"\s*V\S*\s+(\S+)", line)
         if m:
             found.add(m.group(1))
     return frozenset(found)
@@ -112,21 +128,68 @@ def _parse_hwaccels(output: str) -> frozenset[str]:
 
 def _encoder_label(codec: str) -> str:
     labels = {
-        "h264_nvenc": "NVIDIA NVENC",
-        "h264_qsv": "Intel Quick Sync",
-        "h264_amf": "AMD AMF",
+        "h264_nvenc": "NVIDIA NVENC H.264",
+        "h264_qsv": "Intel Quick Sync H.264",
+        "h264_amf": "AMD AMF H.264",
+        "h264_v4l2m2m": "V4L2 M2M H.264",
         "libx264": "CPU (libx264)",
+        "hevc_nvenc": "NVIDIA NVENC HEVC",
+        "hevc_qsv": "Intel Quick Sync HEVC",
+        "hevc_amf": "AMD AMF HEVC",
+        "libx265": "CPU (libx265)",
     }
     return labels.get(codec, codec)
 
 
-def _resolve_encoder(codec: str | None, available: frozenset[str]) -> str:
+def _hardware_encode_works(codec: str) -> bool:
+    if codec in ("libx264", "libx265"):
+        return True
+    if not _ffmpeg_available():
+        return False
+
+    args_by_codec = {
+        "h264_nvenc": ["-c:v", "h264_nvenc", "-preset", "p3", "-rc:v", "vbr", "-cq:v", "23", "-pix_fmt", "yuv420p"],
+        "h264_qsv": ["-c:v", "h264_qsv", "-preset", "veryfast", "-global_quality:v", "23", "-pix_fmt", "nv12"],
+        "h264_amf": ["-c:v", "h264_amf", "-quality", "balanced", "-rc:v", "vbr_latency", "-qp_i:v", "23", "-qp_p:v", "23", "-pix_fmt", "yuv420p"],
+        "h264_v4l2m2m": ["-c:v", "h264_v4l2m2m", "-qp", "23", "-pix_fmt", "yuv420p"],
+        "hevc_nvenc": ["-c:v", "hevc_nvenc", "-preset", "p3", "-rc:v", "vbr", "-cq:v", "23", "-pix_fmt", "yuv420p"],
+        "hevc_qsv": ["-c:v", "hevc_qsv", "-preset", "veryfast", "-global_quality:v", "23", "-pix_fmt", "nv12"],
+        "hevc_amf": ["-c:v", "hevc_amf", "-quality", "balanced", "-rc:v", "vbr_latency", "-qp_i:v", "23", "-qp_p:v", "23", "-pix_fmt", "yuv420p"],
+    }
+    enc_args = args_by_codec.get(codec)
+    if not enc_args:
+        return False
+
+    try:
+        r = _run(
+            [
+                "ffmpeg", "-hide_banner", "-y",
+                "-f", "lavfi", "-i", "testsrc2=duration=0.5:size=640x360:rate=15",
+                *enc_args,
+                "-f", "null", "-",
+            ],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=8,
+        )
+        if r.returncode != 0:
+            logger.info("FFmpeg hardware encoder probe failed for %s: %s", codec, (r.stderr or "")[-300:])
+        return r.returncode == 0
+    except Exception as exc:
+        logger.info("FFmpeg hardware encoder probe failed for %s: %s", codec, exc)
+        return False
+
+
+def _resolve_encoder(codec: str | None, available: frozenset[str], verify: bool = True) -> str:
     if codec == "libx264" or codec == "cpu":
         return "libx264"
-    if codec and codec in available:
+    if codec and codec in available and (not verify or _hardware_encode_works(codec)):
         return codec
+    if codec and codec in available:
+        logger.warning("%s is listed by FFmpeg but failed the encode probe; falling back.", codec)
     for c in _AUTO_PRIORITY:
-        if c in available:
+        if c in available and (not verify or _hardware_encode_works(c)):
             return c
     return "libx264"
 
@@ -205,11 +268,15 @@ def video_encode_args(
         if key == "cpu":
             codec = "libx264"
         elif key in _ENCODER_MAP and _ENCODER_MAP[key]:
-            codec = _ENCODER_MAP[key] if _ENCODER_MAP[key] in prof.encoders else prof.active_encoder
+            requested = _ENCODER_MAP[key]
+            codec = requested if requested == prof.active_encoder else prof.active_encoder
         else:
             codec = prof.active_encoder
 
-    cq = str(max(18, min(32, int(crf))))
+    try:
+        cq = str(max(0, min(51, int(crf))))
+    except (ValueError, TypeError):
+        cq = "23"
     x264_preset = preset if preset in _X264_TO_NVENC else "ultrafast"
 
     if codec == "h264_nvenc":
@@ -217,8 +284,9 @@ def video_encode_args(
         return [
             "-c:v", "h264_nvenc",
             "-preset", nv_preset,
-            "-rc", "vbr",
-            "-cq", cq,
+            "-rc:v", "vbr",
+            "-cq:v", cq,
+            "-profile:v", "high",
             "-pix_fmt", "yuv420p",
         ]
     if codec == "h264_qsv":
@@ -226,7 +294,7 @@ def video_encode_args(
         return [
             "-c:v", "h264_qsv",
             "-preset", qsv_preset,
-            "-global_quality", cq,
+            "-global_quality:v", cq,
             "-pix_fmt", "yuv420p",
         ]
     if codec == "h264_amf":
@@ -234,10 +302,53 @@ def video_encode_args(
         return [
             "-c:v", "h264_amf",
             "-quality", amf_preset,
-            "-rc", "vbr_latency",
-            "-qp_i", cq,
-            "-qp_p", cq,
+            "-rc:v", "vbr_latency",
+            "-qp_i:v", cq,
+            "-qp_p:v", cq,
             "-pix_fmt", "yuv420p",
+        ]
+    if codec == "hevc_nvenc":
+        nv_preset = _X264_TO_NVENC.get(x264_preset, "p4")
+        return [
+            "-c:v", "hevc_nvenc",
+            "-preset", nv_preset,
+            "-rc:v", "vbr",
+            "-cq:v", cq,
+            "-pix_fmt", "yuv420p",
+        ]
+    if codec == "hevc_qsv":
+        qsv_preset = _X264_TO_QSV.get(x264_preset, "veryfast")
+        return [
+            "-c:v", "hevc_qsv",
+            "-preset", qsv_preset,
+            "-global_quality:v", cq,
+            "-pix_fmt", "yuv420p",
+        ]
+    if codec == "hevc_amf":
+        amf_preset = _X264_TO_AMF.get(x264_preset, "balanced")
+        return [
+            "-c:v", "hevc_amf",
+            "-quality", amf_preset,
+            "-rc:v", "vbr_latency",
+            "-qp_i:v", cq,
+            "-qp_p:v", cq,
+            "-pix_fmt", "yuv420p",
+        ]
+    if codec == "libx265":
+        return [
+            "-c:v", "libx265",
+            "-preset", x264_preset,
+            "-crf", cq,
+            "-pix_fmt", "yuv420p",
+        ]
+    if codec == "h264_v4l2m2m": # New: h264_v4l2m2m encoding arguments
+        v4l2m2m_preset = _X264_TO_V4L2M2M.get(x264_preset, "medium")
+        return [
+            "-c:v", "h264_v4l2m2m",
+            "-preset", v4l2m2m_preset,
+            "-qp", cq, # Assuming -qp for quality control
+            "-pix_fmt", "yuv420p",
+            # Add any other specific v4l2m2m options here, e.g., -b:v, -profile:v
         ]
     return [
         "-c:v", "libx264",
@@ -249,24 +360,73 @@ def video_encode_args(
 
 def input_hwaccel_args(decoder: str = "auto") -> list[str]:
     """Build ffmpeg hardware decode args (before -i). Empty if unavailable."""
-    if decoder == "none" or decoder == "cpu":
+    if decoder in ("none", "cpu"):
         return []
+
+    # Handle codec-based hardware decoders (e.g., h264_cuvid, h264_qsv)
+    # These are used as -c:v [codec] before the input -i
+    if any(suffix in decoder for suffix in ("_cuvid", "_qsv", "_v4l2m2m")):
+        return ["-c:v", decoder]
+
     prof = probe_ffmpeg()
-    if not prof.active_hwaccel:
-        return []
-    return ["-hwaccel", prof.active_hwaccel]
+    # Allow explicitly requesting a specific hardware acceleration method
+    # if it was detected during the FFmpeg probe.
+    if decoder != "auto" and decoder in prof.hwaccels:
+        return ["-hwaccel", decoder]
+
+    # 'auto' is significantly more robust than picking a specific string.
+    # It allows FFmpeg to fall back to software or alternative devices if one fails.
+    if prof.active_hwaccel:
+        return ["-hwaccel", "auto"]
+    return []
 
 
-_HW_CODECS = frozenset({"h264_nvenc", "h264_qsv", "h264_amf"})
+_HW_CODECS = frozenset({"h264_nvenc", "h264_qsv", "h264_amf", "h264_v4l2m2m", "hevc_nvenc", "hevc_qsv", "hevc_amf"}) # Added HEVC variants
+
+_HW_OPTION_ARITY = {
+    "-preset": 1,
+    "-rc": 1,
+    "-rc:v": 1,
+    "-cq": 1,
+    "-cq:v": 1,
+    "-global_quality": 1,
+    "-global_quality:v": 1,
+    "-quality": 1,
+    "-qp": 1,
+    "-qp:v": 1,
+    "-qp_i": 1,
+    "-qp_i:v": 1,
+    "-qp_p": 1,
+    "-qp_p:v": 1,
+    "-pix_fmt": 1,
+    "-profile:v": 1,
+    "-level:v": 1,
+    "-tier:v": 1,
+}
+
+_HW_DECODER_SUFFIXES = ("_cuvid", "_qsv", "_v4l2m2m")
 
 
 def _swap_cmd_encode_to_cpu(cmd: list[str], preset: str, crf: str) -> list[str]:
     """Replace hardware -c:v block in an ffmpeg command with libx264 args."""
     out: list[str] = []
     i = 0
+    seen_input = False
     while i < len(cmd):
+        if cmd[i] == "-i":
+            seen_input = True
+            out.append(cmd[i])
+            i += 1
+            continue
+
         # 1. Strip hardware decoder flags (retry should be pure software)
         if cmd[i] == "-hwaccel":
+            i += 2
+            continue
+
+        # 1b. Strip codec-based hardware decoders (before -i) during fallback
+        if (not seen_input and i + 1 < len(cmd) and cmd[i] == "-c:v" and 
+            any(s in cmd[i + 1] for s in _HW_DECODER_SUFFIXES)):
             i += 2
             continue
 
@@ -278,17 +438,15 @@ def _swap_cmd_encode_to_cpu(cmd: list[str], preset: str, crf: str) -> list[str]:
         ):
             out.extend(video_encode_args(preset, crf, force_cpu=True))
             i += 2
-            # Skip subsequent encoder-specific flags we might have added
+            # Skip subsequent encoder-specific flags we might have added.
             while i < len(cmd):
-                if cmd[i] in ("-preset", "-rc", "-cq", "-global_quality", "-quality", "-qp_i", "-qp_p", "-pix_fmt"):
-                    i += 2
+                option_arity = _HW_OPTION_ARITY.get(cmd[i])
+                if option_arity is not None:
+                    i += 1 + option_arity
                     continue
-                # Stop if we hit a generic ffmpeg flag or the output path
-                if cmd[i] in ("-c:a", "-map", "-movflags", "-f", "-t", "-ss", "-y", "-filter_complex", "-vf"):
+                # Stop if we hit any other flag or the output filename
+                if cmd[i].startswith("-") and cmd[i] not in ("-y", "-n"):
                     break
-                if cmd[i].startswith("-") and i + 1 < len(cmd):
-                    i += 2
-                    continue
                 break
             continue
         out.append(cmd[i])
@@ -312,8 +470,10 @@ def run_ffmpeg_with_encode_fallback(
     if not has_hw:
         return r
 
-    # Log why it failed to help with debugging
-    err_msg = r.stderr.splitlines()[-1] if r.stderr else "Unknown error"
+    # Log why it failed to help with debugging. Avoid index errors on empty stderr.
+    lines = r.stderr.strip().splitlines() if r.stderr else []
+    err_msg = lines[-1] if lines else "Unknown error (check ffmpeg installation)"
+    
     print(f"[!] Hardware acceleration failed: {err_msg}")
     print("    Retrying with pure software path...")
 
