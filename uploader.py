@@ -15,6 +15,7 @@ else:
 _SECRETS = _BASE / "client_secrets.json"
 _TOKENS_DIR = _BASE / "tokens"
 _TOKEN_LEGACY = _BASE / "token.json"  # old single-token path
+_SKIP_TOKEN_FILES = frozenset({"gemini_key.json"})
 _SCOPES = [
     "https://www.googleapis.com/auth/youtube.upload",
     "https://www.googleapis.com/auth/youtube.readonly",
@@ -175,6 +176,8 @@ def list_accounts() -> list[dict]:
     _ensure_tokens_dir()
     accounts = []
     for f in sorted(_TOKENS_DIR.glob("*.json")):
+        if f.name in _SKIP_TOKEN_FILES:
+            continue
         try:
             data = json.loads(f.read_text())
             accounts.append({
@@ -203,7 +206,8 @@ def disconnect(account_id: str = None):
     else:
         # Remove all
         for f in _TOKENS_DIR.glob("*.json"):
-            f.unlink()
+            if f.name not in _SKIP_TOKEN_FILES:
+                f.unlink()
         _service_cache.clear()
 
 

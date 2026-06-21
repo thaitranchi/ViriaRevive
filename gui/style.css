@@ -1734,6 +1734,12 @@ code { background: rgba(255,255,255,0.06); padding: 2px 8px; border-radius: 5px;
 .setting-row > label { display: block; font-size: 12.5px; font-weight: 500; color: var(--text-2); margin-bottom: 8px; }
 .setting-hint { display: block; font-size: 10.5px; color: var(--text-3); margin-top: 4px; }
 
+.cred-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+.cred-status { font-size: 11px; font-weight: 600; padding: 3px 8px; border-radius: 4px; }
+.cred-status.ok { background: rgba(0,184,148,0.12); color: var(--success); }
+.cred-status.missing { background: rgba(255,255,255,0.04); color: var(--text-3); }
+.cred-actions { display: flex; gap: 6px; margin-left: auto; }
+
 .slider-group { display: flex; align-items: center; gap: 12px; }
 .slider-group input[type="range"] {
     flex: 1; -webkit-appearance: none; appearance: none;

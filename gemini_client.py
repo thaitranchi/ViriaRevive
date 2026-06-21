@@ -12,6 +12,37 @@ def is_available(api_key: Optional[str]) -> bool:
     """Check if the Gemini API key is configured."""
     return bool(api_key and not api_key.startswith("YOUR_"))
 
+
+def test_connection(api_key: str, timeout: int = 15) -> dict:
+    """Verify a Gemini API key with a minimal generateContent request."""
+    if not is_available(api_key):
+        return {"ok": False, "error": "Invalid or missing API key"}
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent?key={api_key}"
+    payload = {
+        "contents": [{"parts": [{"text": "Reply with OK only."}]}],
+        "generationConfig": {"maxOutputTokens": 8},
+    }
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read())
+        if _extract_text(data):
+            return {"ok": True}
+        return {"ok": False, "error": "Unexpected API response"}
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")
+        try:
+            msg = json.loads(body).get("error", {}).get("message", body[:200])
+        except json.JSONDecodeError:
+            msg = body[:200] or f"HTTP {e.code}"
+        return {"ok": False, "error": msg}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
 def _post(api_key: str, payload: dict, timeout: int) -> Optional[dict]:
     """Internal helper to send a POST request to Gemini."""
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent?key={api_key}"

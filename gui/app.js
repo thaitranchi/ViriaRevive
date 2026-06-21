@@ -236,6 +236,7 @@ window.addEventListener('pywebviewready', async () => {
         // Use backend settings, fall back to localStorage for any missing keys
         state.settings = { ...local, ...backendSettings };
         populateSettings(state.settings);
+        await loadCredentialsStatus();
 
         // Load persisted state from previous session
         const persisted = await pywebview.api.load_persisted_state();
@@ -1778,6 +1779,12 @@ async function connectYouTube() {
     const origHTML = btn.innerHTML;
     btn.textContent = 'Connecting...'; btn.disabled = true;
     try {
+        const creds = await pywebview.api.get_credentials_status();
+        if (!creds.youtube_credentials) {
+            toast('Upload OAuth credentials in Settings first', 'error');
+            addNotification('YouTube Setup Required', 'Upload client_secrets.json in Settings → YouTube Upload', 'error');
+            return;
+        }
         const r = await pywebview.api.connect_youtube();
         if (r.ok) {
             state.ytConnected = true;
@@ -3138,6 +3145,110 @@ async function startUpload() {
 
 function showYouTubeSetup() { showModal('youtube-modal'); }
 
+/* ── Credentials ───────────────────────────────────────────────────────── */
+
+async function loadCredentialsStatus() {
+    try {
+        const st = await pywebview.api.get_credentials_status();
+        updateCredentialsUI(st);
+    } catch (_) { }
+}
+
+function updateCredentialsUI(st) {
+    const ytEl = document.getElementById('yt-cred-status');
+    if (ytEl) {
+        ytEl.textContent = st.youtube_credentials ? 'Configured' : 'Not configured';
+        ytEl.className = 'cred-status ' + (st.youtube_credentials ? 'ok' : 'missing');
+    }
+    const removeYt = document.getElementById('btn-yt-cred-remove');
+    if (removeYt) removeYt.disabled = !st.youtube_credentials;
+
+    const gemEl = document.getElementById('gemini-key-status');
+    if (gemEl) {
+        gemEl.textContent = st.gemini_configured
+            ? ('Configured' + (st.gemini_key_hint ? ' ' + st.gemini_key_hint : ''))
+            : 'Not configured';
+        gemEl.className = 'cred-status ' + (st.gemini_configured ? 'ok' : 'missing');
+    }
+    const clearBtn = document.getElementById('btn-gemini-clear');
+    if (clearBtn) clearBtn.disabled = !st.gemini_configured;
+
+    const keyInput = document.getElementById('set-gemini-key');
+    if (keyInput && !keyInput.value) {
+        keyInput.placeholder = st.gemini_configured
+            ? (st.gemini_key_hint ? `Saved ${st.gemini_key_hint} — enter new to replace` : 'Key saved — enter new to replace')
+            : 'AIza...';
+    }
+}
+
+async function uploadYouTubeCredentials() {
+    try {
+        const r = await pywebview.api.upload_youtube_credentials();
+        if (r.cancelled) return;
+        if (r.ok) {
+            toast('YouTube credentials saved', 'success');
+            await loadCredentialsStatus();
+        } else {
+            toast(r.error || 'Upload failed', 'error');
+        }
+    } catch (e) {
+        toast('Upload failed: ' + e, 'error');
+    }
+}
+
+async function removeYouTubeCredentials() {
+    if (!confirm('Remove saved YouTube OAuth credentials? You will need to upload them again to connect accounts.')) return;
+    try {
+        await pywebview.api.remove_youtube_credentials();
+        toast('YouTube credentials removed', 'success');
+        await loadCredentialsStatus();
+    } catch (e) {
+        toast('Remove failed: ' + e, 'error');
+    }
+}
+
+async function saveGeminiKey() {
+    const key = getVal('set-gemini-key').trim();
+    if (!key) return;
+    try {
+        const s = gatherSettings();
+        s.gemini_api_key = key;
+        await pywebview.api.save_settings(s);
+        document.getElementById('set-gemini-key').value = '';
+        toast('Gemini API key saved', 'success');
+        await loadCredentialsStatus();
+    } catch (e) {
+        toast('Save failed: ' + e, 'error');
+    }
+}
+
+async function testGeminiKey() {
+    const pending = getVal('set-gemini-key').trim();
+    try {
+        const r = await pywebview.api.test_gemini_key(pending || null);
+        if (r.ok) {
+            toast('Gemini API key is valid', 'success');
+            if (pending) await saveGeminiKey();
+        } else {
+            toast(r.error || 'Gemini test failed', 'error');
+        }
+    } catch (e) {
+        toast('Test failed: ' + e, 'error');
+    }
+}
+
+async function clearGeminiKey() {
+    if (!confirm('Remove the saved Gemini API key?')) return;
+    try {
+        await pywebview.api.clear_gemini_key();
+        document.getElementById('set-gemini-key').value = '';
+        toast('Gemini API key removed', 'success');
+        await loadCredentialsStatus();
+    } catch (e) {
+        toast('Clear failed: ' + e, 'error');
+    }
+}
+
 /* ── Settings ──────────────────────────────────────────────────────────── */
 
 function populateSettings(s) {
@@ -3173,7 +3284,13 @@ function populateSettings(s) {
     setSelect('set-yolo-device', s.yolo_device || 'auto');
     setSelect('set-ai-detector', s.ai_detector || 'auto');
     setSelect('set-ai-provider', s.ai_provider || 'gemini');
-    setVal('set-gemini-key', s.gemini_api_key || '');
+    const geminiInput = document.getElementById('set-gemini-key');
+    if (geminiInput) {
+        geminiInput.value = '';
+        geminiInput.placeholder = s.gemini_key_configured
+            ? (s.gemini_key_hint ? `Saved ${s.gemini_key_hint} — enter new to replace` : 'Key saved — enter new to replace')
+            : 'AIza...';
+    }
     const debugToggle = document.getElementById('set-debug-logging');
     if (debugToggle) debugToggle.checked = !!s.debug_logging;
     const mode = s.shorts_mode || (s.crop_vertical !== false ? 'crop' : 'none');
@@ -3216,6 +3333,8 @@ function gatherSettings() {
         shorts_mode: document.getElementById('set-shorts-enabled')?.checked ? 'crop' : 'none',
         crop_vertical: document.getElementById('set-shorts-enabled')?.checked
     };
+    const geminiKey = getVal('set-gemini-key').trim();
+    if (geminiKey) s.gemini_api_key = geminiKey;
     saveLocal('settings', s);
     // Also persist to Python backend (survives localStorage clears)
     try { pywebview.api.save_settings(s); } catch (_) { }

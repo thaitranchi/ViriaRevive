@@ -395,9 +395,81 @@ class ApiBridge:
         if self._user_settings:
             defaults.update(self._user_settings)
         # Ensure the Gemini key is included if it exists in the token file
-        defaults["gemini_api_key"] = self._decrypt(config.GEMINI_API_KEY)
+        gemini_key = self._decrypt(config.GEMINI_API_KEY)
+        defaults["gemini_key_configured"] = gemini_client.is_available(gemini_key)
+        defaults["gemini_key_hint"] = f"...{gemini_key[-4:]}" if gemini_key and len(gemini_key) >= 4 else ""
         defaults["crop_vertical"] = True
         return defaults
+
+    @staticmethod
+    def _validate_youtube_credentials(data: dict) -> bool:
+        for section in ("installed", "web"):
+            creds = data.get(section)
+            if isinstance(creds, dict) and creds.get("client_id") and creds.get("client_secret"):
+                return True
+        return False
+
+    def get_credentials_status(self):
+        """Return whether YouTube OAuth and Gemini credentials are configured."""
+        yt_ok = False
+        if CLIENT_SECRETS_FILE.exists():
+            try:
+                data = json.loads(CLIENT_SECRETS_FILE.read_text(encoding="utf-8"))
+                yt_ok = self._validate_youtube_credentials(data)
+            except Exception:
+                yt_ok = False
+
+        gemini_key = self._decrypt(config.GEMINI_API_KEY)
+        gemini_ok = gemini_client.is_available(gemini_key)
+        return {
+            "youtube_credentials": yt_ok,
+            "gemini_configured": gemini_ok,
+            "gemini_key_hint": f"...{gemini_key[-4:]}" if gemini_ok and len(gemini_key) >= 4 else "",
+        }
+
+    def upload_youtube_credentials(self):
+        """Pick a Google OAuth JSON file and save it as client_secrets.json."""
+        import webview
+
+        result = self._window.create_file_dialog(
+            webview.OPEN_DIALOG,
+            file_types=("JSON files (*.json)", "All files (*.*)"),
+        )
+        if not result:
+            return {"ok": False, "cancelled": True}
+
+        try:
+            data = json.loads(Path(result[0]).read_text(encoding="utf-8"))
+            if not self._validate_youtube_credentials(data):
+                return {
+                    "ok": False,
+                    "error": "Invalid OAuth credentials. Expected Google Desktop app JSON with client_id and client_secret.",
+                }
+            data.pop("gemini_api_key", None)
+            CLIENT_SECRETS_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            return {"ok": True}
+        except json.JSONDecodeError:
+            return {"ok": False, "error": "File is not valid JSON."}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def remove_youtube_credentials(self):
+        """Delete the saved YouTube OAuth credentials file."""
+        if CLIENT_SECRETS_FILE.exists():
+            CLIENT_SECRETS_FILE.unlink()
+        return {"ok": True}
+
+    def test_gemini_key(self, api_key=None):
+        """Test the saved or provided Gemini API key."""
+        key = (api_key or "").strip() or self._decrypt(config.GEMINI_API_KEY)
+        return gemini_client.test_connection(key)
+
+    def clear_gemini_key(self):
+        """Remove the saved Gemini API key."""
+        if GEMINI_TOKEN_FILE.exists():
+            GEMINI_TOKEN_FILE.unlink()
+        config.GEMINI_API_KEY = ""
+        return {"ok": True}
 
     def save_settings(self, settings):
         """Persist user settings to disk so they survive restarts."""
@@ -405,18 +477,18 @@ class ApiBridge:
 
         # Extract Gemini key and save to tokens/gemini_key.json instead of viria_state.json
         gemini_key = new_settings.pop("gemini_api_key", None)
-        if gemini_key is not None:
+        if gemini_key is not None and str(gemini_key).strip():
             try:
                 secrets = {}
                 if GEMINI_TOKEN_FILE.exists():
                     with open(GEMINI_TOKEN_FILE, 'r', encoding='utf-8') as f:
                         secrets = json.load(f)
-                secrets["gemini_api_key"] = self._encrypt(gemini_key)
+                secrets["gemini_api_key"] = self._encrypt(gemini_key.strip())
                 with open(GEMINI_TOKEN_FILE, 'w', encoding='utf-8') as f:
                     json.dump(secrets, f, indent=2)
-                
+
                 # Update runtime value so changes take effect without restart
-                config.GEMINI_API_KEY = gemini_key
+                config.GEMINI_API_KEY = gemini_key.strip()
             except Exception as e:
                 logger.exception("Failed to write Gemini key to tokens file")
 

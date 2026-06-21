@@ -790,7 +790,7 @@
                         Upload Scheduled Clips
                     </button>
 
-                    <p class="upload-hint">Requires <code>client_secrets.json</code> from Google Cloud Console. <a
+                    <p class="upload-hint">Upload OAuth credentials in <strong>Settings → YouTube Upload</strong>, then connect your account above. <a
                             href="#" onclick="showYouTubeSetup()">Setup guide</a></p>
                 </div>
             </section>
@@ -1067,8 +1067,15 @@
                         </div>
                         <div class="setting-row">
                             <label for="set-gemini-key">Gemini API Key</label>
-                            <input type="password" id="set-gemini-key" class="form-input" placeholder="AIza..." onchange="gatherSettings()">
-                            <span class="setting-hint">Get one for free at <a href="https://aistudio.google.com/app/apikey" target="_blank" style="text-decoration:underline">Google AI Studio</a></span>
+                            <div class="cred-row">
+                                <span id="gemini-key-status" class="cred-status missing">Not configured</span>
+                                <div class="cred-actions">
+                                    <button type="button" class="btn-secondary btn-sm" onclick="testGeminiKey()">Test</button>
+                                    <button type="button" class="btn-secondary btn-sm" id="btn-gemini-clear" onclick="clearGeminiKey()" disabled>Clear</button>
+                                </div>
+                            </div>
+                            <input type="password" id="set-gemini-key" class="form-input" placeholder="AIza..." onchange="saveGeminiKey()">
+                            <span class="setting-hint">Get one for free at <a href="https://aistudio.google.com/app/apikey" target="_blank" style="text-decoration:underline">Google AI Studio</a>. Stored encrypted in <code>tokens/gemini_key.json</code>.</span>
                         </div>
                         <div class="setting-row">
                             <label for="set-title-language">Title language</label>
@@ -1111,6 +1118,17 @@
                             </svg>
                             YouTube Upload
                         </h3>
+                        <div class="setting-row">
+                            <label>OAuth Credentials</label>
+                            <div class="cred-row">
+                                <span id="yt-cred-status" class="cred-status missing">Not configured</span>
+                                <div class="cred-actions">
+                                    <button type="button" class="btn-secondary btn-sm" onclick="uploadYouTubeCredentials()">Upload JSON</button>
+                                    <button type="button" class="btn-secondary btn-sm" id="btn-yt-cred-remove" onclick="removeYouTubeCredentials()" disabled>Remove</button>
+                                </div>
+                            </div>
+                            <span class="setting-hint">Google Cloud OAuth 2.0 Desktop app JSON saved as <code>client_secrets.json</code>. <a href="#" onclick="showYouTubeSetup();return false">Setup guide</a></span>
+                        </div>
                         <div class="setting-row">
                             <label for="set-category">Default Category</label>
                             <select id="set-category" class="form-select">
@@ -1278,7 +1296,7 @@
                 <li>Enable <strong>YouTube Data API v3</strong></li>
                 <li>Create <strong>OAuth 2.0</strong> credentials (Desktop app)</li>
                 <li>Download the JSON file</li>
-                <li>Save it as <code>client_secrets.json</code> in the ViriaRevive folder</li>
+                <li>Upload it in <strong>Settings → YouTube Upload → Upload JSON</strong></li>
             </ol>
             <button class="btn-primary" onclick="closeModal('youtube-modal')">Done</button>
         </div>
