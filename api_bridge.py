@@ -336,7 +336,6 @@ class ApiBridge:
         service_name = "ViriaRevive"
         account_name = "MasterEncryptionKey"
 
-        # Try Windows Credential Manager first
         if keyring:
             try:
                 stored_key = keyring.get_password(service_name, account_name)
@@ -346,15 +345,9 @@ class ApiBridge:
                     stored_key = new_key
                 return Fernet(stored_key.encode()) # type: ignore
             except Exception as e:
-                print(f"[security] Keyring access failed: {e}. Using fallback storage.")
+                print(f"[security] Keyring access failed: {e}. Storing secrets without local crypt key.")
 
-        # Fallback to local file if keyring is unavailable or fails
-        key_file = BASE_DIR / "tokens" / ".crypt.key"
-        if not key_file.exists():
-            key_file.parent.mkdir(exist_ok=True)
-            key = Fernet.generate_key()
-            key_file.write_bytes(key)
-        return Fernet(key_file.read_bytes())
+        return None
 
     def _encrypt(self, text):
         cipher = self._get_cipher()
