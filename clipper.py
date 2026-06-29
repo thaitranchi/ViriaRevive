@@ -411,6 +411,173 @@ def _fallback_shorts_encode(video_path: Path, start: float, duration: float,
     return None
 
 
+# ── Helpers for merged FFmpeg pass ───────────────────────────────────────────
+
+
+def _get_effect_vf(effect: str | None) -> str | None:
+    """Return the video filter string for an effect preset, or None."""
+    if not effect or effect == "none" or effect not in EFFECTS_PRESETS:
+        return None
+    return EFFECTS_PRESETS[effect]["vf"]
+
+
+def _build_music_extra_inputs(music_path: Path | None) -> list[str]:
+    """Return extra -i args if a music file is provided and exists."""
+    if not music_path or not Path(music_path).exists():
+        return []
+    return ["-i", str(music_path)]
+
+
+def _build_music_af(clip_duration: float, music_path: Path | None,
+                     volume: float, trim_start: float, trim_end: float) -> str | None:
+    """Build the audio filter string for background music amix, or None."""
+    if not music_path or not Path(music_path).exists():
+        return None
+    has_trim = trim_end > trim_start and trim_end > 0
+    if has_trim:
+        trim_dur = trim_end - trim_start
+        music_part = (
+            f"[1:a]atrim=start={trim_start:.3f}:end={trim_end:.3f},asetpts=PTS-STARTPTS,"
+            f"aloop=loop=-1:size={int(trim_dur * 48000)},"
+            f"atrim=duration={clip_duration:.3f},volume={volume:.2f}[bg]"
+        )
+    else:
+        music_part = (
+            f"[1:a]aloop=loop=-1:size=2e+09,"
+            f"atrim=duration={clip_duration:.3f},volume={volume:.2f}[bg]"
+        )
+    return f"{music_part};[0:a][bg]amix=inputs=2:duration=first:dropout_transition=2[aout]"
+
+
+def _build_sub_filter_str(subtitle_path: Path | None, output_stem: str) -> tuple[str | None, Path | None, Path | None]:
+    """Prepare subtitle filter string and return (filter_str_with_stream_label, temp_sub, sub_dir)."""
+    temp_sub, sub_dir = _prepare_subtitle_file(subtitle_path, output_stem)
+    if not temp_sub:
+        return None, None, None
+    
+    filt = _detect_subtitle_filter()
+    if not filt:
+        return None, None, None
+    
+    fontsdir_cwd = _fonts_dir_option(sub_dir, use_cwd=True)
+    sub_str = f"{filt}={temp_sub.name}{fontsdir_cwd}"
+    # Add stream label for filter_complex
+    return sub_str, temp_sub, sub_dir
+
+
+def _run_merged_ffmpeg(
+    video_path: Path, start: float, duration: float,
+    output_path: Path,
+    vf_chain: str | None,
+    af_chain: str | None,
+    sub_filter_cwd: str | None,
+    extra_inputs: list[str],
+    preset: str, crf: str, encoder: str, decoder: str,
+) -> subprocess.CompletedProcess | None:
+    """Run a single merged ffmpeg call with optional video/audio filter chains."""
+    filter_parts = []
+    map_args = []
+
+    if vf_chain:
+        filter_parts.append(f"[0:v]{vf_chain}[vout]")
+        map_args.extend(["-map", "[vout]"])
+    else:
+        map_args.extend(["-map", "0:v"])
+
+    if af_chain:
+        filter_parts.append(af_chain)
+        map_args.extend(["-map", "[aout]"])
+        audio_enc = ["-c:a", "aac", "-b:a", "192k"]
+    else:
+        map_args.extend(["-map", "0:a"])
+        audio_enc = ["-c:a", "aac", "-b:a", "192k"]
+
+    filter_complex = ";".join(filter_parts) if filter_parts else None
+
+    cmd = [
+        "ffmpeg", "-y", "-ss", str(start),
+        *input_hwaccel_args(decoder),
+        "-i", str(video_path), "-t", str(duration),
+        *extra_inputs,
+    ]
+    if filter_complex:
+        cmd.extend(["-filter_complex", filter_complex])
+    cmd.extend([
+        *map_args,
+        *video_encode_args(preset, crf, encoder),
+        *audio_enc,
+        str(output_path),
+    ])
+
+    kwargs = {}
+    if sub_filter_cwd:
+        kwargs["cwd"] = sub_filter_cwd
+
+    return run_ffmpeg_with_encode_fallback(
+        cmd,
+        lambda c: _run(c, capture_output=True, text=True, errors="replace", **kwargs),
+        preset, crf,
+    )
+
+
+def _try_sub_filter_approaches(
+    video_path: Path, start: float, duration: float,
+    output_path: Path, temp_sub: Path, sub_dir: Path,
+    sub_filter_str: str, vf_base: str, af_chain: str | None,
+    extra_inputs: list[str],
+    preset: str, crf: str, encoder: str, decoder: str,
+) -> bool:
+    """Try subtitle burn with multiple approaches in a merged ffmpeg call.
+    
+    Returns True on success.
+    """
+    filt = _detect_subtitle_filter()
+    other = "ass" if filt == "subtitles" else "subtitles"
+    fontsdir_cwd = _fonts_dir_option(sub_dir, use_cwd=True)
+    fontsdir_full = _fonts_dir_option(sub_dir, use_cwd=False)
+
+    # Approach 1: filename-only with CWD
+    sub_vf = f"{filt}={temp_sub.name}{fontsdir_cwd}"
+    vf_chain = f"{vf_base},{sub_vf}" if vf_base else sub_vf
+    r = _run_merged_ffmpeg(
+        video_path, start, duration, output_path,
+        vf_chain, af_chain, str(sub_dir), extra_inputs,
+        preset, crf, encoder, decoder,
+    )
+    if r and r.returncode == 0 and output_path.exists():
+        return True
+
+    # Approach 2: full escaped path, no CWD
+    escaped = _escape_sub_path_win(temp_sub)
+    sub_vf = f"{filt}={escaped}{fontsdir_full}"
+    vf_chain = f"{vf_base},{sub_vf}" if vf_base else sub_vf
+    r = _run_merged_ffmpeg(
+        video_path, start, duration, output_path,
+        vf_chain, af_chain, None, extra_inputs,
+        preset, crf, encoder, decoder,
+    )
+    if r and r.returncode == 0 and output_path.exists():
+        return True
+
+    # Approach 3: try the other filter
+    try:
+        r_check = _run(["ffmpeg", "-filters"], capture_output=True, text=True, timeout=10)
+        if re.search(rf'\b{other}\b', r_check.stdout):
+            sub_vf = f"{other}={temp_sub.name}{fontsdir_cwd}"
+            vf_chain = f"{vf_base},{sub_vf}" if vf_base else sub_vf
+            r = _run_merged_ffmpeg(
+                video_path, start, duration, output_path,
+                vf_chain, af_chain, str(sub_dir), extra_inputs,
+                preset, crf, encoder, decoder,
+            )
+            if r and r.returncode == 0 and output_path.exists():
+                return True
+    except Exception:
+        pass
+
+    return False
+
+
 # ── Main extract function ────────────────────────────────────────────────────
 
 
@@ -426,12 +593,16 @@ def extract_clip(
     encoder: str = "auto",
     decoder: str = "auto",
     shorts_format: str = "crop",  # "crop" | "blur_pad" | "none"
+    effect: str = None,
+    music_path: Path = None,
+    music_volume: float = 0.12,
+    music_trim_start: float = 0,
+    music_trim_end: float = 0,
 ) -> ClipResult:
     """Extract a clip, always exporting exact 1080x1920 Shorts video.
 
-    Uses a TWO-PASS approach when both crop and subtitles are needed:
-      Pass 1 → crop the video (fast, near-lossless)
-      Pass 2 → burn subtitles onto the cropped video
+    Merges crop, subtitle burn, video effect, and background music into a single
+    FFmpeg call for maximum performance. Falls back to multi-pass if needed.
 
     crop_params can be:
       - (cw, ch, cx, cy)         → static crop (4-tuple)
@@ -471,197 +642,170 @@ def extract_clip(
 
     logger.info(f"Clipping {fmt_time(start)} -> {fmt_time(end)}  ({duration}s)")
 
-    # ── CASE A: crop + subtitles → two-pass ──────────────────────────────
-    if crop_params and temp_sub:
-        # Pass 1: crop only → temp file
-        temp_cropped = output_path.with_name(output_path.stem + "_tmp_crop.mp4")
-        
+    # Build common filter components
+    effect_vf = _get_effect_vf(effect)
+    music_af = _build_music_af(duration, music_path, music_volume, music_trim_start, music_trim_end)
+    extra_inputs = _build_music_extra_inputs(music_path)
+
+    # Build video base filter (crop + shorts format)
+    if crop_params:
         if shorts_format == "none":
-            v_filter = None
+            vf_base = None
         elif shorts_format == "blur_pad":
-            v_filter = _blur_pad_vf()
+            vf_base = _blur_pad_vf()
         else:
-            v_filter = _chain_vf(_build_crop_vf(crop_params, duration), _shorts_vf())
+            vf_base = _chain_vf(_build_crop_vf(crop_params, duration), _shorts_vf())
+    else:
+        if shorts_format == "none":
+            vf_base = None
+        elif shorts_format == "blur_pad":
+            vf_base = _blur_pad_vf()
+        else:
+            vf_base = _shorts_vf()
 
-        is_blur = shorts_format == "blur_pad" and shorts_format != "none"
-        v_args = ["-filter_complex" if is_blur else "-vf", v_filter] if v_filter else []
+    # ── CASE A: crop + subtitles → try merged single-pass first ──────────
+    if crop_params and temp_sub:
+        filt = _detect_subtitle_filter()
+        if filt:
+            sub_str, _, _ = _build_sub_filter_str(subtitle_path, output_path.stem)
+            if sub_str:
+                merged_ok = _try_sub_filter_approaches(
+                    video_path, start, duration, output_path,
+                    temp_sub, sub_dir, sub_str, vf_base or "",
+                    music_af, extra_inputs,
+                    preset, crf, encoder, decoder,
+                )
+                if merged_ok:
+                    _cleanup(temp_sub)
+                    logger.info(f"Merged (crop+sub+effect+music) -> {output_path.name}")
+                    return _validated_result(output_path)
 
-        cmd1 = [
-            "ffmpeg", "-y", "-ss", str(start),
-            *input_hwaccel_args(decoder),
-            "-i", str(video_path), "-t", str(duration),
-            *v_args,
-            *video_encode_args(preset, "18", encoder),
-            "-c:a", "aac", "-strict", "-2", "-b:a", "192k",
-            str(temp_cropped),
-        ]
-        logger.info(f"Pass 1 (crop): {' '.join(cmd1)}")
-        r1 = run_ffmpeg_with_encode_fallback(
-            cmd1,
-            lambda c: _run(c, capture_output=True, text=True, errors="replace"),
-            preset, "18",
+        # Fallback to 2-pass: crop with effect+music → temp, then burn subs
+        temp_cropped = output_path.with_name(output_path.stem + "_tmp_crop.mp4")
+        r = _run_merged_ffmpeg(
+            video_path, start, duration, temp_cropped,
+            vf_base, music_af, None, extra_inputs,
+            preset, "18", encoder, decoder,
         )
-
-        if r1.returncode != 0:
-            logger.error(f"Pass 1 crop failed:\n{r1.stderr[-500:]}")
+        if r and r.returncode == 0 and temp_cropped.exists():
+            # Pass 2: burn subtitles on cropped file (with copy_audio for speed)
+            sub_ok = _try_subtitle_burn(
+                temp_cropped, output_path, temp_sub, sub_dir,
+                preset, crf, copy_audio=True, encoder=encoder, decoder=decoder,
+            )
+            if sub_ok:
+                _cleanup(temp_cropped)
+                _cleanup(temp_sub)
+                logger.info(f"Saved {output_path.name}")
+                return _validated_result(output_path)
+            else:
+                _rename_safe(temp_cropped, output_path)
+                _cleanup(temp_sub)
+                print(f"[!] Saved (crop only, no subs): {output_path.name}")
+                return _validated_result(
+                    output_path,
+                    subtitles_burned=False,
+                    warning="Subtitle burn failed — ffmpeg may lack libass",
+                )
+        else:
             _cleanup(temp_cropped)
             _cleanup(temp_sub)
-            result = _fallback_shorts_encode(video_path, start, duration, output_path, 
+            result = _fallback_shorts_encode(video_path, start, duration, output_path,
                                              preset, crf, encoder, decoder)
             if result:
                 return _validated_result(result, subtitles_burned=False, warning="Crop failed")
             return ClipResult(path=None, subtitles_burned=False, warning="Crop failed")
 
-        # Pass 2: burn subtitles
-        sub_ok = _try_subtitle_burn(temp_cropped, output_path, temp_sub, sub_dir,
-                                     preset, crf, copy_audio=True, encoder=encoder, decoder=decoder)
-
-        if sub_ok:
-            _cleanup(temp_cropped)
-            _cleanup(temp_sub)
-            logger.info(f"Saved {output_path.name}")
-            return _validated_result(output_path)
-        else:
-            _rename_safe(temp_cropped, output_path)
-            _cleanup(temp_sub)
-            print(f"[!] Saved (crop only, no subs): {output_path.name}")
-            return _validated_result(
-                output_path,
-                subtitles_burned=False,
-                warning="Subtitle burn failed — ffmpeg may lack libass",
-            )
-
-    # ── CASE B: crop only ────────────────────────────────────────────────
+    # ── CASE B: crop only (with optional effect + music) ─────────────────
     elif crop_params:
-        if shorts_format == "none":
-            v_filter = None
-        elif shorts_format == "blur_pad":
-            v_filter = _blur_pad_vf()
-        else:
-            v_filter = _chain_vf(_build_crop_vf(crop_params, duration), _shorts_vf())
-
-        is_blur = shorts_format == "blur_pad" and shorts_format != "none"
-        v_args = ["-filter_complex" if is_blur else "-vf", v_filter] if v_filter else []
-
-        cmd = [
-            "ffmpeg", "-y", "-ss", str(start),
-            *input_hwaccel_args(decoder),
-            "-i", str(video_path), "-t", str(duration),
-            *v_args,
-            *video_encode_args(preset, crf, encoder),
-            "-c:a", "aac", "-strict", "-2", "-b:a", "192k",
-            str(output_path),
-        ]
-        logger.info(f"cmd (crop): {' '.join(cmd)}")
-        r = run_ffmpeg_with_encode_fallback(
-            cmd,
-            lambda c: _run(c, capture_output=True, text=True, errors="replace"),
-            preset, crf,
+        r = _run_merged_ffmpeg(
+            video_path, start, duration, output_path,
+            vf_base, music_af, None, extra_inputs,
+            preset, crf, encoder, decoder,
         )
-        if r.returncode != 0:
-            logger.error(f"Crop failed:\n{r.stderr[-400:]}")
-            result = _fallback_shorts_encode(video_path, start, duration, output_path, preset, crf, encoder, decoder)
-            if result:
-                return _validated_result(result)
-            return ClipResult(path=None)
-        print(f"[+] Saved {output_path.name}")
-        return _validated_result(output_path)
+        if r and r.returncode == 0:
+            # Apply effect via merged pass already included above
+            print(f"[+] Saved {output_path.name}")
+            return _validated_result(output_path)
+        logger.error(f"Crop failed:\n{(r.stderr[-400:] if r else 'N/A')}")
+        result = _fallback_shorts_encode(video_path, start, duration, output_path,
+                                         preset, crf, encoder, decoder)
+        if result:
+            return _validated_result(result)
+        return ClipResult(path=None)
 
-    # ── CASE C: subtitles only ───────────────────────────────────────────
+    # ── CASE C: subtitles only → try merged single-pass first ────────────
     elif temp_sub:
-        temp_input = output_path.with_name(output_path.stem + "_tmp_nosub.mp4")
-        
-        if shorts_format == "blur_pad":
-            v_filter = _blur_pad_vf()
-            is_blur = True
-        elif shorts_format == "crop":
-            v_filter = _shorts_vf()
-            is_blur = False
-        else:
-            v_filter, is_blur = None, False
+        filt = _detect_subtitle_filter()
+        if filt:
+            sub_str, _, _ = _build_sub_filter_str(subtitle_path, output_path.stem)
+            if sub_str:
+                merged_ok = _try_sub_filter_approaches(
+                    video_path, start, duration, output_path,
+                    temp_sub, sub_dir, sub_str, vf_base or "",
+                    music_af, extra_inputs,
+                    preset, crf, encoder, decoder,
+                )
+                if merged_ok:
+                    _cleanup(temp_sub)
+                    print(f"[+] Saved {output_path.name}")
+                    return _validated_result(output_path)
 
-        cmd_extract = [
-            "ffmpeg", "-y", "-ss", str(start),
-            *input_hwaccel_args(decoder),
-            "-i", str(video_path), "-t", str(duration),
-            "-filter_complex" if is_blur else "-vf", v_filter,
-            *video_encode_args(preset, "18", encoder),
-            "-c:a", "aac", "-strict", "-2", "-b:a", "192k",
-            str(temp_input),
-        ]
-        r_ext = run_ffmpeg_with_encode_fallback(
-            cmd_extract,
-            lambda c: _run(c, capture_output=True, text=True, errors="replace"),
-            preset, "18",
+        # Fallback to 2-pass: extract with effect+music → temp, then burn subs
+        temp_input = output_path.with_name(output_path.stem + "_tmp_nosub.mp4")
+        r = _run_merged_ffmpeg(
+            video_path, start, duration, temp_input,
+            vf_base, music_af, None, extra_inputs,
+            preset, "18", encoder, decoder,
         )
-        if r_ext.returncode != 0:
+        if r and r.returncode == 0 and temp_input.exists():
+            sub_ok = _try_subtitle_burn(
+                temp_input, output_path, temp_sub, sub_dir,
+                preset, crf, copy_audio=True, encoder=encoder, decoder=decoder,
+            )
             _cleanup(temp_input)
             _cleanup(temp_sub)
-            result = _fallback_shorts_encode(video_path, start, duration, output_path, preset, crf, encoder, decoder)
+            if sub_ok:
+                print(f"[+] Saved {output_path.name}")
+                return _validated_result(output_path)
+            else:
+                result = _fallback_shorts_encode(video_path, start, duration, output_path,
+                                                 preset, crf, encoder, decoder)
+                if result:
+                    return _validated_result(
+                        result,
+                        subtitles_burned=False,
+                        warning="Subtitle filter failed — check ffmpeg libass support",
+                    )
+                return ClipResult(
+                    path=None,
+                    subtitles_burned=False,
+                    warning="Subtitle filter failed — check ffmpeg libass support",
+                )
+        else:
+            _cleanup(temp_input)
+            _cleanup(temp_sub)
+            result = _fallback_shorts_encode(video_path, start, duration, output_path,
+                                             preset, crf, encoder, decoder)
             if result:
                 return _validated_result(result, subtitles_burned=False, warning="Extract failed")
             return ClipResult(path=None, subtitles_burned=False, warning="Extract failed")
 
-        sub_ok = _try_subtitle_burn(temp_input, output_path, temp_sub, sub_dir,
-                                     preset, crf, copy_audio=True, encoder=encoder, decoder=decoder)
-        _cleanup(temp_input)
-        _cleanup(temp_sub)
-        
-        if sub_ok:
-            print(f"[+] Saved {output_path.name}")
-            return _validated_result(output_path)
-        else:
-            result = _fallback_shorts_encode(video_path, start, duration, output_path, preset, crf, encoder, decoder)
-            if result:
-                return _validated_result(
-                    result,
-                    subtitles_burned=False,
-                    warning="Subtitle filter failed — check ffmpeg libass support",
-                )
-            return ClipResult(
-                path=None,
-                subtitles_burned=False,
-                warning="Subtitle filter failed — check ffmpeg libass support",
-            )
-
-    # ── CASE D: no crop/subtitle filters → Shorts normalize ──────────────
-    if shorts_format == "none":
-        v_filter = None
-        is_blur = False
-    elif shorts_format == "blur_pad":
-        v_filter = _blur_pad_vf()
-        is_blur = True
-    else: # "crop" (standard center crop for Shorts)
-        v_filter = _shorts_vf()
-        is_blur = False
-
-    v_args = ["-filter_complex" if is_blur else "-vf", v_filter] if v_filter else []
-
-    cmd = [
-        "ffmpeg", "-y", "-ss", str(start),
-        *input_hwaccel_args(decoder),
-        "-i", str(video_path), "-t", str(duration),
-        *v_args,
-        *video_encode_args(preset, crf, encoder),
-        "-c:a", "aac", "-strict", "-2", "-b:a", "192k",
-        str(output_path),
-    ]
-    r = run_ffmpeg_with_encode_fallback(
-        cmd,
-        lambda c: _run(c, capture_output=True, text=True, errors="replace"),
-        preset, crf,
+    # ── CASE D: no crop/subtitle filters → single pass with effect+music ─
+    r = _run_merged_ffmpeg(
+        video_path, start, duration, output_path,
+        vf_base, music_af, None, extra_inputs,
+        preset, crf, encoder, decoder,
     )
-    if r.returncode != 0:
-        logger.error(f"Shorts encode failed:\n{r.stderr[-400:]}")
-        # Try one last time with guaranteed software decoding path
-        result = _fallback_shorts_encode(
-            video_path, start, duration, output_path, preset, crf, encoder, decoder
-        )
-        if result:
-            return _validated_result(result)
-        return ClipResult(path=None)
-    print(f"[+] Saved {output_path.name}")
-    return _validated_result(output_path)
+    if r and r.returncode == 0:
+        print(f"[+] Saved {output_path.name}")
+        return _validated_result(output_path)
+    logger.error(f"Shorts encode failed:\n{(r.stderr[-400:] if r else 'N/A')}")
+    result = _fallback_shorts_encode(video_path, start, duration, output_path,
+                                     preset, crf, encoder, decoder)
+    if result:
+        return _validated_result(result)
+    return ClipResult(path=None)
 
 
 def extract_audio_clip(video_path: Path, start: int, end: int, output_path: Path) -> Path | None:
@@ -859,6 +1003,16 @@ EFFECTS_PRESETS = {
         "label": "Black & White",
         "desc": "Classic monochrome with contrast",
         "vf": "eq=saturation=0:contrast=1.15",
+    },
+    "streamer": {
+        "label": "Streamer",
+        "desc": "Punchy vibrant look — boosted saturation and sharpness for game feeds",
+        "vf": "eq=saturation=1.30:contrast=1.10:brightness=0.02,unsharp=5:5:0.8",
+    },
+    "hdr": {
+        "label": "Game HDR",
+        "desc": "Expanded contrast range with vibrance for gameplay footage",
+        "vf": "eq=saturation=1.15:contrast=1.20:brightness=0.01,curves=m='0/0.02 0.3/0.35 0.7/0.7 1/1.0'",
     },
 }
 

@@ -96,7 +96,7 @@ def run(*args, **kwargs):
 
         # Poll the process, checking cancel flag every 0.5s
         elapsed = 0.0
-        poll_interval = 0.5
+        poll_interval = 2.0
         while proc.poll() is None:
             if _cancel_flag.is_set():
                 proc.terminate()

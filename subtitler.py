@@ -86,7 +86,7 @@ STYLES = {
         "font": "Verdana",
         "size": 52,
         "primary": "&H00FFFFFF",
-        "highlight": "&H00FFFFFF",       # no color change — scale only
+        "highlight": "&H00FFFFFF",
         "outline": "&H50000000",
         "back": "&H00000000",
         "bold": 0,
@@ -94,6 +94,19 @@ STYLES = {
         "shadow": 0,
         "label": "Minimal",
         "desc": "Subtle white text, thin outline",
+    },
+    "game": {
+        "font": "Impact",
+        "size": 72,
+        "primary": "&H00FFFFFF",
+        "highlight": "&H0000FF00",       # neon green (BGR)
+        "outline": "&H00000000",
+        "back": "&HCC000000",
+        "bold": -1,
+        "border": 6,
+        "shadow": 4,
+        "label": "Game",
+        "desc": "Bold gamer-style with neon green pop and heavy outline",
     },
 }
 

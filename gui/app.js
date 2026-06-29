@@ -1889,7 +1889,7 @@ function selectChannel(id) {
 
 function updateCategoryDropdowns() {
     const ids = ['modal-meta-category', 'set-category'];
-    const defaultCat = state.settings.upload_category || '22';
+    const defaultCat = state.settings.upload_category || '20';
     
     ids.forEach(id => {
         const sel = document.getElementById(id);
@@ -2548,9 +2548,9 @@ function _scheduleClipIndices(clipIndices, opts = {}) {
             date: dateStr,
             time: time,
             title: clip.filename.replace(/\.mp4$/i, ''),
-            description: state.settings.upload_description || '#shorts #viral',
-            tags: state.settings.upload_tags || 'shorts, viral, clips',
-            category_id: state.settings.upload_category || '22',
+            description: state.settings.upload_description || '#shorts #gaming #gameplay',
+            tags: state.settings.upload_tags || 'shorts, gaming, gameplay, clips',
+            category_id: state.settings.upload_category || '20',
             privacy: privacy,
             uploaded: false,
             channel_id: resolvedChannel,
@@ -2947,9 +2947,9 @@ function dropClipOnDate(clipIdx, dateStr) {
         date: dateStr,
         time: _nextPeakTimeForDate(dateStr),
         title: clip.filename.replace(/\.mp4$/i, ''),
-        description: state.settings.upload_description || '#shorts #viral',
-        tags: state.settings.upload_tags || 'shorts, viral, clips',
-        category_id: state.settings.upload_category || '22',
+            description: state.settings.upload_description || '#shorts #gaming #gameplay',
+            tags: state.settings.upload_tags || 'shorts, gaming, gameplay, clips',
+            category_id: state.settings.upload_category || '20',
         privacy: document.getElementById('smart-sched-privacy').value || 'public',
         uploaded: false,
         channel_id: _getScheduleChannelId() || state.selectedChannel || null,
@@ -2997,9 +2997,9 @@ function pickClipForDate(clipIdx) {
         date: dateStr,
         time: time,
         title: clip.filename.replace(/\.mp4$/i, ''),
-        description: state.settings.upload_description || '#shorts #viral',
-        tags: state.settings.upload_tags || 'shorts, viral, clips',
-        category_id: state.settings.upload_category || '22',
+            description: state.settings.upload_description || '#shorts #gaming #gameplay',
+            tags: state.settings.upload_tags || 'shorts, gaming, gameplay, clips',
+            category_id: state.settings.upload_category || '20',
         privacy: document.getElementById('smart-sched-privacy').value || 'public',
         uploaded: false,
         channel_id: state.selectedChannel || null,
@@ -3097,7 +3097,7 @@ async function startUpload() {
         title: s.title,
         description: s.description,
         tags: (s.tags || '').split(',').map(t => t.trim()).filter(Boolean),
-        category_id: s.category_id || '22',
+        category_id: s.category_id || '20',
         privacy: s.privacy || 'private',
     }));
 
@@ -3276,7 +3276,7 @@ function populateSettings(s) {
     setSelect('set-encoder', s.video_encoder || 'auto');
     setSelect('set-decoder', s.video_decoder || 'auto'); // Add this line
     setSelect('set-whisper-device', s.whisper_device || 'auto');
-    setSelect('set-category', s.upload_category || '22');
+    setSelect('set-category', s.upload_category || '20');
     setSelect('set-upload-region', s.upload_region || 'US');
     setSelect('set-upload-privacy', s.upload_privacy || 'public');
     setVal('set-upload-tags', s.upload_tags || '');
@@ -3322,7 +3322,7 @@ function gatherSettings() {
         video_decoder: getVal('set-decoder'), // Add this line
         whisper_device: getVal('set-whisper-device'),
         yolo_device: getVal('set-yolo-device'),
-        upload_category: getVal('set-category') || '22',
+        upload_category: getVal('set-category') || '20',
         upload_region: getVal('set-upload-region') || 'US',
         upload_privacy: getVal('set-upload-privacy') || 'public',
         upload_tags: getVal('set-upload-tags') || '',

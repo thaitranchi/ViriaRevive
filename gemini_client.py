@@ -91,9 +91,10 @@ def rerank_moments(moments: List[dict], api_key: str, keep: int = 5) -> List[dic
     if not moments or not api_key:
         return []
         
-    prompt = "Analyze these video transcript segments and score their viral potential (0.0 to 1.0). " \
-             "Focus on hooks, humor, and self-contained stories. Return a JSON object with a 'scores' " \
-             "list of floats corresponding to the input order.\n\nSegments:\n"
+    prompt = "Analyze these gaming video transcript segments and score their viral potential (0.0 to 1.0). " \
+             "Focus on action moments: kills, clutches, wins, fails, reactions, team fights, and shoutcaster hype. " \
+             "Reward segments with high energy, crowd reactions, or dramatic gameplay. " \
+             "Return a JSON object with a 'scores' list of floats corresponding to the input order.\n\nSegments:\n"
              
     for i, m in enumerate(moments):
         prompt += f"{i}. {m.get('transcript', '')[:300]}\n"
@@ -131,7 +132,12 @@ def generate_titles_batch(
     def _gen_one(idx: int, text: str) -> tuple[int, str]:
         if not text:
             return idx, ""
-        prompt = f"Create a viral YouTube Short title in {lang_str} for: {text}"
+        prompt = (
+            f"Create a viral gaming YouTube Short title in {lang_str} for this gameplay clip. "
+            f"Make it hype and gamer-friendly. Use gaming slang if appropriate "
+            f"(clutch, OP, insane, wipeout, GG). Keep it under 50 chars.\n\n"
+            f"Transcript: {text}"
+        )
         res = generate(prompt, api_key)
         return idx, res or ""
 

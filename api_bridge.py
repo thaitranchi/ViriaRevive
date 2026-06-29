@@ -16,6 +16,7 @@ import shutil
 import tempfile
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -69,7 +70,7 @@ from transcriber import transcribe_clip, find_sentence_boundary
 from subtitler import generate_subtitles, get_available_styles
 from clipper import (
     extract_clip, extract_audio_clip,
-    add_background_music, apply_video_effect, get_effects_list,
+    get_effects_list,
     validate_shorts_output,
 )
 from cropper import get_crop_params, get_crop_params_dynamic, get_dimensions, detect_all_persons
@@ -377,11 +378,11 @@ class ApiBridge:
             "whisper_device": WHISPER_DEVICE,
             "crop_vertical": True,
             "ai_detector": AI_DETECTOR_MODE,
-            "upload_category": "22",
+            "upload_category": "20",
             "upload_privacy": "public",
             "upload_region": "US",
-            "upload_tags": "shorts, viral, clips",
-            "upload_description": "#shorts #viral",
+            "upload_tags": "shorts, gaming, gameplay, clips",
+            "upload_description": "#shorts #gaming #gameplay",
             "debug_logging": False,
         }
         # Merge saved user overrides (from save_settings)
@@ -745,7 +746,11 @@ class ApiBridge:
         try:
             wav = Path(tempfile.gettempdir()) / f"viria_backfill_{clip_index}.wav"
             extract_audio_clip(p, 0, 60, wav)  # max 60s
-            if wav.exists() and wav.stat().st_size > 1000: # type: ignore
+            try:
+                st = wav.stat()
+            except OSError:
+                st = None
+            if st and st.st_size > 1000: # type: ignore
                 words = transcribe_clip(
                     wav, model_size=WHISPER_MODEL, language=None, device_pref=WHISPER_DEVICE,
                 ) # type: ignore
@@ -788,7 +793,12 @@ class ApiBridge:
         lang = self._user_settings.get("title_language") or self._user_settings.get("whisper_language")
 
         if use_gemini:
-            prompt = f"Create a viral YouTube Short title in {lang or 'English'} for: {transcript}"
+            prompt = (
+                f"Create a viral gaming YouTube Short title in {lang or 'English'} for this gameplay clip. "
+                f"Make it hype and gamer-friendly. Use gaming slang if appropriate "
+                f"(clutch, OP, insane, wipeout, GG). Keep it under 50 chars.\n\n"
+                f"Transcript: {transcript}"
+            )
             return gemini_client.generate(prompt, gemini_key)
         else:
             model = self._user_settings.get("ollama_detector_model", OLLAMA_DETECTOR_MODEL)
@@ -1020,11 +1030,18 @@ class ApiBridge:
     def get_results(self):
         clips = []
         for i, p in enumerate(self._results): # type: ignore
+            try:
+                st = p.stat()
+                size_mb = round(st.st_size / (1024 * 1024), 1)
+                url = f"http://127.0.0.1:{self._video_port}/{p.name}"
+            except OSError:
+                size_mb = 0
+                url = ""
             clip = {
                 "path": str(p),
                 "filename": p.name,
-                "size_mb": round(p.stat().st_size / (1024 * 1024), 1) if p.exists() else 0,
-                "url": f"http://127.0.0.1:{self._video_port}/{p.name}" if p.exists() else "",
+                "size_mb": size_mb,
+                "url": url,
             }
             # Include source_stem for grouping renamed clips
             if i < len(self._moments) and self._moments[i].get("source_stem"):
@@ -1225,8 +1242,8 @@ class ApiBridge:
                 video_path,
                 title=meta.get("title", f"Viral Clip #{clip_index + 1}"),
                 description=meta.get("description", ""),
-                tags=meta.get("tags", ["shorts", "viral", "clips"]),
-                category_id=str(meta.get("category_id", "22")),
+                tags=meta.get("tags", ["shorts", "gaming", "gameplay", "clips"]),
+                category_id=str(meta.get("category_id", "20")),
                 privacy=meta.get("privacy", "private"),
                 channel_id=channel_id,
             )
@@ -1261,12 +1278,14 @@ class ApiBridge:
         """Return persisted results/moments/scheduled for frontend init."""
         clips = [] # type: ignore
         for i, p in enumerate(self._results):
-            if not p.exists():
+            try:
+                st = p.stat()
+            except OSError:
                 continue
             clip = {
                 "path": str(p),
                 "filename": p.name,
-                "size_mb": round(p.stat().st_size / (1024 * 1024), 1),
+                "size_mb": round(st.st_size / (1024 * 1024), 1),
             }
             # Include source_stem so frontend can group renamed clips by source video
             if i < len(self._moments) and self._moments[i].get("source_stem"):
@@ -1506,44 +1525,41 @@ class ApiBridge:
             self._push("detect", 100, f"Found {len(moments)} moments")
             self._js(f"window.onMomentsDetected({json.dumps(moments)}, {self._active_item_index if self._active_item_index is not None else 'null'})")
 
-            # ── 3. Process each clip ─────────────────────────────────
+            # ── 3. Process each clip (parallel with ThreadPoolExecutor) ──
             done: list[Path] = []
             total = len(moments)
+            SENTENCE_BUFFER = 5
+            results_lock = threading.Lock()
 
-            # Buffer to extend audio extraction for sentence boundary search
-            SENTENCE_BUFFER = 5  # seconds beyond original end
-
-            for idx, m in enumerate(moments):
+            def _process_one(idx: int, m: dict) -> Path | None:
+                """Process a single clip from audio extraction through rendering."""
                 if self._cancel:
-                    return self._cancelled()
+                    return None
                 clip_num = idx + 1
+                out = CLIPS_DIR / f"{stem}_viral{clip_num}.mp4"
 
                 # Resume Logic: Skip if clip already exists and is valid
-                out = CLIPS_DIR / f"{stem}_viral{clip_num}.mp4"
                 if out.exists() and validate_shorts_output(out): # type: ignore
                     if m.get("transcript"):
                         print(f"    [+] Clip {clip_num} already processed, skipping.")
-                        done.append(out)
-                        continue
+                        return out
 
                 start, end = m["start"], m["end"]
                 original_duration = end - start
 
                 # ── 3b: extract audio WITH extended buffer ──
-                # Extract a few extra seconds beyond the clip end so we can
-                # find a natural sentence ending even if it falls just outside.
                 self._clip_push(clip_num, total, "audio", 50, f"Clip {clip_num}/{total}: Extracting audio...")
                 wav = SUBTITLES_DIR / f"{stem}_c{clip_num}.wav"
                 extended_end = min(end + SENTENCE_BUFFER, int(vid_duration))
                 r = extract_audio_clip(video_path, start, extended_end, wav) # type: ignore
                 if not r:
                     self._clip_push(clip_num, total, "render", 100, f"Clip {clip_num}: failed, skipping")
-                    continue
+                    return None
                 self._clip_push(clip_num, total, "audio", 100, "Audio extracted")
 
                 # ── 3c: transcribe the extended audio ──
                 if self._cancel:
-                    return self._cancelled()
+                    return None
                 self._clip_push(clip_num, total, "transcribe", 0, f"Clip {clip_num}/{total}: Transcribing...")
                 words = transcribe_clip( # type: ignore
                     wav, model_size=model, language=language, device_pref=whisper_device,
@@ -1551,7 +1567,6 @@ class ApiBridge:
                 self._clip_push(clip_num, total, "transcribe", 100, f"{len(words)} words transcribed")
 
                 # ── 3c.1: find natural sentence boundary ──
-                # Adjust clip end so the speaker finishes their sentence
                 new_duration = find_sentence_boundary(
                     words,
                     clip_duration=float(original_duration), # type: ignore
@@ -1559,27 +1574,24 @@ class ApiBridge:
                     max_extend=float(SENTENCE_BUFFER),
                 )
                 if new_duration is not None:
-                    end = start + int(new_duration + 0.5)  # round to nearest second
-                    # Trim words to the adjusted duration
+                    end = start + int(new_duration + 0.5)
                     words = [w for w in words if w["end"] <= (end - start) + 0.1]
                     self._clip_push(clip_num, total, "transcribe", 100,
                                     f"Adjusted to {end - start}s (sentence end)")
                 else:
-                    # No boundary found — trim words to original duration
                     words = [w for w in words if w["end"] <= original_duration + 0.1]
 
-                # Update moment info for UI
+                # Update moment info for UI (thread-safe: each thread writes to its own slot)
                 m["end"] = end # type: ignore
                 m["duration"] = end - start
-                # Store transcript text for LLM title generation
                 m["transcript"] = " ".join(w.get("word", w.get("text", "")) for w in words).strip()
 
-                # ── 3a: compute crop params (uses adjusted start/end) ──
+                # ── 3a: compute crop params ──
                 crop_params = None
                 crop_w, crop_h = get_dimensions(video_path)
                 if crop_vertical:
                     if self._cancel:
-                        return self._cancelled()
+                        return None
                     self._clip_push(clip_num, total, "audio", 0, f"Clip {clip_num}/{total}: Tracking speakers...")
                     try:
                         crop_params = get_crop_params_dynamic(
@@ -1591,12 +1603,13 @@ class ApiBridge:
                     if crop_params:
                         crop_w, crop_h = crop_params[0], crop_params[1]
 
-                # ── 3d: subtitles (pass cropped dimensions) ──
+                # ── 3d: subtitles ──
                 if self._cancel:
-                    return self._cancelled()
+                    return None
                 self._clip_push(clip_num, total, "subtitle", 0, f"Clip {clip_num}/{total}: Generating subtitles...")
                 ass = SUBTITLES_DIR / f"{stem}_c{clip_num}.ass" # type: ignore
-                subtitle_files.append(ass)
+                with results_lock:
+                    subtitle_files.append(ass)
                 generate_subtitles(
                     words, ass,
                     video_width=1080,
@@ -1605,58 +1618,78 @@ class ApiBridge:
                 )
                 self._clip_push(clip_num, total, "subtitle", 100, "Subtitles generated")
 
-                # ── 3e: render clip with crop + burned subs ──
+                # ── 3e: render clip ──
                 if self._cancel:
-                    return self._cancelled()
+                    return None
                 self._clip_push(clip_num, total, "render", 0, f"Clip {clip_num}/{total}: Rendering...")
+
+                resolved_music = None
+                if music_file:
+                    mp = Path(music_file)
+                    if not mp.is_absolute():
+                        mp = MUSIC_DIR / music_file
+                    if mp.exists(): # type: ignore
+                        resolved_music = mp
+
                 clip_result = extract_clip( # type: ignore
                     video_path, start, end, out,
                     subtitle_path=ass if words else None,
                     crop_params=crop_params,
                     preset=preset, crf=crf, encoder=video_encoder, decoder=video_decoder,
+                    effect=effect,
+                    music_path=resolved_music,
+                    music_volume=music_volume,
+                    music_trim_start=music_start,
+                    music_trim_end=music_end,
                 )
+
                 if clip_result and clip_result.path:
-                    # Post-processing: apply video effect
-                    if effect and effect != "none":
-                        self._clip_push(clip_num, total, "render", 80,
-                                        f"Clip {clip_num}/{total}: Applying {effect} effect...")
-                        apply_video_effect( # type: ignore
-                            clip_result.path, effect, preset, crf, encoder=video_encoder, decoder=video_decoder,
-                        )
-
-                    # Post-processing: mix background music
-                    if music_file:
-                        music_path = Path(music_file)
-                        if not music_path.is_absolute():
-                            music_path = MUSIC_DIR / music_file
-                        if music_path.exists(): # type: ignore
-                            self._clip_push(clip_num, total, "render", 90,
-                                            f"Clip {clip_num}/{total}: Adding music...")
-                            add_background_music(
-                                clip_result.path, music_path, music_volume,
-                                trim_start=music_start, trim_end=music_end,
-                            )
-
                     if not validate_shorts_output(clip_result.path): # type: ignore
                         self._clip_push(clip_num, total, "render", 100,
                                         f"Clip {clip_num} failed Shorts validation")
+                        result = None
                     else:
-                        done.append(clip_result.path)
+                        done_path = clip_result.path
                         if not clip_result.subtitles_burned and clip_result.warning:
                             self._clip_push(clip_num, total, "render", 100,
                                             f"Clip {clip_num} done (WARNING: {clip_result.warning})")
                         else:
                             self._clip_push(clip_num, total, "render", 100, f"Clip {clip_num} complete!")
+                        result = done_path
                 elif clip_result and not clip_result.path:
                     self._clip_push(clip_num, total, "render", 100, f"Clip {clip_num} failed")
+                    result = None
                 else:
                     self._clip_push(clip_num, total, "render", 100, f"Clip {clip_num} failed")
+                    result = None
 
                 # cleanup temp wav
                 try:
                     self._robust_unlink(wav) # type: ignore
                 except Exception:
                     pass
+
+                return result
+
+            # Run clips in parallel (max_workers=2 to avoid GPU saturation)
+            futures = {}
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                for idx, m in enumerate(moments):
+                    if self._cancel:
+                        return self._cancelled()
+                    futures[executor.submit(_process_one, idx, m)] = idx
+
+                # Collect results in order of submission
+                ordered_results = [None] * total
+                for fut in as_completed(futures):
+                    idx = futures[fut]
+                    try:
+                        ordered_results[idx] = fut.result()
+                    except Exception:
+                        logger.exception(f"Clip {idx + 1} failed with exception")
+                        ordered_results[idx] = None
+
+            done = [r for r in ordered_results if r is not None]
 
             # Append results (batch mode: preserve previous video's clips)
             self._results.extend(done)

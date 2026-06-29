@@ -3,7 +3,6 @@ import subprocess
 import shutil
 import numpy as np
 from pydub import AudioSegment
-import tempfile
 import time
 from pathlib import Path
 
@@ -51,31 +50,15 @@ def find_viral_moments(
         if not video_path.exists():
             raise FileNotFoundError(f"Video file not found: {video_path}")
             
-        # To handle files > 4GB and avoid MemoryErrors, we extract a downsampled 
-        # mono version of the audio for analysis instead of loading the full stream.
-        tmp_path = None
-        try:
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-                tmp_path = tmp.name
-            
-            # Extract at 8kHz mono — plenty for energy/peak analysis
-            cmd = [
-                "ffmpeg", "-y", "-i", str(video_path),
-                "-vn", "-ac", "1", "-ar", "8000", "-acodec", "pcm_s16le",
-                "-rf64", "auto", tmp_path
-            ]
-            _run(cmd, capture_output=True, timeout=300)
-            
-            audio = AudioSegment.from_file(tmp_path)
-        finally:
-            if tmp_path:
-                # Attempt cleanup with retries for Windows locks
-                for _ in range(5):
-                    try:
-                        Path(tmp_path).unlink(missing_ok=True)
-                        break
-                    except OSError:
-                        time.sleep(0.2)
+        # Stream audio directly via pipe to avoid temp file I/O
+        from io import BytesIO
+        cmd = [
+            "ffmpeg", "-y", "-i", str(video_path),
+            "-vn", "-ac", "1", "-ar", "8000", "-acodec", "pcm_s16le",
+            "-f", "wav", "pipe:1"
+        ]
+        r = _run(cmd, capture_output=True, timeout=300)
+        audio = AudioSegment.from_file(BytesIO(r.stdout), format="wav")
         
     except Exception as e:
         if isinstance(e, IndexError):
@@ -89,8 +72,8 @@ def find_viral_moments(
     if audio is None:
         energies = np.zeros(total_seconds, dtype=float)
     else:
-        # --- Audio RMS energy (1-second windows) ---
-        window_ms = 1000
+        # --- Audio RMS energy (500ms windows — captures gaming action bursts) ---
+        window_ms = 500
         energies_list = []
         for i in range(0, len(audio), window_ms):
             if is_cancelled():
@@ -106,7 +89,8 @@ def find_viral_moments(
     smoothed = np.convolve(energies, kernel, mode="same")
 
     # --- Volume variance (dynamic = interesting) ---
-    var_window = 10
+    # Gaming: shorter 5s window catches action bursts (gunshots, explosions)
+    var_window = 5
     variance = np.array(
         [
             np.std(energies[max(0, i - var_window // 2) : i + var_window // 2])
@@ -126,10 +110,12 @@ def find_viral_moments(
         r = a.max() - a.min()
         return (a - a.min()) / r if r > 1e-8 else np.zeros_like(a)
 
+    # Gaming-tuned weights: scene changes carry more weight (fast cuts),
+    # audio energy less so (game audio is noisy baseline)
     combined = (
-        0.45 * norm(smoothed)
-        + 0.25 * norm(variance)
-        + 0.30 * norm(scene_density[: len(smoothed)])
+        0.30 * norm(smoothed)
+        + 0.20 * norm(variance)
+        + 0.50 * norm(scene_density[: len(smoothed)])
     )
 
     # --- Pick top N non-overlapping peaks ---
@@ -175,7 +161,7 @@ def _scene_change_density(video_path: Path, length: int) -> np.ndarray:
             *input_hwaccel_args(),
             "-i", str(video_path),
             "-an", "-sn",
-            "-vf", "fps=2,select='gt(scene,0.3)',showinfo",
+            "-vf", "fps=2,select='gt(scene,0.15)',showinfo",
             "-vsync", "vfr", "-f", "null", "-",
             "-threads", "4",
         ]

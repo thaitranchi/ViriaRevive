@@ -44,22 +44,25 @@ def score_candidate(
     end = int(moment.get("end", start + clip_duration))
     heuristic_score = float(moment.get("score", 0.0) or 0.0)
 
-    prompt = f"""You are selecting short-form viral moments.
-Score this transcript from 0 to 1 for Shorts/TikTok potential.
+    prompt = f"""You are selecting viral gaming moments for Shorts/TikTok.
+Score this transcript from 0 to 1.
 
-Prefer:
-- conflict
-- surprise
-- emotion
-- clear setup/payoff
-- quotable moment
-- fast context
+Prefer (gaming content):
+- high-kill plays / multikills / aces
+- clutch moments (1vX, last-second wins)
+- funny fails or reactions
+- impressive mechanics / outplays
+- shoutcaster hype or crowd reactions
+- game-winning / round-winning moments
+- unexpected outcomes or comebacks
+- toxic or funny voice comms
 
-Reject:
-- filler
-- slow explanation
-- unclear topic
-- no payoff
+Reject (gaming content):
+- menu navigation or lobby screens
+- inventory management or gear selection
+- quiet walking / dead air
+- loading screens
+- slow explanations or tutorials
 
 Candidate metadata:
 - source_start_seconds: {start}
@@ -135,8 +138,8 @@ def rerank_moments(
         enriched = dict(moment)
         enriched["ai_score"] = float(score["viral_score"] or 0.0)
         enriched["ai_reason"] = score["reason"]
-        # Combined score: 70% AI analysis + 30% Visual presence
-        enriched["score"] = enriched["ai_score"] * 0.7 + float(enriched.get("visual_score", 1.0) or 1.0) * 0.3
+        # Combined score: 80% AI analysis + 20% Visual presence (person in frame is less critical for game footage)
+        enriched["score"] = enriched["ai_score"] * 0.8 + float(enriched.get("visual_score", 1.0) or 1.0) * 0.2
         enriched["ai_better_start_offset"] = score["better_start_offset"]
         enriched["ai_better_end_offset"] = score["better_end_offset"]
         scored.append(enriched)

@@ -124,8 +124,9 @@ class TestSubtitleLogic(unittest.TestCase):
 
     def test_get_available_styles(self):
         styles = self.subtitler.get_available_styles()
-        self.assertGreaterEqual(len(styles), 4)
+        self.assertGreaterEqual(len(styles), 6)
         self.assertTrue(any(s["id"] == "tiktok" for s in styles))
+        self.assertTrue(any(s["id"] == "game" for s in styles))
 
 
 class TestClipperLogic(unittest.TestCase):
@@ -157,6 +158,12 @@ class TestClipperLogic(unittest.TestCase):
     def test_chain_vf_all_none(self):
         result = self.clipper._chain_vf(None, None)
         self.assertEqual(result, "")
+
+    def test_effects_includes_gaming_presets(self):
+        effects = self.clipper.get_effects_list()
+        effect_ids = [e["id"] for e in effects]
+        self.assertIn("streamer", effect_ids)
+        self.assertIn("hdr", effect_ids)
 
 
 class TestHwaccelLogic(unittest.TestCase):

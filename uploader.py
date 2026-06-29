@@ -324,7 +324,7 @@ def upload_to_youtube(
     if "#Shorts" not in description and "#shorts" not in description:
         description = f"{description}\n\n#Shorts".strip() if description else "#Shorts"
     if tags is None:
-        tags = ["shorts", "viral", "clips"]
+        tags = ["shorts", "gaming", "gameplay", "clips"]
     elif "shorts" not in [t.lower() for t in tags]:
         tags = ["shorts"] + tags
 
@@ -336,7 +336,7 @@ def upload_to_youtube(
         "snippet": {
             "title": title[:100],
             "description": description,
-            "tags": tags or ["shorts", "viral", "clips"],
+            "tags": tags or ["shorts", "gaming", "gameplay", "clips"],
             "categoryId": str(category_id),
         },
         "status": {

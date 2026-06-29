@@ -38,15 +38,16 @@ def _ask_ollama(transcript: str, model: str = DEFAULT_MODEL, language: str = Non
     """Ask Ollama for a catchy short YouTube Shorts title."""
     lang_instruction = f" and reply in {language}" if language else ""
     prompt = (
-        "You are a viral YouTube Shorts title expert. "
-        f"Given a transcript, create ONE clickbait title that makes people NEED to watch{lang_instruction}.\n\n"
+        "You are a viral gaming YouTube Shorts title expert. "
+        f"Given a gameplay clip transcript, create ONE clickbait title that makes gamers NEED to watch{lang_instruction}.\n\n"
         "RULES:\n"
         "- Max 50 characters\n"
         "- No quotes, no hashtags, no emojis\n"
+        "- Use gaming slang: clutch, OP, insane, cracked, 1v5, ace, wipeout, GG\n"
         "- Use curiosity gaps, shock value, or bold claims\n"
         "- NEVER just copy words from the transcript\n"
-        "- Good examples: 'Nobody Expected This to Happen', 'He Instantly Regretted It', "
-        "'This Changes Everything'\n\n"
+        "- Good examples: 'This 1v5 Clutch Was INSANE', 'He Got the Craziest Headshot Ever', "
+        "'Unbelievable Game-Winning Play', 'This Player is Actually CRACKED'\n\n"
         f'Transcript: "{transcript[:500]}"\n\n'
         "Reply with ONLY the title. Nothing else."
     )
@@ -95,16 +96,16 @@ def _heuristic_title(transcript: str) -> str:
 
     # Clickbait templates — {topic} gets replaced with the key phrase
     templates = [
+        "This {topic} Clutch Was Insane",
+        "INSANE {topic} Gameplay",
+        "Pro {topic} Player Goes Crazy",
+        "UNBELIEVABLE {topic} Moment",
+        "Watch This {topic} 1v5 Ace",
         "Nobody Expected {topic} to Go Like This",
-        "Wait Until You See {topic}",
-        "This Is Why {topic} Went Viral",
         "{topic} Will Blow Your Mind",
         "You Won't Believe What Happened With {topic}",
-        "Everyone Is Talking About {topic}",
-        "The Truth About {topic} Is Shocking",
-        "{topic} Changed Everything",
+        "This Is Why {topic} Went Viral",
         "I Can't Believe {topic} Actually Worked",
-        "Watch What Happens With {topic}",
     ]
 
     topic = key_phrase.title()
@@ -113,11 +114,11 @@ def _heuristic_title(transcript: str) -> str:
     # If title is too long, use shorter templates
     if len(title) > 55:
         short_templates = [
-            "{topic} Goes Wrong",
+            "{topic} Clutch",
+            "{topic} Gameplay OP",
+            "Insane {topic} Play",
             "{topic} Went Viral",
-            "Wait for {topic}",
             "{topic} Was Insane",
-            "This {topic} Though",
         ]
         title = random.choice(short_templates).format(topic=topic)
 

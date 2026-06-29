@@ -38,10 +38,10 @@ elif CLIENT_SECRETS_FILE.exists():
     except Exception:
         pass
 
-# Clip detection
-NUM_CLIPS = 5
-CLIP_DURATION = 30
-MIN_GAP = 15
+# Clip detection (gaming-tuned: more clips, shorter duration, tighter gaps)
+NUM_CLIPS = 8
+CLIP_DURATION = 25
+MIN_GAP = 10
 AI_DETECTOR_MODE = "auto"  # auto | off | on
 AI_PROVIDER = "gemini"     # gemini | ollama
 OLLAMA_DETECTOR_MODEL = "qwen2.5:3b"
@@ -70,4 +70,4 @@ WHISPER_DEVICE = "cuda"  # auto | cuda | cpu
 
 # YouTube
 TOKEN_FILE = BASE_DIR / "token.json"
-DEFAULT_TAGS = ["shorts", "viral", "clips"]
+DEFAULT_TAGS = ["shorts", "gaming", "gameplay", "clips"]
