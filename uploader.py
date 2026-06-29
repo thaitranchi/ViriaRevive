@@ -296,16 +296,26 @@ def upload_to_youtube(
     privacy: str = "private",
     scheduled_time: datetime = None,
     channel_id: str = None,
+    account_id: str = None,
 ) -> dict | None:
     """Upload a video with full metadata.  Returns {'id', 'url'} or None.
 
-    channel_id: used to identify which account to upload from (the channel's
-    account_id is the same as its channel_id for single-channel accounts).
+    channel_id: which YouTube channel to upload to.
+    account_id: which Google account to use for upload.
+    If account_id is None, it is resolved from the channel_id via list_channels().
+    If both are provided, account_id takes precedence.
     """
     from googleapiclient.http import MediaFileUpload
 
-    # Use channel_id as account_id (for YouTube, channel ID = primary account ID)
-    yt = get_youtube_service(channel_id)
+    # Resolve account_id from channel_id if not explicitly given
+    if account_id is None and channel_id is not None:
+        channels = list_channels()
+        for ch in channels:
+            if ch["id"] == channel_id:
+                account_id = ch.get("account_id")
+                break
+
+    yt = get_youtube_service(account_id or channel_id)
 
     # Ensure Shorts format — append #Shorts to title and description
     if "#Shorts" not in title and "#shorts" not in title:

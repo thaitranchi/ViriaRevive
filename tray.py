@@ -54,10 +54,13 @@ class TrayManager:
         self._window = window
         self._on_quit = on_quit_callback
         self._icon = None
-        self._visible = True  # tracks window visibility
+        self._icon_thread = None
+        self._visible = True
+        self._running = False
 
     def start(self):
-        """Start the tray icon in a background thread."""
+        """Start the tray icon in a background thread with restart on failure."""
+        self._running = True
         image = _create_icon_image()
         menu = pystray.Menu(
             pystray.MenuItem("Show ViriaRevive", self._show_window, default=True),
@@ -65,10 +68,22 @@ class TrayManager:
             pystray.MenuItem("Quit", self._quit),
         )
         self._icon = pystray.Icon("ViriaRevive", image, "ViriaRevive", menu)
-        threading.Thread(target=self._icon.run, daemon=True).start()
+        self._icon_thread = threading.Thread(target=self._run_icon, daemon=True)
+        self._icon_thread.start()
+
+    def _run_icon(self):
+        """Run the tray icon loop, restarting on unexpected exit."""
+        while self._running and self._icon is not None:
+            try:
+                self._icon.run()
+            except Exception:
+                if self._running:
+                    import time
+                    time.sleep(1)
 
     def stop(self):
         """Stop the tray icon."""
+        self._running = False
         if self._icon:
             try:
                 self._icon.stop()

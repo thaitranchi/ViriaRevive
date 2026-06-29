@@ -27,6 +27,9 @@ import logging
 YUNET_MODEL = Path(__file__).parent / "models" / "face_detection_yunet.onnx"
 YUNET_CONF = 0.35
 YUNET_NMS = 0.3
+YOLO_CONF_BATCH = 0.30
+YOLO_CONF_RETRY = 0.15
+YOLO_CONF_SINGLE = 0.35
 WINDOW_SEC = 2.0       # seconds per crop window (legacy, used by static crop)
 CHANGE_THRESH = 0.12   # 12% of crop size = minimum position change to trigger a cut
 HEAD_RATIO = 0.30      # place head at 30% from top of crop (rule of thirds)
@@ -267,7 +270,7 @@ def _boxes_to_persons(boxes) -> list:
     return detections
 
 
-def _detect_persons_yolo_batch(frames, model, device, conf=0.35):
+def _detect_persons_yolo_batch(frames, model, device, conf=YOLO_CONF_SINGLE):
     """Detect persons in a batch of frames. Returns list of detection lists."""
     if not frames:
         return []
@@ -281,7 +284,7 @@ def _detect_persons_yolo_batch(frames, model, device, conf=0.35):
     return [_boxes_to_persons(r.boxes) for r in results]
 
 
-def _detect_persons_yolo(frame, model, device, conf=0.35):
+def _detect_persons_yolo(frame, model, device, conf=YOLO_CONF_SINGLE):
     """Detect persons in a single frame."""
     return _detect_persons_yolo_batch([frame], model, device, conf=conf)[0]
 
@@ -502,10 +505,10 @@ def detect_all_persons(video_path, start, end, width, height, sample_count,
         batch_results = []
         if use_yolo:
             y_frames = [f for _, f in batch_frames]
-            batch_persons = _detect_persons_yolo_batch(y_frames, yolo, yolo_dev, conf=0.30)
+            batch_persons = _detect_persons_yolo_batch(y_frames, yolo, yolo_dev, conf=YOLO_CONF_BATCH)
             for (t, frame), persons in zip(batch_frames, batch_persons):
                 if not persons: # Retry misses
-                    persons = _detect_persons_yolo(frame, yolo, yolo_dev, conf=0.15)
+                    persons = _detect_persons_yolo(frame, yolo, yolo_dev, conf=YOLO_CONF_RETRY)
                 batch_results.append((t, frame, persons))
         else:
             for t, frame in batch_frames:
@@ -628,9 +631,9 @@ def _refine_transitions(detections, video_path, start, width, height,
             if not ok or frame is None:
                 break
 
-            persons = _detect_persons_yolo(frame, yolo, yolo_dev, conf=0.30)
+            persons = _detect_persons_yolo(frame, yolo, yolo_dev, conf=YOLO_CONF_BATCH)
             if not persons:
-                persons = _detect_persons_yolo(frame, yolo, yolo_dev, conf=0.15)
+                persons = _detect_persons_yolo(frame, yolo, yolo_dev, conf=YOLO_CONF_RETRY)
 
             # Rescale coordinates if needed
             if persons and (scale_x != 1.0 or scale_y != 1.0):

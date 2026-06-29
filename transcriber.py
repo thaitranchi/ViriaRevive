@@ -24,6 +24,7 @@ def _load_whisper_model(model_size: str, device: str, compute: str):
             if device != "cpu":
                 print(f"[!] Whisper GPU init failed ({e}), falling back to CPU...")
                 return _load_whisper_model(model_size, "cpu", "int8")
+            print(f"[!] Whisper CPU init also failed ({e})")
             raise
     return _model_cache[cache_key]
 
@@ -47,14 +48,15 @@ def transcribe_clip(
             str(audio_path), word_timestamps=True, language=language
         )
     except Exception as e:
-        if device != "cpu":
-            print(f"[!] Whisper GPU transcribe failed ({e}), retrying on CPU...")
-            model = _load_whisper_model(model_size, "cpu", "int8")
-            segments, info = model.transcribe(
-                str(audio_path), word_timestamps=True, language=language
-            )
-        else:
-            raise
+            if device != "cpu":
+                print(f"[!] Whisper GPU transcribe failed ({e}), retrying on CPU...")
+                model = _load_whisper_model(model_size, "cpu", "int8")
+                segments, info = model.transcribe(
+                    str(audio_path), word_timestamps=True, language=language
+                )
+            else:
+                print(f"[!] Whisper CPU transcribe also failed ({e})")
+                raise
 
     from subprocess_utils import is_cancelled, CancelledError
 

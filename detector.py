@@ -1,3 +1,4 @@
+import re
 import subprocess
 import shutil
 import numpy as np
@@ -8,6 +9,7 @@ from pathlib import Path
 
 from subprocess_utils import run as _run, is_cancelled, CancelledError
 from hwaccel import input_hwaccel_args
+from utils import fmt_time, wait_for_file_unlock
 
 import logging
 logger = logging.getLogger(__name__)
@@ -35,12 +37,8 @@ def find_viral_moments(
     logger.info("Analyzing audio energy (waiting for file access)...")
     
     # Windows can sometimes hold a lock on newly downloaded files (antivirus/indexing).
-    # Wait up to 5 seconds for the file to become readable.
-    for _ in range(10):
-        try:
-            with open(video_path, 'rb'): break
-        except OSError:
-            time.sleep(0.5)
+    if not wait_for_file_unlock(video_path, timeout=5.0):
+        logger.warning("File still locked after 5s, proceeding anyway...")
 
     _sync_pydub_paths()  # Refresh paths in case they were updated during runtime
     
@@ -162,7 +160,7 @@ def find_viral_moments(
 
     logger.info(f"Found {len(clips)} viral moments") # type: ignore
     for i, c in enumerate(clips):
-        print(f"    Clip {i+1}: {_fmt(c['start'])} - {_fmt(c['end'])}  (score {c['score']:.2f})")
+        print(f"    Clip {i+1}: {fmt_time(c['start'])} - {fmt_time(c['end'])}  (score {c['score']:.2f})")
     return clips
 
 
@@ -186,11 +184,13 @@ def _scene_change_density(video_path: Path, length: int) -> np.ndarray:
             logger.warning("Scene detection unavailable, using audio only")
             return np.zeros(length + 1)
         timestamps = []
+        pts_pattern = re.compile(r"pts_time:\s*([\d.]+)")
         for line in (r.stderr or "").split("\n"):
-            if "pts_time:" in line:
+            m = pts_pattern.search(line)
+            if m:
                 try:
-                    timestamps.append(float(line.split("pts_time:")[1].split()[0]))
-                except (ValueError, IndexError):
+                    timestamps.append(float(m.group(1)))
+                except ValueError:
                     pass
 
         density = np.zeros(length + 1)
@@ -269,7 +269,4 @@ def _fallback_moments(
     return clips
 
 
-def _fmt(seconds: int) -> str:
-    m, s = divmod(seconds, 60)
-    h, m = divmod(m, 60)
-    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+_fmt = fmt_time

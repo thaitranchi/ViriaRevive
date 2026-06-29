@@ -77,6 +77,9 @@ def process(
     # ── 1. Download ──────────────────────────────────────────────────────
     print("\n══ 1 · Downloading video ══")
     video_path = download_video(url)
+    if video_path is None:
+        print("[!] Download failed — aborting")
+        return []
     print(f"[+] {video_path}")
     stem = video_path.stem[:50]
 
@@ -147,7 +150,7 @@ def process(
                 f"[ai-detector] {done}/{total}: {'scored' if score else 'skipped'}"
             ),
         )
-        if ranked:
+        if ranked is not None:
             moments = ranked
             print(f"[ai-detector] Selected {len(moments)} clips with Ollama reranking")
         else:

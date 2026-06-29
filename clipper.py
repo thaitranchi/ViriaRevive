@@ -10,12 +10,15 @@ from subprocess_utils import run as _run
 from hwaccel import (
     input_hwaccel_args,
     run_ffmpeg_with_encode_fallback,
-    logger as hwaccel_logger, # Import hwaccel's logger to avoid re-configuring
+    logger as hwaccel_logger,
     video_encode_args,
 )
+from utils import fmt_time, wait_for_file_unlock
 
 import logging
 logger = logging.getLogger(__name__)
+
+DEBUG = False  # Toggle full ffmpeg command logging
 
 @dataclass
 class ClipResult:
@@ -143,7 +146,8 @@ def _try_subtitle_burn(input_path: Path, output_path: Path, temp_sub: Path, sub_
         *audio_args,
         str(output_path),
     ]
-    print(f"    Subs attempt 1 (cwd): {' '.join(cmd)}")
+    if DEBUG:
+        logger.info(f"Subs attempt 1 (cwd): {' '.join(cmd)}")
     r = run_ffmpeg_with_encode_fallback(
         cmd,
         lambda c: _run(c, capture_output=True, text=True, errors="replace", cwd=str(sub_dir)),
@@ -151,14 +155,13 @@ def _try_subtitle_burn(input_path: Path, output_path: Path, temp_sub: Path, sub_
     )
     if r.returncode == 0:
         if r.stderr:
-            # Log stderr to catch font warnings
             stderr_lines = [l for l in r.stderr.split('\n') if 'font' in l.lower() or 'libass' in l.lower()]
             if stderr_lines:
                 logger.info(f"Font info: {'; '.join(stderr_lines[:3])}")
         logger.info("Subtitles burned successfully (cwd method)")
         return True
 
-    print(f"    [!] Attempt 1 failed: {r.stderr[-200:]}")
+    logger.warning(f"Attempt 1 (cwd) failed: {(r.stderr or '')[-200:]}")
 
     # Attempt 2: full escaped path + fontsdir, no CWD
     escaped = _escape_sub_path_win(temp_sub)
@@ -173,7 +176,8 @@ def _try_subtitle_burn(input_path: Path, output_path: Path, temp_sub: Path, sub_
         *audio_args,
         str(output_path),
     ]
-    print(f"    Subs attempt 2 (escaped path): {' '.join(cmd2)}")
+    if DEBUG:
+        logger.info(f"Subs attempt 2 (escaped path): {' '.join(cmd2)}")
     r2 = run_ffmpeg_with_encode_fallback(
         cmd2,
         lambda c: _run(c, capture_output=True, text=True, errors="replace"),
@@ -187,7 +191,7 @@ def _try_subtitle_burn(input_path: Path, output_path: Path, temp_sub: Path, sub_
         logger.info("Subtitles burned successfully (escaped path method)")
         return True
 
-    print(f"    [!] Attempt 2 failed: {r2.stderr[-200:]}")
+    logger.warning(f"Attempt 2 (escaped path) failed: {(r2.stderr or '')[-200:]}")
 
     # Attempt 3: try the other filter if available
     other = "ass" if filt == "subtitles" else "subtitles"
@@ -204,7 +208,8 @@ def _try_subtitle_burn(input_path: Path, output_path: Path, temp_sub: Path, sub_
                 *audio_args,
                 str(output_path),
             ]
-            print(f"    Subs attempt 3 ({other} filter): {' '.join(cmd3)}")
+            if DEBUG:
+                logger.info(f"Subs attempt 3 ({other} filter): {' '.join(cmd3)}")
             r3 = run_ffmpeg_with_encode_fallback(
                 cmd3,
                 lambda c: _run(c, capture_output=True, text=True, errors="replace", cwd=str(sub_dir)),
@@ -217,7 +222,7 @@ def _try_subtitle_burn(input_path: Path, output_path: Path, temp_sub: Path, sub_
                         logger.info(f"Font info: {'; '.join(stderr_lines[:3])}")
                 logger.info(f"Subtitles burned successfully ({other} filter)")
                 return True
-            print(f"    [!] Attempt 3 failed: {r3.stderr[-200:]}")
+            logger.warning(f"Attempt 3 ({other}) failed: {(r3.stderr or '')[-200:]}")
     except Exception:
         pass
 
@@ -458,17 +463,13 @@ def extract_clip(
         return ClipResult(path=None, subtitles_burned=False, warning=warning)
 
     # Ensure input file is not locked (common issue on Windows after download)
-    while True:
-        try:
-            with open(video_path, 'rb'):
-                break
-        except OSError:
-            time.sleep(0.5)
+    if not wait_for_file_unlock(video_path, timeout=5.0):
+        logger.warning("Input file still locked after 5s, proceeding anyway...")
 
     # Prepare subtitle temp copy
     temp_sub, sub_dir = _prepare_subtitle_file(subtitle_path, output_path.stem)
 
-    logger.info(f"Clipping {_fmt(start)} -> {_fmt(end)}  ({duration}s)")
+    logger.info(f"Clipping {fmt_time(start)} -> {fmt_time(end)}  ({duration}s)")
 
     # ── CASE A: crop + subtitles → two-pass ──────────────────────────────
     if crop_params and temp_sub:
@@ -722,10 +723,7 @@ def _cleanup(path):
     _robust_unlink(path)
 
 
-def _fmt(seconds: int) -> str:
-    m, s = divmod(seconds, 60)
-    h, m = divmod(m, 60)
-    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+_fmt = fmt_time
 
 
 # ── Post-processing: background music ───────────────────────────────────────
