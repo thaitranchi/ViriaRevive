@@ -236,15 +236,14 @@ class _SilentHTTPServer(http.server.HTTPServer):
         super().handle_error(request, client_address)
 
 
-def _start_video_server(clips_dir: Path) -> int:
-    """Start a local HTTP server for video previews; returns the port."""
+def _start_video_server(clips_dir: Path):
+    """Start a local HTTP server for video previews; returns (port, server)."""
     handler = functools.partial(_SilentHandler, directory=str(clips_dir))
-    # Bind to port 0 → OS picks a free port
     server = _SilentHTTPServer(("127.0.0.1", 0), handler)
     port = server.server_address[1]
-    threading.Thread(target=server.serve_forever, daemon=True).start() # type: ignore
+    threading.Thread(target=server.serve_forever, daemon=True).start()
     print(f"[+] Video preview server on http://127.0.0.1:{port}")
-    return port
+    return port, server
 
 
 class ApiBridge:
@@ -261,8 +260,6 @@ class ApiBridge:
         self._results: list[Path] = []
         self._moments: list[dict] = []
         self._scheduled: list[dict] = []
-        self._video_port = _start_video_server(CLIPS_DIR)
-        self._music_port = _start_video_server(MUSIC_DIR)
         self._scheduler_running = False
         self._delete_after_upload = False   # auto-delete clips after YouTube upload
         self._user_settings: dict = {}      # user settings persisted to disk
@@ -272,8 +269,19 @@ class ApiBridge:
         global _log_bridge
         _log_bridge = self
 
-        # Load persisted state from previous session
+        # Load persisted state from previous session (before video server init)
         self._load_state()
+
+        # Clips directory: use saved setting or fall back to config default
+        saved_clips_path = self._user_settings.get("clips_path")
+        if saved_clips_path:
+            self._clips_dir = Path(saved_clips_path)
+            self._clips_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            self._clips_dir = CLIPS_DIR
+
+        self._video_port, self._video_server = _start_video_server(self._clips_dir)
+        self._music_port, _ = _start_video_server(MUSIC_DIR)
 
         # Initialize logging based on saved setting
         is_debug = self._user_settings.get("debug_logging", False)
@@ -302,7 +310,7 @@ class ApiBridge:
             ),
             "ollama": detector_ready(OLLAMA_DETECTOR_MODEL)
         }
-        for name, path in [("clips", CLIPS_DIR), ("temp", Path(tempfile.gettempdir()))]:
+        for name, path in [("clips", self._clips_dir), ("temp", Path(tempfile.gettempdir()))]:
             try:
                 test_file = path / f".viria_test_{int(time.time())}"
                 test_file.write_text("ok")
@@ -317,7 +325,7 @@ class ApiBridge:
         preset = self._user_settings.get("ffmpeg_preset", FFMPEG_PRESET)
         crf = str(self._user_settings.get("video_crf", VIDEO_CRF))
         encoder = self._user_settings.get("video_encoder", VIDEO_ENCODER)
-        test_out = CLIPS_DIR / f"test_enc_{int(time.time())}.mp4"
+        test_out = self._clips_dir / f"test_enc_{int(time.time())}.mp4"
         cmd = [
             "ffmpeg", "-y", "-f", "lavfi", "-i", "testsrc=duration=1:size=1280x720:rate=30",
             *video_encode_args(preset, crf, encoder),
@@ -384,6 +392,7 @@ class ApiBridge:
             "upload_tags": "shorts, gaming, gameplay, clips",
             "upload_description": "#shorts #gaming #gameplay",
             "debug_logging": False,
+            "clips_path": str(CLIPS_DIR),
         }
         # Merge saved user overrides (from save_settings)
         if self._user_settings:
@@ -489,6 +498,11 @@ class ApiBridge:
         # Check if debug mode changed and re-install logging tee
         if new_settings.get("debug_logging") != self._user_settings.get("debug_logging"):
             _install_log_tee(debug=new_settings.get("debug_logging", False))
+
+        # Handle clips path change: restart video server for new directory
+        new_clips_path = new_settings.get("clips_path")
+        if new_clips_path and str(Path(new_clips_path).resolve()) != str(self._clips_dir.resolve()):
+            self._restart_video_server(Path(new_clips_path))
 
         self._user_settings = new_settings
         self._user_settings["crop_vertical"] = True
@@ -1051,10 +1065,24 @@ class ApiBridge:
 
     def open_output_folder(self):
         try:
-            os.startfile(str(CLIPS_DIR))
+            os.startfile(str(self._clips_dir))
         except Exception:
             pass
         return {"ok": True}
+
+    def select_clips_folder(self):
+        """Open a folder picker dialog and return the chosen path."""
+        import webview
+        try:
+            result = self._window.create_file_dialog(
+                webview.FOLDER_DIALOG,
+                directory=str(self._clips_dir),
+            )
+            if result and len(result) > 0:
+                return {"path": result[0]}
+        except Exception:
+            pass
+        return {"path": None}
 
     def select_file(self):
         import webview
@@ -1081,6 +1109,18 @@ class ApiBridge:
         return {"paths": []}
 
     # ── Exposed: video preview ───────────────────────────────────────────
+
+    def _restart_video_server(self, new_dir: Path):
+        """Shut down the old video server and start a new one serving new_dir."""
+        try:
+            self._video_server.shutdown()
+            self._video_server.server_close()
+        except Exception:
+            pass
+        new_dir.mkdir(parents=True, exist_ok=True)
+        self._video_port, self._video_server = _start_video_server(new_dir)
+        self._clips_dir = new_dir
+        logger.info(f"Video server restarted on port {self._video_port} for {new_dir}")
 
     def get_video_url(self, clip_index):
         """Return a local HTTP URL for the clip so the HTML5 <video> can play it."""
@@ -1131,8 +1171,8 @@ class ApiBridge:
 
     def delete_library_file(self, filename):
         """Delete a video file from the clips folder by filename."""
-        target = CLIPS_DIR / filename
-        if target.exists() and target.parent == CLIPS_DIR:
+        target = self._clips_dir / filename
+        if target.exists() and target.parent == self._clips_dir:
             try:
                 self._robust_unlink(target)
                 # Also remove from results if it was there
@@ -1150,10 +1190,10 @@ class ApiBridge:
         clips = []
         total_size = 0
         _exts = {'.mp4', '.mkv', '.avi', '.mov', '.webm'}
-        if CLIPS_DIR.exists(): # type: ignore
+        if self._clips_dir.exists(): # type: ignore
             # Single stat() per file — cache the result
             entries = []
-            for p in CLIPS_DIR.iterdir():
+            for p in self._clips_dir.iterdir():
                 if p.suffix.lower() in _exts:
                     st = p.stat()
                     entries.append((p, st))
@@ -1183,8 +1223,8 @@ class ApiBridge:
         existing = {p.resolve() for p in self._results if p.exists()}
         added = 0
 
-        if CLIPS_DIR.exists(): # type: ignore
-            for p in sorted(CLIPS_DIR.iterdir(), key=lambda x: x.stat().st_mtime):
+        if self._clips_dir.exists(): # type: ignore
+            for p in sorted(self._clips_dir.iterdir(), key=lambda x: x.stat().st_mtime):
                 if p.suffix.lower() in _exts and p.resolve() not in existing:
                     self._results.append(p)
                     existing.add(p.resolve())
@@ -1536,7 +1576,7 @@ class ApiBridge:
                 if self._cancel:
                     return None
                 clip_num = idx + 1
-                out = CLIPS_DIR / f"{stem}_viral{clip_num}.mp4"
+                out = self._clips_dir / f"{stem}_viral{clip_num}.mp4"
 
                 # Resume Logic: Skip if clip already exists and is valid
                 if out.exists() and validate_shorts_output(out): # type: ignore

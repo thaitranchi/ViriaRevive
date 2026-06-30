@@ -548,6 +548,16 @@ async function openMusicFolder() {
     setTimeout(() => loadMusicList(), 1000);
 }
 
+async function selectClipsFolder() {
+    try {
+        const r = await pywebview.api.select_clips_folder();
+        if (r && r.path) {
+            document.getElementById('set-clips-path').value = r.path;
+            gatherSettings();
+        }
+    } catch (_) { }
+}
+
 /* ── Waveform Trimmer ────────────────────────────────────────────────── */
 
 const trimmerState = {
@@ -3284,6 +3294,7 @@ function populateSettings(s) {
     setSelect('set-yolo-device', s.yolo_device || 'auto');
     setSelect('set-ai-detector', s.ai_detector || 'auto');
     setSelect('set-ai-provider', s.ai_provider || 'gemini');
+    setVal('set-clips-path', s.clips_path || '');
     const geminiInput = document.getElementById('set-gemini-key');
     if (geminiInput) {
         geminiInput.value = '';
@@ -3329,6 +3340,7 @@ function gatherSettings() {
         upload_description: getVal('set-upload-desc') || '',
         ai_detector: getVal('set-ai-detector') || 'auto',
         ai_provider: getVal('set-ai-provider') || 'gemini',
+        clips_path: getVal('set-clips-path') || '',
         debug_logging: document.getElementById('set-debug-logging')?.checked || false,
         shorts_mode: document.getElementById('set-shorts-enabled')?.checked ? 'crop' : 'none',
         crop_vertical: document.getElementById('set-shorts-enabled')?.checked

@@ -918,6 +918,23 @@
                             </div>
                             <span class="setting-hint">Lower = better quality, larger file</span>
                         </div>
+                        <div class="setting-row">
+                            <label>Clips folder</label>
+                            <div style="display:flex;gap:6px;flex:1;align-items:center;min-width:0">
+                                <input type="text" id="set-clips-path" class="form-input" readonly
+                                    style="flex:1;font-size:11px;cursor:default"
+                                    onclick="this.select()">
+                                <button class="btn-secondary btn-sm" onclick="selectClipsFolder()"
+                                    title="Browse for folder">
+                                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                        stroke-width="2">
+                                        <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
+                                    </svg>
+                                    Browse
+                                </button>
+                            </div>
+                            <span class="setting-hint">New clips will be saved here. Gallery updates automatically.</span>
+                        </div>
                     </div>
 
                     <div class="card settings-card">
