@@ -12,6 +12,68 @@ from subprocess_utils import run as _run
 
 logger = logging.getLogger(__name__)
 
+# ── GPU discovery ─────────────────────────────────────────────────────────
+
+
+def list_cuda_devices() -> list[dict]:
+    """Enumerate available CUDA GPUs with name, total_mib, free_mib.
+
+    Returns empty list if PyTorch is not available or no CUDA devices found.
+    Each entry: {index, name, total_mib, free_mib}.
+    """
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return []
+        devices = []
+        for i in range(torch.cuda.device_count()):
+            props = torch.cuda.get_device_properties(i)
+            try:
+                free_bytes, total_bytes = torch.cuda.mem_get_info(i)
+            except Exception:
+                free_bytes = 0
+                total_bytes = props.total_memory if hasattr(props, 'total_memory') else 0
+            devices.append({
+                "index": i,
+                "name": props.name if hasattr(props, 'name') else f"CUDA GPU {i}",
+                "total_mib": total_bytes // (1024 * 1024),
+                "free_mib": free_bytes // (1024 * 1024),
+            })
+        return devices
+    except ImportError:
+        return []
+    except Exception:
+        return []
+
+
+def get_gpu_count() -> int:
+    """Return the number of available CUDA GPUs (0 if none / CPU-only)."""
+    return len(list_cuda_devices())
+
+
+def select_least_loaded_gpu(gpu_indices: list[int] | None = None) -> int:
+    """Pick the GPU with the most free VRAM.
+
+    If *gpu_indices* is None, checks all available GPUs.
+    Returns the device index (int).  Defaults to 0 if detection fails.
+    """
+    devices = list_cuda_devices()
+    if not devices:
+        return 0
+    candidates = [d for d in devices if gpu_indices is None or d["index"] in gpu_indices]
+    if not candidates:
+        return 0
+    # Pick the one with the most free MiB; tie → lowest index
+    best = max(candidates, key=lambda d: (d["free_mib"], -d["index"]))
+    return best["index"]
+
+
+def get_gpu_device_str(gpu_index: int) -> str:
+    """Return the torch device string for a GPU index (e.g. ``"cuda:0"``)."""
+    if gpu_index < 0:
+        return "cpu"
+    return f"cuda:{gpu_index}"
+
 # User-facing encoder keys → ffmpeg codec names
 _ENCODER_MAP = {
     "auto": None,
@@ -246,10 +308,12 @@ def get_hardware_summary(
     prof = probe_ffmpeg(encoder_pref)
     decode = prof.active_hwaccel or "software"
     yolo = resolve_yolo_device(yolo_device)
-    whisper_dev, whisper_compute = resolve_whisper_device(whisper_device)
+    whisper_dev, whisper_compute, whisper_idx = resolve_whisper_device(whisper_device)
+    gpu_count = get_gpu_count()
+    gpu_str = f", gpus={gpu_count}" if gpu_count > 0 else ""
     return (
         f"encoder={prof.active_encoder}, decode={decode}, "
-        f"yolo={yolo}, whisper={whisper_dev}/{whisper_compute}"
+        f"yolo={yolo}, whisper={whisper_dev}/{whisper_compute}{gpu_str}"
     )
 
 
@@ -258,8 +322,13 @@ def video_encode_args(
     crf: str = "23",
     encoder: str = "auto",
     force_cpu: bool = False,
+    gpu_index: int | None = None,
 ) -> list[str]:
-    """Build ffmpeg video encode arguments for the chosen encoder."""
+    """Build ffmpeg video encode arguments for the chosen encoder.
+
+    If *gpu_index* is provided (≥ 0), a ``-gpu:v N`` flag is appended for
+    NVENC-based encoders so the correct physical GPU is used.
+    """
     if force_cpu:
         codec = "libx264"
     else:
@@ -279,16 +348,22 @@ def video_encode_args(
         cq = "23"
     x264_preset = preset if preset in _X264_TO_NVENC else "ultrafast"
 
+    def _maybe_gpu_flag(args: list[str]) -> list[str]:
+        """Append ``-gpu:v N`` for NVENC when *gpu_index* is set."""
+        if gpu_index is not None and gpu_index >= 0:
+            return args + ["-gpu:v", str(gpu_index)]
+        return args
+
     if codec == "h264_nvenc":
         nv_preset = _X264_TO_NVENC.get(x264_preset, "p4")
-        return [
+        return _maybe_gpu_flag([
             "-c:v", "h264_nvenc",
             "-preset", nv_preset,
             "-rc:v", "vbr",
             "-cq:v", cq,
             "-profile:v", "high",
             "-pix_fmt", "yuv420p",
-        ]
+        ])
     if codec == "h264_qsv":
         qsv_preset = _X264_TO_QSV.get(x264_preset, "veryfast")
         return [
@@ -309,13 +384,13 @@ def video_encode_args(
         ]
     if codec == "hevc_nvenc":
         nv_preset = _X264_TO_NVENC.get(x264_preset, "p4")
-        return [
+        return _maybe_gpu_flag([
             "-c:v", "hevc_nvenc",
             "-preset", nv_preset,
             "-rc:v", "vbr",
             "-cq:v", cq,
             "-pix_fmt", "yuv420p",
-        ]
+        ])
     if codec == "hevc_qsv":
         qsv_preset = _X264_TO_QSV.get(x264_preset, "veryfast")
         return [
@@ -358,26 +433,35 @@ def video_encode_args(
     ]
 
 
-def input_hwaccel_args(decoder: str = "auto") -> list[str]:
-    """Build ffmpeg hardware decode args (before -i). Empty if unavailable."""
+def input_hwaccel_args(decoder: str = "auto",
+                       gpu_index: int | None = None) -> list[str]:
+    """Build ffmpeg hardware decode args (before -i). Empty if unavailable.
+
+    If *gpu_index* is given (≥ 0), a ``-hwaccel_device N`` flag is appended
+    so the correct GPU is used for decode.
+    """
     if decoder in ("none", "cpu"):
         return []
 
     # Handle codec-based hardware decoders (e.g., h264_cuvid, h264_qsv)
-    # These are used as -c:v [codec] before the input -i
     if any(suffix in decoder for suffix in ("_cuvid", "_qsv", "_v4l2m2m")):
-        return ["-c:v", decoder]
+        args = ["-c:v", decoder]
+        if gpu_index is not None and gpu_index >= 0:
+            args += ["-hwaccel_device", str(gpu_index)]
+        return args
 
     prof = probe_ffmpeg()
-    # Allow explicitly requesting a specific hardware acceleration method
-    # if it was detected during the FFmpeg probe.
     if decoder != "auto" and decoder in prof.hwaccels:
-        return ["-hwaccel", decoder]
+        args = ["-hwaccel", decoder]
+        if gpu_index is not None and gpu_index >= 0:
+            args += ["-hwaccel_device", str(gpu_index)]
+        return args
 
-    # 'auto' is significantly more robust than picking a specific string.
-    # It allows FFmpeg to fall back to software or alternative devices if one fails.
     if prof.active_hwaccel:
-        return ["-hwaccel", "auto"]
+        args = ["-hwaccel", "auto"]
+        if gpu_index is not None and gpu_index >= 0:
+            args += ["-hwaccel_device", str(gpu_index)]
+        return args
     return []
 
 
@@ -483,16 +567,22 @@ def run_ffmpeg_with_encode_fallback(
 # ── YOLO / Whisper device helpers (used by cropper & transcriber) ───────────
 
 
-def resolve_yolo_device(pref: str = "auto") -> str:
-    """Return 'cuda:0' or 'cpu' for ultralytics."""
+def resolve_yolo_device(pref: str = "auto", gpu_index: int | None = None) -> str:
+    """Return a device string like ``"cuda:0"`` or ``"cpu"`` for ultralytics.
+
+    If *gpu_index* is given (e.g. ``1`` for GPU 1), it takes precedence over *pref*.
+    """
+    if gpu_index is not None and gpu_index >= 0:
+        return f"cuda:{gpu_index}"
+
     pref = (pref or "auto").lower()
     try:
         import torch
         cuda_avail = torch.cuda.is_available()
-        
+
         if pref != "cpu" and cuda_avail:
             return "cuda:0"
-            
+
         if pref == "cuda" and not cuda_avail:
             print("[!] YOLO: CUDA requested but torch.cuda.is_available() is False. Falling back to CPU.")
     except ImportError:
@@ -502,23 +592,30 @@ def resolve_yolo_device(pref: str = "auto") -> str:
     return "cpu"
 
 
-def resolve_whisper_device(pref: str = "auto") -> tuple[str, str]:
-    """Return (device, compute_type) for faster-whisper."""
+def resolve_whisper_device(pref: str = "auto", gpu_index: int | None = None) -> tuple[str, str, int]:
+    """Return (device, compute_type, device_index) for faster-whisper.
+
+    If *gpu_index* is given (e.g. ``1``), the returned *device_index* is set
+    accordingly so whisper can be pinned to a specific GPU.
+    """
+    if gpu_index is not None and gpu_index >= 0:
+        return "cuda", "float16", gpu_index
+
     pref = (pref or "auto").lower()
     if pref == "cpu":
-        return "cpu", "int8"
+        return "cpu", "int8", 0
 
     try:
         import torch
         if pref == "cuda" or pref == "auto":
             if torch.cuda.is_available():
-                return "cuda", "float16"
+                return "cuda", "float16", 0
         if pref in ("auto", "mps") and getattr(torch.backends, "mps", None):
             if torch.backends.mps.is_available():
-                return "cpu", "int8"  # faster-whisper lacks stable MPS — stay CPU
+                return "cpu", "int8", 0  # faster-whisper lacks stable MPS — stay CPU
     except ImportError:
         pass
-    return "cpu", "int8"
+    return "cpu", "int8", 0
 
 
 def log_hardware_startup(

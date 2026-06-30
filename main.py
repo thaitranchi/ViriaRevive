@@ -13,10 +13,14 @@ Usage:
 """
 
 import argparse
+import logging
 import shutil
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 from config import (
     AI_DETECTOR_MODE,
@@ -33,12 +37,13 @@ from config import (
     SUBTITLES_DIR,
     VIDEO_CRF,
     VIDEO_ENCODER,
+    VIDEO_DECODER,
     WHISPER_DEVICE,
     WHISPER_LANGUAGE,
     WHISPER_MODEL,
     YOLO_DEVICE,
 )
-from hwaccel import log_hardware_startup
+from hwaccel import log_hardware_startup, get_gpu_count, select_least_loaded_gpu
 from downloader import download_video
 from detector import find_viral_moments
 from ollama_detector import detector_ready, rerank_moments
@@ -159,12 +164,24 @@ def process(
     else:
         moments = moments[:num_clips]
 
-    # ── 3. Clip + subtitle each moment ───────────────────────────────────
+    # ── 3. Clip + subtitle each moment (parallel multi-GPU) ────────────
     print("\n══ 3 · Creating clips with subtitles ══")
-    done: list[Path] = []
+    gpu_count = get_gpu_count()
+    if gpu_count > 0:
+        print(f"[+] {gpu_count} GPU(s) detected — processing clips in parallel")
+    else:
+        print("[+] CPU mode — processing clips sequentially")
 
-    for idx, m in enumerate(moments, 1):
-        print(f"\n── clip {idx}/{len(moments)} ──")
+    def _process_one_clip(idx: int, m: dict) -> Path | None:
+        """Process a single clip, assigned to a specific GPU."""
+        is_multi = gpu_count > 0
+        if is_multi:
+            gpu_idx = select_least_loaded_gpu(list(range(gpu_count)))
+        else:
+            gpu_idx = None
+        clip_num = idx + 1
+
+        print(f"\n── clip {clip_num}/{len(moments)} {'GPU ' + str(gpu_idx) if gpu_idx is not None else ''}──")
         start, end = m["start"], m["end"]
 
         # 3a. compute crop params for 9:16
@@ -176,21 +193,22 @@ def process(
                 vid_w, vid_h = crop_params[0], crop_params[1]
 
         # 3b. extract wav for whisper
-        wav = SUBTITLES_DIR / f"{stem}_c{idx}.wav"
+        wav = SUBTITLES_DIR / f"{stem}_c{clip_num}.wav"
         if not extract_audio_clip(video_path, start, end, wav):
-            continue
+            return None
 
-        # 3c. transcribe → word timestamps
+        # 3c. transcribe → word timestamps (pinned to assigned GPU)
         words = transcribe_clip(
-            wav, model_size=model, language=language, device_pref=WHISPER_DEVICE,
+            wav, model_size=model, language=language,
+            device_pref=WHISPER_DEVICE, gpu_index=gpu_idx,
         )
 
         # 3d. build ASS subtitles (sized for cropped resolution)
-        ass = SUBTITLES_DIR / f"{stem}_c{idx}.ass"
+        ass = SUBTITLES_DIR / f"{stem}_c{clip_num}.ass"
         generate_subtitles(words, ass, video_width=1080, video_height=1920, style=style)
 
-        # 3e. extract clip + crop + burn subs (single ffmpeg pass)
-        out = CLIPS_DIR / f"{stem}_viral{idx}.mp4"
+        # 3e. extract clip + crop + burn subs (single ffmpeg pass, pinned to GPU)
+        out = CLIPS_DIR / f"{stem}_viral{clip_num}.mp4"
         result = extract_clip(
             video_path, start, end, out,
             subtitle_path=ass if words else None,
@@ -198,12 +216,38 @@ def process(
             preset=FFMPEG_PRESET,
             crf=VIDEO_CRF,
             encoder=VIDEO_ENCODER,
+            decoder=VIDEO_DECODER,
+            gpu_index=gpu_idx,
         )
-        if result and result.path:
-            done.append(result.path)
 
         # cleanup temp wav
         wav.unlink(missing_ok=True)
+
+        if result and result.path:
+            return result.path
+        return None
+
+    done: list[Path] = []
+    if gpu_count > 0:
+        # Parallel dispatch across GPUs
+        futures = {}
+        with ThreadPoolExecutor(max_workers=gpu_count) as executor:
+            for idx, m in enumerate(moments):
+                futures[executor.submit(_process_one_clip, idx, m)] = idx
+            ordered = [None] * len(moments)
+            for fut in as_completed(futures):
+                i = futures[fut]
+                try:
+                    ordered[i] = fut.result()
+                except Exception:
+                    logger.exception(f"Clip {i + 1} failed")
+        done = [p for p in ordered if p is not None]
+    else:
+        # Sequential (single GPU or CPU) — preserves existing behaviour
+        for idx, m in enumerate(moments):
+            p = _process_one_clip(idx, m)
+            if p:
+                done.append(p)
 
     # ── 4. Generate AI Titles ───────────────────────────────────────────
     all_titles = []

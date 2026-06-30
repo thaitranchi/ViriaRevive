@@ -52,9 +52,9 @@ def check_hardware_support():
         print("    Or:  pip install -r requirements.txt --index-url https://download.pytorch.org/whl/cu124")
 
     yolo = resolve_yolo_device("cuda")
-    whisper_dev, whisper_compute = resolve_whisper_device("cuda")
+    whisper_dev, whisper_compute, whisper_idx = resolve_whisper_device("cuda")
     print(f"\nResolved YOLO Device:    {yolo}")
-    print(f"Resolved Whisper Device: {whisper_dev}/{whisper_compute}")
+    print(f"Resolved Whisper Device: {whisper_dev}/{whisper_compute} (idx={whisper_idx})")
     print("="*40)
 
 if __name__ == "__main__":

@@ -36,10 +36,10 @@ CAMERA_CUT_THRESH = 0.40  # 40% of frame width jump = camera cut
 CUT_DELAY_SEC = 0.200     # delay crop switch 200ms after detected cut to avoid empty frames
 CUT_HOLD_BEFORE = 0.050   # hold old crop 50ms before the cut too (covers early-switch)
 
-# YOLO caches its model globally so we only load once
-_yolo_model = None
-_yolo_device: str | None = None
-_yolo_checked = False
+# YOLO caches its model per-device so we only load once per GPU
+_yolo_models: dict[str, object] = {}       # device_str → YOLO model instance
+_yolo_devices: dict[str, str] = {}          # device_str → resolved device string
+_yolo_checked_devices: set[str] = set()     # set of device strings that have been probed
 _yolo_device_pref = "auto"
 YOLO_BATCH_SIZE = 32
 
@@ -100,11 +100,14 @@ def get_crop_params(video_path: Path, start: int, end: int,
 
 def get_crop_params_dynamic(video_path: Path, start: int, end: int,
                             target_ratio: float = 9 / 16, sample_count: int = 50,
-                            yolo_device: str = "auto", debug_frames: bool = False):
+                            yolo_device: str = "auto", debug_frames: bool = False,
+                            gpu_index: int | None = None):
     """Return (crop_w, crop_h, keyframes) or None if already vertical.
 
     Dynamic crop — tracks the active person per-window with stable cuts.
     keyframes is a list of (time, crop_x, crop_y) tuples.
+
+    *gpu_index* pins YOLO inference to a specific GPU.
     """
     width, height = _get_dimensions(video_path)
     if width <= 0 or height <= 0:
@@ -127,7 +130,8 @@ def get_crop_params_dynamic(video_path: Path, start: int, end: int,
 
     # Get per-frame person tracking data
     detections, scale_x, scale_y = detect_all_persons(
-        video_path, start, end, width, height, sample_count, yolo_device=yolo_device, debug_frames=debug_frames,
+        video_path, start, end, width, height, sample_count, yolo_device=yolo_device,
+        debug_frames=debug_frames, gpu_index=gpu_index,
     )
 
     if len(detections) < 3:
@@ -163,7 +167,7 @@ def get_crop_params_dynamic(video_path: Path, start: int, end: int,
 
     # Refine transition timing with binary search (sub-frame precision)
     detections = _refine_transitions(detections, video_path, start, width, height,
-                                     scale_x, scale_y)
+                                     scale_x, scale_y, gpu_index=gpu_index)
 
     # Select active person per time window and smooth
     active_positions = _select_active_person(detections, duration, width)
@@ -219,31 +223,37 @@ def _get_dimensions(video_path: Path) -> tuple[int, int]:
 # ── YOLO person detector (primary) ───────────────────────────────────────────
 
 
-def _get_yolo_model(device_pref: str = "auto"):
+def _get_yolo_model(device_pref: str = "auto",
+                    gpu_index: int | None = None):
     """Load YOLOv8-nano for person detection (auto-downloads 6MB model).
 
-    Cached globally so we only load once per process.
-    Returns (model, device) or (None, None).
-    """
-    global _yolo_model, _yolo_checked, _yolo_device, _yolo_device_pref
-    device = resolve_yolo_device(device_pref)
-    if _yolo_checked and _yolo_model is not None and device == _yolo_device:
-        return _yolo_model, _yolo_device
-    if _yolo_checked and device_pref != _yolo_device_pref:
-        _yolo_checked = False
-        _yolo_model = None
+    Cached **per device** so we only load once per GPU.
+    When *gpu_index* is provided the model is pinned to that specific GPU.
 
-    _yolo_checked = True
+    Returns (model, device_str) or (None, None).
+    """
+    global _yolo_device_pref
+    device = resolve_yolo_device(device_pref, gpu_index=gpu_index)
     _yolo_device_pref = device_pref
+
+    # Return cached instance for this device if available
+    if device in _yolo_models:
+        return _yolo_models[device], _yolo_devices.get(device, device)
+
+    # Avoid re-probing failed devices
+    if device in _yolo_checked_devices:
+        return _yolo_models.get(device), _yolo_devices.get(device)
+
+    _yolo_checked_devices.add(device)
     try:
         from ultralytics import YOLO
         model = YOLO("yolov8n.pt")
         if device != "cpu":
             model.to(device)
-        _yolo_model = model
-        _yolo_device = device
+        _yolo_models[device] = model
+        _yolo_devices[device] = device
         logger.info(f"YOLO person detector loaded on {device}")
-        return _yolo_model, _yolo_device
+        return _yolo_models[device], _yolo_devices[device]
     except ImportError:
         logger.warning("ultralytics not installed — falling back to face detection")
         return None, None
@@ -410,7 +420,8 @@ def _read_frame_safe(cap, msec=None, timeout=5.0):
 
 
 def detect_all_persons(video_path, start, end, width, height, sample_count,
-                        yolo_device: str = "auto", debug_frames: bool = False):
+                        yolo_device: str = "auto", debug_frames: bool = False,
+                        gpu_index: int | None = None):
     """Track persons across frames for dynamic cropping.
 
     Primary: YOLO person detection (catches ALL people regardless of pose).
@@ -425,7 +436,7 @@ def detect_all_persons(video_path, start, end, width, height, sample_count,
     """
 
     # Try YOLO first (much more reliable)
-    yolo, yolo_dev = _get_yolo_model(yolo_device)
+    yolo, yolo_dev = _get_yolo_model(yolo_device, gpu_index=gpu_index)
     use_yolo = yolo is not None
 
     # Fallback: face detectors
@@ -568,7 +579,8 @@ def detect_all_persons(video_path, start, end, width, height, sample_count,
 
 def _refine_transitions(detections, video_path, start, width, height,
                         scale_x=1.0, scale_y=1.0,
-                        max_iterations=4, min_gap=0.033):
+                        max_iterations=4, min_gap=0.033,
+                        gpu_index: int | None = None):
     """Binary-search for exact transition frames between large position jumps.
 
     When consecutive detections show a person position jump > CAMERA_CUT_THRESH
@@ -598,7 +610,7 @@ def _refine_transitions(detections, video_path, start, width, height,
         return detections
 
     # Load YOLO model for refinement reads
-    yolo, yolo_dev = _get_yolo_model(_yolo_device_pref)
+    yolo, yolo_dev = _get_yolo_model(_yolo_device_pref, gpu_index=gpu_index)
     if yolo is None:
         print("[!] No YOLO model for transition refinement, skipping")
         return detections

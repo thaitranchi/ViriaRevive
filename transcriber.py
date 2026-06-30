@@ -2,28 +2,36 @@ from pathlib import Path
 
 from hwaccel import resolve_whisper_device
 
+# Per-GPU model cache: key = (model_size, device, compute, gpu_index)
 _model_cache = {}
 
 
-def _get_device(device_pref: str = "auto") -> tuple[str, str]:
-    """Resolve device and compute_type for faster-whisper."""
-    return resolve_whisper_device(device_pref)
+def _get_device(device_pref: str = "auto",
+                gpu_index: int | None = None) -> tuple[str, str, int]:
+    """Resolve (device, compute_type, device_index) for faster-whisper.
+
+    When *gpu_index* is provided, whisper is pinned to that specific GPU.
+    """
+    return resolve_whisper_device(device_pref, gpu_index=gpu_index)
 
 
-def _load_whisper_model(model_size: str, device: str, compute: str):
+def _load_whisper_model(model_size: str, device: str, compute: str,
+                        device_index: int = 0):
     from faster_whisper import WhisperModel
 
-    cache_key = (model_size, device, compute)
+    cache_key = (model_size, device, compute, device_index)
     if cache_key not in _model_cache:
-        print(f"[*] Loading Whisper {model_size} ({device}/{compute})...")
+        print(f"[*] Loading Whisper {model_size} ({device}/{compute},"
+              f" device_index={device_index})...")
         try:
             _model_cache[cache_key] = WhisperModel(
-                model_size, device=device, compute_type=compute
+                model_size, device=device, device_index=device_index,
+                compute_type=compute,
             )
         except Exception as e:
             if device != "cpu":
                 print(f"[!] Whisper GPU init failed ({e}), falling back to CPU...")
-                return _load_whisper_model(model_size, "cpu", "int8")
+                return _load_whisper_model(model_size, "cpu", "int8", 0)
             print(f"[!] Whisper CPU init also failed ({e})")
             raise
     return _model_cache[cache_key]
@@ -34,15 +42,18 @@ def transcribe_clip(
     model_size: str = "base",
     language: str = None,
     device_pref: str = "auto",
+    gpu_index: int | None = None,
 ) -> list:
     """Transcribe audio and return word-level timestamps.
 
     Returns list of dicts: [{'text': str, 'start': float, 'end': float}, ...]
-    """
-    device, compute = _get_device(device_pref)
-    model = _load_whisper_model(model_size, device, compute)
 
-    print(f"[*] Transcribing {audio_path.name}...")
+    If *gpu_index* is provided the whisper model is pinned to that GPU.
+    """
+    device, compute, device_index = _get_device(device_pref, gpu_index=gpu_index)
+    model = _load_whisper_model(model_size, device, compute, device_index)
+
+    print(f"[*] Transcribing {audio_path.name} (GPU {device_index})...")
     try:
         segments, info = model.transcribe(
             str(audio_path), word_timestamps=True, language=language
@@ -50,7 +61,7 @@ def transcribe_clip(
     except Exception as e:
             if device != "cpu":
                 print(f"[!] Whisper GPU transcribe failed ({e}), retrying on CPU...")
-                model = _load_whisper_model(model_size, "cpu", "int8")
+                model = _load_whisper_model(model_size, "cpu", "int8", 0)
                 segments, info = model.transcribe(
                     str(audio_path), word_timestamps=True, language=language
                 )

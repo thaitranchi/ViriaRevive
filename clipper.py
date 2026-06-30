@@ -122,7 +122,8 @@ def _prepare_subtitle_file(subtitle_path: Path, output_stem: str) -> tuple[Path 
 
 def _try_subtitle_burn(input_path: Path, output_path: Path, temp_sub: Path, sub_dir: Path,
                         preset: str, crf: str, copy_audio: bool = False,
-                        encoder: str = "auto", decoder: str = "auto") -> bool:
+                        encoder: str = "auto", decoder: str = "auto",
+                        gpu_index: int | None = None) -> bool:
     """Try to burn subtitles into a video. Tries multiple approaches.
 
     Returns True on success.
@@ -132,14 +133,14 @@ def _try_subtitle_burn(input_path: Path, output_path: Path, temp_sub: Path, sub_
         return False
 
     audio_args = ["-c:a", "copy"] if copy_audio else ["-c:a", "aac", "-strict", "-2", "-b:a", "128k"]
-    enc_args = video_encode_args(preset, crf, encoder)
+    enc_args = video_encode_args(preset, crf, encoder, gpu_index=gpu_index)
 
     # Attempt 1: filename-only with CWD set to subtitle directory + local fontsdir
     fontsdir_cwd = _fonts_dir_option(sub_dir, use_cwd=True)
     vf = f"{filt}={temp_sub.name}{fontsdir_cwd}"
     cmd = [
         "ffmpeg", "-y",
-        *input_hwaccel_args(decoder),
+        *input_hwaccel_args(decoder, gpu_index=gpu_index),
         "-i", str(input_path),
         "-vf", vf,
         *enc_args,
@@ -169,7 +170,7 @@ def _try_subtitle_burn(input_path: Path, output_path: Path, temp_sub: Path, sub_
     vf2 = f"{filt}={escaped}{fontsdir_full}"
     cmd2 = [
         "ffmpeg", "-y",
-        *input_hwaccel_args(decoder),
+        *input_hwaccel_args(decoder, gpu_index=gpu_index),
         "-i", str(input_path),
         "-vf", vf2,
         *enc_args,
@@ -201,7 +202,7 @@ def _try_subtitle_burn(input_path: Path, output_path: Path, temp_sub: Path, sub_
             vf3 = f"{other}={temp_sub.name}{fontsdir_cwd}"
             cmd3 = [
                 "ffmpeg", "-y",
-                *input_hwaccel_args(decoder),
+                *input_hwaccel_args(decoder, gpu_index=gpu_index),
                 "-i", str(input_path),
                 "-vf", vf3,
                 *enc_args,
@@ -473,6 +474,7 @@ def _run_merged_ffmpeg(
     sub_filter_cwd: str | None,
     extra_inputs: list[str],
     preset: str, crf: str, encoder: str, decoder: str,
+    gpu_index: int | None = None,
 ) -> subprocess.CompletedProcess | None:
     """Run a single merged ffmpeg call with optional video/audio filter chains."""
     filter_parts = []
@@ -496,7 +498,7 @@ def _run_merged_ffmpeg(
 
     cmd = [
         "ffmpeg", "-y", "-ss", str(start),
-        *input_hwaccel_args(decoder),
+        *input_hwaccel_args(decoder, gpu_index=gpu_index),
         "-i", str(video_path), "-t", str(duration),
         *extra_inputs,
     ]
@@ -504,7 +506,7 @@ def _run_merged_ffmpeg(
         cmd.extend(["-filter_complex", filter_complex])
     cmd.extend([
         *map_args,
-        *video_encode_args(preset, crf, encoder),
+        *video_encode_args(preset, crf, encoder, gpu_index=gpu_index),
         *audio_enc,
         str(output_path),
     ])
@@ -526,6 +528,7 @@ def _try_sub_filter_approaches(
     sub_filter_str: str, vf_base: str, af_chain: str | None,
     extra_inputs: list[str],
     preset: str, crf: str, encoder: str, decoder: str,
+    gpu_index: int | None = None,
 ) -> bool:
     """Try subtitle burn with multiple approaches in a merged ffmpeg call.
     
@@ -542,7 +545,7 @@ def _try_sub_filter_approaches(
     r = _run_merged_ffmpeg(
         video_path, start, duration, output_path,
         vf_chain, af_chain, str(sub_dir), extra_inputs,
-        preset, crf, encoder, decoder,
+        preset, crf, encoder, decoder, gpu_index=gpu_index,
     )
     if r and r.returncode == 0 and output_path.exists():
         return True
@@ -554,7 +557,7 @@ def _try_sub_filter_approaches(
     r = _run_merged_ffmpeg(
         video_path, start, duration, output_path,
         vf_chain, af_chain, None, extra_inputs,
-        preset, crf, encoder, decoder,
+        preset, crf, encoder, decoder, gpu_index=gpu_index,
     )
     if r and r.returncode == 0 and output_path.exists():
         return True
@@ -568,7 +571,7 @@ def _try_sub_filter_approaches(
             r = _run_merged_ffmpeg(
                 video_path, start, duration, output_path,
                 vf_chain, af_chain, str(sub_dir), extra_inputs,
-                preset, crf, encoder, decoder,
+                preset, crf, encoder, decoder, gpu_index=gpu_index,
             )
             if r and r.returncode == 0 and output_path.exists():
                 return True
@@ -598,6 +601,7 @@ def extract_clip(
     music_volume: float = 0.12,
     music_trim_start: float = 0,
     music_trim_end: float = 0,
+    gpu_index: int | None = None,
 ) -> ClipResult:
     """Extract a clip, always exporting exact 1080x1920 Shorts video.
 
@@ -673,7 +677,7 @@ def extract_clip(
                     video_path, start, duration, output_path,
                     temp_sub, sub_dir, sub_str, vf_base or "",
                     music_af, extra_inputs,
-                    preset, crf, encoder, decoder,
+                    preset, crf, encoder, decoder, gpu_index=gpu_index,
                 )
                 if merged_ok:
                     _cleanup(temp_sub)
@@ -685,13 +689,14 @@ def extract_clip(
         r = _run_merged_ffmpeg(
             video_path, start, duration, temp_cropped,
             vf_base, music_af, None, extra_inputs,
-            preset, "18", encoder, decoder,
+            preset, "18", encoder, decoder, gpu_index=gpu_index,
         )
         if r and r.returncode == 0 and temp_cropped.exists():
             # Pass 2: burn subtitles on cropped file (with copy_audio for speed)
             sub_ok = _try_subtitle_burn(
                 temp_cropped, output_path, temp_sub, sub_dir,
                 preset, crf, copy_audio=True, encoder=encoder, decoder=decoder,
+                gpu_index=gpu_index,
             )
             if sub_ok:
                 _cleanup(temp_cropped)
@@ -721,7 +726,7 @@ def extract_clip(
         r = _run_merged_ffmpeg(
             video_path, start, duration, output_path,
             vf_base, music_af, None, extra_inputs,
-            preset, crf, encoder, decoder,
+            preset, crf, encoder, decoder, gpu_index=gpu_index,
         )
         if r and r.returncode == 0:
             # Apply effect via merged pass already included above
@@ -744,7 +749,7 @@ def extract_clip(
                     video_path, start, duration, output_path,
                     temp_sub, sub_dir, sub_str, vf_base or "",
                     music_af, extra_inputs,
-                    preset, crf, encoder, decoder,
+                    preset, crf, encoder, decoder, gpu_index=gpu_index,
                 )
                 if merged_ok:
                     _cleanup(temp_sub)
@@ -756,12 +761,13 @@ def extract_clip(
         r = _run_merged_ffmpeg(
             video_path, start, duration, temp_input,
             vf_base, music_af, None, extra_inputs,
-            preset, "18", encoder, decoder,
+            preset, "18", encoder, decoder, gpu_index=gpu_index,
         )
         if r and r.returncode == 0 and temp_input.exists():
             sub_ok = _try_subtitle_burn(
                 temp_input, output_path, temp_sub, sub_dir,
                 preset, crf, copy_audio=True, encoder=encoder, decoder=decoder,
+                gpu_index=gpu_index,
             )
             _cleanup(temp_input)
             _cleanup(temp_sub)
@@ -795,7 +801,7 @@ def extract_clip(
     r = _run_merged_ffmpeg(
         video_path, start, duration, output_path,
         vf_base, music_af, None, extra_inputs,
-        preset, crf, encoder, decoder,
+        preset, crf, encoder, decoder, gpu_index=gpu_index,
     )
     if r and r.returncode == 0:
         print(f"[+] Saved {output_path.name}")
@@ -1024,6 +1030,7 @@ def apply_video_effect(
     crf: str = "23",
     encoder: str = "auto",
     decoder: str = "auto",
+    gpu_index: int | None = None,
 ) -> bool:
     """Apply a video effect preset to a clip (in-place).
 
@@ -1045,10 +1052,10 @@ def apply_video_effect(
 
     cmd = [
         "ffmpeg", "-y",
-        *input_hwaccel_args(decoder),
+        *input_hwaccel_args(decoder, gpu_index=gpu_index),
         "-i", str(clip_path),
         "-vf", vf,
-        *video_encode_args(preset, crf, encoder),
+        *video_encode_args(preset, crf, encoder, gpu_index=gpu_index),
         "-c:a", "copy",
         str(temp_out),
     ]

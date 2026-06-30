@@ -63,7 +63,7 @@ from config import (
     YOLO_DEVICE,
 )
 import gemini_client
-from hwaccel import log_hardware_startup, probe_ffmpeg, get_hardware_summary, video_encode_args
+from hwaccel import log_hardware_startup, probe_ffmpeg, get_hardware_summary, video_encode_args, get_gpu_count, select_least_loaded_gpu
 from detector import find_viral_moments
 from ollama_detector import detector_ready, rerank_moments
 from transcriber import transcribe_clip, find_sentence_boundary
@@ -1565,14 +1565,18 @@ class ApiBridge:
             self._push("detect", 100, f"Found {len(moments)} moments")
             self._js(f"window.onMomentsDetected({json.dumps(moments)}, {self._active_item_index if self._active_item_index is not None else 'null'})")
 
-            # ── 3. Process each clip (parallel with ThreadPoolExecutor) ──
+            # ── 3. Process each clip (parallel with multi-GPU) ──────────
             done: list[Path] = []
             total = len(moments)
             SENTENCE_BUFFER = 5
             results_lock = threading.Lock()
+            gpu_count = get_gpu_count()
 
-            def _process_one(idx: int, m: dict) -> Path | None:
-                """Process a single clip from audio extraction through rendering."""
+            def _process_one(idx: int, m: dict, gpu_idx: int | None = None) -> Path | None:
+                """Process a single clip from audio extraction through rendering.
+
+                *gpu_idx* pins whisper / YOLO / NVENC to a specific GPU.
+                """
                 if self._cancel:
                     return None
                 clip_num = idx + 1
@@ -1603,6 +1607,7 @@ class ApiBridge:
                 self._clip_push(clip_num, total, "transcribe", 0, f"Clip {clip_num}/{total}: Transcribing...")
                 words = transcribe_clip( # type: ignore
                     wav, model_size=model, language=language, device_pref=whisper_device,
+                    gpu_index=gpu_idx,
                 )
                 self._clip_push(clip_num, total, "transcribe", 100, f"{len(words)} words transcribed")
 
@@ -1636,6 +1641,7 @@ class ApiBridge:
                     try:
                         crop_params = get_crop_params_dynamic(
                             video_path, start, end, yolo_device=yolo_device, debug_frames=True,
+                            gpu_index=gpu_idx,
                         )
                     except Exception as e:
                         print(f"[!] Crop detection failed for clip {clip_num}: {e}")
@@ -1681,6 +1687,7 @@ class ApiBridge:
                     music_volume=music_volume,
                     music_trim_start=music_start,
                     music_trim_end=music_end,
+                    gpu_index=gpu_idx,
                 )
 
                 if clip_result and clip_result.path:
@@ -1711,13 +1718,17 @@ class ApiBridge:
 
                 return result
 
-            # Run clips in parallel (max_workers=2 to avoid GPU saturation)
+            # Run clips in parallel with VRAM-aware GPU assignment
+            max_workers = max(gpu_count, 1)
             futures = {}
-            with ThreadPoolExecutor(max_workers=2) as executor:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 for idx, m in enumerate(moments):
                     if self._cancel:
                         return self._cancelled()
-                    futures[executor.submit(_process_one, idx, m)] = idx
+                    gpu_idx = select_least_loaded_gpu(
+                        list(range(gpu_count)) if gpu_count > 0 else None
+                    ) if gpu_count > 0 else None
+                    futures[executor.submit(_process_one, idx, m, gpu_idx)] = idx
 
                 # Collect results in order of submission
                 ordered_results = [None] * total
