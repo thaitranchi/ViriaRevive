@@ -1,7 +1,16 @@
 from hwaccel import probe_ffmpeg, resolve_yolo_device, resolve_whisper_device
 import shutil
+import sys
 
 def check_hardware_support():
+    print(f"Python: {sys.executable}")
+    if sys.prefix == sys.base_prefix:
+        print("[!] WARNING: Not running in a virtual environment. Activate venv first:")
+        print("    .\\venv\\Scripts\\Activate")
+        print()
+    else:
+        print("[+] Virtual environment detected")
+
     print("[*] Probing FFmpeg for hardware support...")
     prof = probe_ffmpeg()
     
@@ -33,10 +42,14 @@ def check_hardware_support():
         else:
             print("\n[!] WARNING: PyTorch cannot see your GPU.")
             print("    To fix this, run:")
-            print("    pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118")
+            print("    pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124")
+            print("    Or (with requirements.txt):")
+            print("    pip install -r requirements.txt --index-url https://download.pytorch.org/whl/cu124")
             
     except ImportError:
         print("\n[!] FAILURE: 'torch' is not installed.")
+        print("    Run: pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124")
+        print("    Or:  pip install -r requirements.txt --index-url https://download.pytorch.org/whl/cu124")
 
     yolo = resolve_yolo_device("cuda")
     whisper_dev, whisper_compute = resolve_whisper_device("cuda")

@@ -12,3 +12,8 @@ pystray>=0.19.0
 Pillow>=10.0.0
 cryptography>=41.0.0
 keyring>=24.0.0
+# PyTorch (CUDA) — required for YOLO crop & faster-whisper GPU acceleration.
+# Install with: pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+torch>=2.0.0
+torchvision>=0.15.0
+torchaudio>=2.0.0
