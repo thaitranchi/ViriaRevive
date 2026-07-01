@@ -352,6 +352,8 @@ def _group_phrases(
 ) -> list:
     if not words:
         return []
+    if len(words) == 1:
+        return [{"words": words, "start": words[0]["start"], "end": words[0]["end"]}]
     phrases, cur = [], [words[0]]
     for w in words[1:]:
         prev = cur[-1]

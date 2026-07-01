@@ -22,6 +22,9 @@ from hwaccel import resolve_yolo_device
 
 import logging
 
+# OpenCV VideoCapture is not thread-safe; protect with a lock
+_cv2_lock = threading.Lock()
+
 # ── Constants ────────────────────────────────────────────────────────────────
 
 YUNET_MODEL = Path(__file__).parent / "models" / "face_detection_yunet.onnx"
@@ -402,12 +405,18 @@ def _detect_faces_haar(frame, cascades, scale=0.5):
 
 
 def _read_frame_safe(cap, msec=None, timeout=5.0):
-    """Read a frame from VideoCapture with a timeout to avoid hangs on corrupt video."""
+    """Read a frame from VideoCapture with a timeout to avoid hangs on corrupt video.
+    Uses threading lock because cv2.VideoCapture is not thread-safe.
+    """
+    if msec is not None:
+        with _cv2_lock:
+            cap.set(cv2.CAP_PROP_POS_MSEC, msec)
+
     result = [False, None]
 
     def _read():
-        if msec is not None: cap.set(cv2.CAP_PROP_POS_MSEC, msec)
-        result[0], result[1] = cap.read()
+        with _cv2_lock:
+            result[0], result[1] = cap.read()
 
     t = threading.Thread(target=_read, daemon=True)
     t.start()
@@ -495,6 +504,7 @@ def detect_all_persons(video_path, start, end, width, height, sample_count,
     debug_frame = test_frame # type: ignore # save first frame for debug output
     debug_saved = False
     last_good_persons = None # for gap-filling frames with no detection
+    last_good_time = -10.0  # timestamp of last valid detection
 
     # ── Process in chunks to save memory ──
     for i in range(0, len(sample_times), YOLO_BATCH_SIZE):
@@ -537,9 +547,15 @@ def detect_all_persons(video_path, start, end, width, height, sample_count,
                 new_persons = []
                 for hx, hy, a, c, h in persons:
                     if is_swapped:
-                        # Map raw (x,y) to rotated coordinate space
-                        # This is a simplified mapping; exact transpose depends on metadata
-                        new_hx, new_hy = int(hy * scale_x), int(hx * scale_y)
+                        # 90° or 270° rotation: swap x/y and handle scaling
+                        # Try both mappings and pick the one within frame bounds
+                        candidate1 = (int(hy * scale_x), int(hx * scale_y))
+                        candidate2 = (int((cv_w - hy) * scale_x), int((cv_h - hx) * scale_y))
+                        # Pick the candidate that places the head in the upper third
+                        if candidate1[1] < candidate2[1] or candidate2[1] >= height:
+                            new_hx, new_hy = candidate1
+                        else:
+                            new_hx, new_hy = candidate2
                     else:
                         new_hx, new_hy = int(hx * scale_x), int(hy * scale_y)
                     new_persons.append((new_hx, new_hy, int(a * scale_x * scale_y), c, int(h * scale_y)))
@@ -551,11 +567,13 @@ def detect_all_persons(video_path, start, end, width, height, sample_count,
                 if use_yolo: yolo_frames += 1
                 else: face_frames += 1
                 last_good_persons = persons
+                last_good_time = t
                 # Save debug frame only once for the first detection if debug_frames is True
                 if not debug_saved and use_yolo and debug_frames:
                     _save_debug_frame(frame, persons, width, height, scale_x, scale_y, video_path)
                     debug_saved = True
-            elif last_good_persons is not None:
+            elif last_good_persons is not None and t - last_good_time <= 5.0:
+                # Only reuse last detection if within 5 seconds (avoids stale tracking)
                 detections.append((t, last_good_persons))
 
     cap.release()

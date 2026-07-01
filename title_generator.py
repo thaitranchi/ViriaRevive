@@ -193,8 +193,8 @@ def generate_titles_batch(
                 return idx, title
         return idx, _heuristic_title(transcript)
 
-    # Run up to 3 concurrent Ollama requests (Ollama handles queuing internally)
-    workers = min(3, total) if model_ready else 1
+    # Run 1 request at a time (Ollama processes sequentially; concurrency causes hangs)
+    workers = 1
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {pool.submit(_gen_one, (i, t)): i for i, t in enumerate(transcripts)}
         for future in as_completed(futures):

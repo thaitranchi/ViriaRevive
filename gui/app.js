@@ -884,20 +884,33 @@ function confirmStyleAndGenerate() {
     document.getElementById('btn-cancel').classList.remove('hidden');
     document.getElementById('clip-cards').innerHTML = '';
 
-    // Submit all pending items to the backend task queue
-    state.batchQueue.forEach((item, i) => {
-        if (item.status === 'pending') {
+    // Submit all pending items to the backend task queue sequentially
+    (async () => {
+        for (let i = 0; i < state.batchQueue.length; i++) {
+            const item = state.batchQueue[i];
+            if (item.status !== 'pending') continue;
             item.status = 'queued';
+            renderBatchQueue();
             const isLocal = !!item.isFile;
-            pywebview.api.start_processing(
-                isLocal ? '' : item.url,
-                state.batchSettings,
-                isLocal ? item.url : null,
-                i // pass index so backend can report it back
-            );
+            try {
+                const r = await pywebview.api.start_processing(
+                    isLocal ? '' : item.url,
+                    state.batchSettings,
+                    isLocal ? item.url : null,
+                    i
+                );
+                if (r && r.error) {
+                    item.status = 'error';
+                    toast(`Failed: ${item.label} — ${r.error}`, 'error');
+                    renderBatchQueue();
+                }
+            } catch (e) {
+                item.status = 'error';
+                toast(`Failed: ${item.label}`, 'error');
+                renderBatchQueue();
+            }
         }
-    });
-    renderBatchQueue();
+    })();
 }
 
 async function cancelProcessing() {
@@ -1034,24 +1047,20 @@ async function processNextInQueue() {
     setDownloadStageLabel(isLocal);
 
     try {
-        let r = await pywebview.api.start_processing(
+        const r = await pywebview.api.start_processing(
             isLocal ? '' : item.url,
             state.batchSettings,
             isLocal ? item.url : null,
         );
-        if (r.error && r.error.includes('Already processing')) {
-            await new Promise(ok => setTimeout(ok, 1500));
-            r = await pywebview.api.start_processing(
-                isLocal ? '' : item.url,
-                state.batchSettings,
-                isLocal ? item.url : null,
-            );
-        }
         if (r.error) {
+            if (r.error.includes('Already processing')) {
+                // Another pipeline is still running; wait and retry
+                await new Promise(ok => setTimeout(ok, 2000));
+                return processNextInQueue();
+            }
             item.status = 'error';
             toast(`Failed: ${item.label} — ${r.error}`, 'error');
             renderBatchQueue();
-            // Continue to next
             processNextInQueue();
         }
         // Otherwise, onPipelineComplete will call processNextInQueue
@@ -1162,9 +1171,10 @@ function clearGlobalConsole() {
     document.getElementById('global-console-log').innerHTML = '';
 }
 
-function _appendLogLine(log, text) {
+function _appendLogLine(log, text, isDebug) {
     const line = document.createElement('div');
     line.className = 'log-line';
+    if (isDebug) line.classList.add('log-debug');
 
     // Color-code by prefix
     if (text.includes('[+]') || text.includes('complete') || text.includes('success'))

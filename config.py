@@ -21,12 +21,20 @@ CLIENT_SECRETS_FILE = BASE_DIR / "client_secrets.json"
 GEMINI_TOKEN_FILE = TOKENS_DIR / "gemini_key.json"
 
 # The Gemini API key is loaded from tokens/gemini_key.json to keep it out of source control.
+# It may be stored as a Fernet-encrypted blob (from GUI settings) or as a plaintext key.
+# If encrypted, config.py stores it as-is; api_bridge.py's _decrypt() handles decryption.
+# Direct consumers (e.g. gemini_client.py) must use api_bridge to get the decrypted key.
 GEMINI_API_KEY = ""
+GEMINI_API_KEY_ENCRYPTED = False
 if GEMINI_TOKEN_FILE.exists():
     try:
         with open(GEMINI_TOKEN_FILE, "r", encoding="utf-8") as f:
             _secrets = json.load(f)
-            GEMINI_API_KEY = _secrets.get("gemini_api_key", "")
+            _val = _secrets.get("gemini_api_key", "")
+            # Fernet tokens start with gAAAA
+            if _val.startswith("gAAAA"):
+                GEMINI_API_KEY_ENCRYPTED = True
+            GEMINI_API_KEY = _val
     except Exception:
         pass
 elif CLIENT_SECRETS_FILE.exists():
@@ -34,7 +42,10 @@ elif CLIENT_SECRETS_FILE.exists():
     try:
         with open(CLIENT_SECRETS_FILE, "r", encoding="utf-8") as f:
             _secrets = json.load(f)
-            GEMINI_API_KEY = _secrets.get("gemini_api_key", "")
+            _val = _secrets.get("gemini_api_key", "")
+            if _val.startswith("gAAAA"):
+                GEMINI_API_KEY_ENCRYPTED = True
+            GEMINI_API_KEY = _val
     except Exception:
         pass
 

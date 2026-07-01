@@ -275,7 +275,10 @@ def process(
             interval_hours=schedule_hours,
         )
         for item in sched:
-            idx = done.index(item["path"]) + 1
+            try:
+                idx = done.index(item["path"]) + 1
+            except ValueError:
+                idx = 0
             upload_to_youtube(
                 item["path"],
                 title=all_titles[idx-1] if (all_titles and idx-1 < len(all_titles)) else f"{stem} – Viral Clip #{idx}",
@@ -303,7 +306,7 @@ def main():
     p.add_argument("--title-language", default=None, help="force AI title language (Spanish, French …)")
     p.add_argument("-u", "--upload",   action="store_true", help="upload clips to YouTube")
     p.add_argument("--schedule",       type=int, default=24, help="hours between scheduled uploads")
-    p.add_argument("--no-crop",        action="store_true", help="ignored; Shorts-ready output is always 1080x1920")
+    p.add_argument("--no-crop",        action="store_true", help="skip YOLO person-detection cropping (uses center crop)")
     p.add_argument("--ai-detector", choices=["auto", "off", "on"], default=AI_DETECTOR_MODE, help="local Ollama AI detector mode")
 
     a = p.parse_args()

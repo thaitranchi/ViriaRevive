@@ -13,11 +13,24 @@ def is_available(api_key: Optional[str]) -> bool:
     return bool(api_key and not api_key.startswith("YOUR_"))
 
 
+def _build_url(api_key: str) -> str:
+    """Build Gemini API URL (key goes in header, not URL, to avoid exposure in logs)."""
+    return f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent"
+
+
+def _build_headers(api_key: str) -> dict:
+    """Build request headers with API key in x-goog-api-key header."""
+    return {
+        "Content-Type": "application/json",
+        "x-goog-api-key": api_key,
+    }
+
+
 def test_connection(api_key: str, timeout: int = 15) -> dict:
     """Verify a Gemini API key with a minimal generateContent request."""
     if not is_available(api_key):
         return {"ok": False, "error": "Invalid or missing API key"}
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent?key={api_key}"
+    url = _build_url(api_key)
     payload = {
         "contents": [{"parts": [{"text": "Reply with OK only."}]}],
         "generationConfig": {"maxOutputTokens": 8},
@@ -25,7 +38,7 @@ def test_connection(api_key: str, timeout: int = 15) -> dict:
     req = urllib.request.Request(
         url,
         data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        headers=_build_headers(api_key),
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -45,11 +58,11 @@ def test_connection(api_key: str, timeout: int = 15) -> dict:
 
 def _post(api_key: str, payload: dict, timeout: int) -> Optional[dict]:
     """Internal helper to send a POST request to Gemini."""
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent?key={api_key}"
+    url = _build_url(api_key)
     req = urllib.request.Request(
         url,
         data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"}
+        headers=_build_headers(api_key),
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:

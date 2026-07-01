@@ -3,6 +3,7 @@
 import subprocess
 import sys
 import threading
+import time
 
 # On Windows, prevent ffmpeg/ffprobe from flashing a console window
 _CREATION_FLAGS = (
@@ -41,6 +42,25 @@ def is_cancelled() -> bool:
 class CancelledError(Exception):
     """Raised when a subprocess is interrupted by cancellation."""
     pass
+
+
+def _kill_process_tree(proc):
+    """Kill a process and all its children. On Windows uses taskkill /T /F."""
+    if sys.platform == "win32":
+        try:
+            subprocess.run(
+                ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                capture_output=True, timeout=5,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+        except Exception:
+            proc.kill()
+    else:
+        proc.terminate()
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.kill()
 
 
 def run(*args, **kwargs):
@@ -94,30 +114,22 @@ def run(*args, **kwargs):
             t.start()
             drain_threads.append(t)
 
-        # Poll the process, checking cancel flag every 0.5s
-        elapsed = 0.0
+        # Poll the process, checking cancel flag every 2s
+        _start_time = time.monotonic()
         poll_interval = 2.0
         while proc.poll() is None:
             if _cancel_flag.is_set():
-                proc.terminate()
-                try:
-                    proc.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
+                _kill_process_tree(proc)
                 raise CancelledError("Pipeline cancelled")
+            elapsed = time.monotonic() - _start_time
             if timeout is not None and elapsed >= timeout:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
+                _kill_process_tree(proc)
                 raise subprocess.TimeoutExpired(proc.args, timeout)
             # Wait a bit before next poll
             try:
                 proc.wait(timeout=poll_interval)
             except subprocess.TimeoutExpired:
                 pass
-            elapsed += poll_interval
 
         # Check cancel one more time after process exits (process may have been
         # killed externally by request_cancel via _active_processes)

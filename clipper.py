@@ -104,7 +104,7 @@ def _prepare_subtitle_file(subtitle_path: Path, output_stem: str) -> tuple[Path 
     """
     if not subtitle_path or not Path(subtitle_path).exists():
         return None, None
-    if Path(subtitle_path).stat().st_size <= 50:
+    if Path(subtitle_path).stat().st_size < 20:
         return None, None
 
     sub_dir = Path(tempfile.gettempdir()) / "viria_subs"

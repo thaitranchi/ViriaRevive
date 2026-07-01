@@ -25,10 +25,23 @@ def main():
 
     api = ApiBridge()
     gui_dir = _get_base_dir() / "gui"
+    gui_html = gui_dir / "index.html"
+
+    if not gui_html.exists():
+        # Fallback: serve an inline error page so the user sees something useful
+        fallback = f"""
+<!DOCTYPE html><html><body style="background:#0a0a0f;color:#eee;font-family:sans-serif;
+padding:40px;text-align:center"><h1>ViriaRevive</h1>
+<p style="color:#f88">GUI files not found.</p>
+<p>Expected: <code>{gui_html}</code></p>
+<p>Try reinstalling or building the app.</p></body></html>"""
+        _url = f"data:text/html,{fallback.replace(chr(10),'').replace(chr(13),'')}"
+    else:
+        _url = str(gui_html)
 
     window = webview.create_window(
         title="ViriaRevive",
-        url=str(gui_dir / "index.html"),
+        url=_url,
         js_api=api,
         width=1100,
         height=750,

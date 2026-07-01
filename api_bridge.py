@@ -1155,19 +1155,20 @@ class ApiBridge:
 
     def delete_clip(self, clip_index):
         """Delete a clip by its index in the current results list."""
-        if 0 <= clip_index < len(self._results): # type: ignore
-            p = self._results[clip_index]
-            try:
-                if p.exists():
-                    self._robust_unlink(p)
-                self._results.pop(clip_index)
-                # Remove matching moments entry
-                if clip_index < len(self._moments):
-                    self._moments.pop(clip_index)
-                self._save_state() # type: ignore
-                return {"ok": True}
-            except Exception as e:
-                return {"error": str(e)}
+        with self._state_lock:
+            if 0 <= clip_index < len(self._results): # type: ignore
+                p = self._results[clip_index]
+                try:
+                    if p.exists():
+                        self._robust_unlink(p)
+                    self._results.pop(clip_index)
+                    # Remove matching moments entry
+                    if clip_index < len(self._moments):
+                        self._moments.pop(clip_index)
+                    self._save_state() # type: ignore
+                    return {"ok": True}
+                except Exception as e:
+                    return {"error": str(e)}
         return {"error": "Invalid clip index"}
 
     def delete_library_file(self, filename):
@@ -1573,7 +1574,8 @@ class ApiBridge:
                 m.pop("_words", None) # type: ignore
 
             # Append moments (batch mode: preserve previous video's moments)
-            self._moments.extend(moments)
+            with self._state_lock:
+                self._moments.extend(moments)
 
             self._push("detect", 100, f"Found {len(moments)} moments")
             self._js(f"window.onMomentsDetected({json.dumps(moments)}, {self._active_item_index if self._active_item_index is not None else 'null'})")
@@ -1756,7 +1758,8 @@ class ApiBridge:
             done = [r for r in ordered_results if r is not None]
 
             # Append results (batch mode: preserve previous video's clips)
-            self._results.extend(done)
+            with self._state_lock:
+                self._results.extend(done)
             self._save_state()
             self._js(f"window.onPipelineComplete(true, {len(done)}, {total}, null, {self._active_item_index if self._active_item_index is not None else 'null'})")
 
@@ -1812,11 +1815,14 @@ class ApiBridge:
         DOWNLOADS_DIR.mkdir(exist_ok=True)
 
         # Prefer H.264 (avc1) — universally supported by ffmpeg.
+        # Fall back to any codec if avc1/mp4a not available for the video.
         # restrictfilenames removes unicode chars that break Windows paths.
         fmt = (
             "bestvideo[vcodec^=avc1][height<=1080]+bestaudio[acodec^=mp4a]/"
             "bestvideo[vcodec^=avc1][height<=1080]+bestaudio/"
             "bestvideo[height<=1080]+bestaudio/"
+            "bestvideo[height<=1080]+worstaudio/"
+            "bestvideo+bestaudio/"
             "best"
         )
         ydl_opts = {
@@ -1835,6 +1841,8 @@ class ApiBridge:
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
+            if self._cancel:
+                raise CancelledError("Download cancelled after completion")
             return Path(ydl.prepare_filename(info))
 
     # ── Upload orchestrator (background thread) ──────────────────────────
@@ -1851,7 +1859,7 @@ class ApiBridge:
             for i, meta in enumerate(clips_metadata):
                 if self._cancel:
                     self._js(f"window.onUploadComplete(false, {uploaded}, 'Cancelled')")
-                    return self._cancelled()
+                    return
                 pct = int((i / total) * 100)
                 self._push("upload", pct, f"Uploading clip {i + 1}/{total}...")
 
@@ -2098,4 +2106,6 @@ class ApiBridge:
 
     @staticmethod
     def _esc(s):
-        return str(s).replace("\\", "\\\\").replace("`", "\\`").replace("$", "\\$")
+        return str(s).replace("\\", "\\\\").replace("`", "\\`").replace("$", "\\$") \
+                      .replace("\n", "\\n").replace("\r", "\\r") \
+                      .replace("'", "\\'")
