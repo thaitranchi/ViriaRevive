@@ -1360,6 +1360,23 @@ window.onScheduleUpdated = function () {
     }).catch(() => { });
 };
 
+window.onUploadComplete = function (success, count, errorMsg) {
+    document.getElementById('btn-upload').disabled = false;
+    if (success) {
+        document.getElementById('upload-progress-card').classList.add('hidden');
+        toast(`${count} clip${count > 1 ? 's' : ''} uploaded successfully`, 'success');
+        addNotification('Upload Complete', `${count} clip${count > 1 ? 's' : ''} uploaded to YouTube`, 'success');
+        pywebview.api.get_all_scheduled().then(r => {
+            if (r.scheduled) state.scheduled = r.scheduled;
+            renderCalendar();
+            renderTimeline();
+        }).catch(() => { });
+    } else {
+        toast(errorMsg || 'Upload failed', 'error');
+        addNotification('Upload Error', errorMsg || 'Upload failed', 'error');
+    }
+};
+
 /* ── Progress Helpers ──────────────────────────────────────────────────── */
 
 function setProgress(pct, msg) {
@@ -1813,14 +1830,20 @@ async function connectYouTube() {
 
 async function disconnectAccount(accountId) {
     try {
-        await pywebview.api.disconnect_youtube(accountId);
+        const r = await pywebview.api.disconnect_youtube(accountId);
+        if (r && r.error) {
+            toast(r.error, 'error');
+            return;
+        }
         // Refresh channels
         await loadChannelsAndCategories();
         const hasAccounts = state.channels.length > 0;
         state.ytConnected = hasAccounts;
         updateYtUI(hasAccounts);
         toast('Account removed', 'success');
-    } catch (_) { }
+    } catch (e) {
+        toast('Failed to disconnect: ' + e, 'error');
+    }
 }
 
 function updateYtUI(connected) {
@@ -1914,6 +1937,26 @@ function updateCategoryDropdowns() {
         });
         if (cur) sel.value = cur;
     });
+}
+
+function updateModalCategoryDropdown() {
+    const sel = document.getElementById('modal-meta-category');
+    if (!sel) return;
+    const cur = sel.value;
+    sel.innerHTML = '';
+    const defaultCat = state.settings.upload_category || '20';
+    state.categories.forEach(cat => {
+        const opt = document.createElement('option');
+        opt.value = cat.id; opt.textContent = cat.title;
+        if (cat.id === defaultCat) opt.selected = true;
+        sel.appendChild(opt);
+    });
+    if (cur) sel.value = cur;
+}
+
+function onRegionChange() {
+    // Region changed — could refresh categories if needed in future
+    toast('YouTube region updated', 'info');
 }
 
 /* ── Upload / Calendar Section ────────────────────────────────────────── */
@@ -2544,9 +2587,15 @@ function _scheduleClipIndices(clipIndices, opts = {}) {
         return usedCount % perDay;
     })();
 
+    // Build set of already-scheduled clipIdx values to avoid duplicates
+    const existingScheduled = new Set(
+        state.scheduled.filter(s => !s.uploaded).map(s => s.clipIdx)
+    );
+
     clipIndices.forEach(i => {
         const clip = state.results[i];
         if (!clip) return;
+        if (existingScheduled.has(i)) return;
 
         const d = new Date(startDate);
         d.setDate(d.getDate() + dayOffset);
@@ -3125,8 +3174,8 @@ async function startUpload() {
         interval = Math.max(1, (last - first) / (3600000 * (sorted.length - 1)));
     }
 
-    // Store channel_id in each scheduled item for background scheduler
-    state.scheduled.forEach(s => { s.channel_id = state.selectedChannel; });
+    // Set channel_id for items that don't have one yet (preserve per-item assignments)
+    state.scheduled.forEach(s => { if (!s.channel_id) s.channel_id = state.selectedChannel; });
     pywebview.api.save_scheduled(state.scheduled);
 
     document.getElementById('upload-progress-card').classList.remove('hidden');
@@ -3145,11 +3194,13 @@ async function startUpload() {
             toast(r.error, 'error');
             addNotification('Upload Error', r.error, 'error');
             document.getElementById('btn-upload').disabled = false;
+            document.getElementById('upload-progress-card').classList.add('hidden');
         }
     } catch (e) {
         toast('Upload failed: ' + e, 'error');
         addNotification('Upload Failed', String(e), 'error');
         document.getElementById('btn-upload').disabled = false;
+        document.getElementById('upload-progress-card').classList.add('hidden');
     }
 }
 

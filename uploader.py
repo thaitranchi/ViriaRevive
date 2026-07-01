@@ -4,7 +4,8 @@ import json
 import os
 import sys
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+UTC = timezone.utc
 
 # In PyInstaller frozen builds, __file__ points to temp _MEIPASS dir.
 # Secrets and tokens must live next to the .exe so they persist.
@@ -319,8 +320,10 @@ def upload_to_youtube(
 
     # Ensure Shorts format — append #Shorts to title and description
     if "#Shorts" not in title and "#shorts" not in title:
+        title = title[:100 - len(" #Shorts")]  # truncate first, then append
         title = f"{title} #Shorts"
-    title = title[:100]
+    else:
+        title = title[:100]
     if "#Shorts" not in description and "#shorts" not in description:
         description = f"{description}\n\n#Shorts".strip() if description else "#Shorts"
     if tags is None:
@@ -345,7 +348,13 @@ def upload_to_youtube(
         },
     }
     if scheduled_time:
-        body["status"]["publishAt"] = scheduled_time.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        # Convert to UTC for YouTube API (YouTube expects RFC 3339 / ISO 8601 with Z)
+        if scheduled_time.tzinfo is None:
+            # Naive datetime — assume local time, then make aware
+            local_tz = datetime.now().astimezone().tzinfo
+            scheduled_time = scheduled_time.replace(tzinfo=local_tz)
+        utc_time = scheduled_time.astimezone(UTC)
+        body["status"]["publishAt"] = utc_time.strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
     media = MediaFileUpload(str(video_path), chunksize=-1, resumable=True, mimetype="video/mp4")
 

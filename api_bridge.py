@@ -255,6 +255,7 @@ class ApiBridge:
         self._worker_thread = None
         self._worker_lock = threading.Lock()
         self._state_lock = threading.Lock()
+        self._scheduled_lock = threading.Lock()
         self._active_item_index = None
 
         self._results: list[Path] = []
@@ -264,6 +265,7 @@ class ApiBridge:
         self._delete_after_upload = False   # auto-delete clips after YouTube upload
         self._user_settings: dict = {}      # user settings persisted to disk
         self._pending_js: list[str] = []    # JS calls queued while window was hidden
+        self._uploading_indices: set = set()  # prevent double-upload/delete
 
         # Install log interceptor so print() output goes to the GUI console
         global _log_bridge
@@ -839,9 +841,9 @@ class ApiBridge:
             result = add_account()
             return {"ok": True, "account": result}
         except FileNotFoundError as e:
-            return {"error": str(e)}
+            return {"ok": False, "error": str(e)}
         except Exception as e:
-            return {"error": f"Connection failed: {e}"}
+            return {"ok": False, "error": f"Connection failed: {e}"}
 
     def add_youtube_account(self):
         """Alias for connect_youtube — adds another account."""
@@ -1021,7 +1023,6 @@ class ApiBridge:
         self._active_item_index = None
 
     def cancel_processing(self):
-        self._cancel = False
         self._cancel = True
         
         # Clear the pending queue
@@ -1243,8 +1244,18 @@ class ApiBridge:
 
     def save_scheduled(self, scheduled_list):
         """Replace the full scheduled list (called from JS on every change)."""
-        self._scheduled = scheduled_list or []
-        self._save_state() # type: ignore
+        if not isinstance(scheduled_list, list):
+            return {"ok": False, "error": "Expected a list"}
+        # Validate each item has required fields
+        for item in scheduled_list:
+            if not isinstance(item, dict):
+                return {"ok": False, "error": "Each scheduled item must be a dict"}
+            for key in ("clipIdx", "date", "time", "title", "uploaded"):
+                if key not in item:
+                    return {"ok": False, "error": f"Scheduled item missing required field: {key}"}
+        with self._scheduled_lock:
+            self._scheduled = scheduled_list
+            self._save_state() # type: ignore
         return {"ok": True}
 
     def get_all_scheduled(self):
@@ -1253,16 +1264,18 @@ class ApiBridge:
 
     # ── Exposed: upload ──────────────────────────────────────────────────
 
-    def start_upload(self, clips_metadata, schedule_start, interval_hours, channel_id=None):
+    def start_upload(self, clips_metadata, schedule_start, interval_hours, channel_id=None, item_index=None):
         """Upload clips with per-clip metadata.
 
         clips_metadata: list of {index, title, description, tags, category_id, privacy}
         channel_id: YouTube channel ID to upload to (from get_channels())
+        item_index: batch queue index for progress callbacks
         """
         if self._processing:
             return {"error": "Processing in progress"}
         self._processing = True
         self._cancel = False
+        self._active_item_index = item_index
         threading.Thread(
             target=self._run_upload,
             args=(clips_metadata, schedule_start, interval_hours, channel_id),
@@ -1828,11 +1841,16 @@ class ApiBridge:
 
     def _run_upload(self, clips_metadata, schedule_start_iso, interval_hours, channel_id=None):
         try:
-            start_time = datetime.fromisoformat(schedule_start_iso) if schedule_start_iso else None
+            start_time = None
+            if schedule_start_iso:
+                start_time = datetime.fromisoformat(schedule_start_iso)
+                start_time = start_time.astimezone()  # make timezone-aware (local time)
             total = len(clips_metadata)
+            uploaded = 0
 
             for i, meta in enumerate(clips_metadata):
                 if self._cancel:
+                    self._js(f"window.onUploadComplete(false, {uploaded}, 'Cancelled')")
                     return self._cancelled()
                 pct = int((i / total) * 100)
                 self._push("upload", pct, f"Uploading clip {i + 1}/{total}...")
@@ -1846,7 +1864,7 @@ class ApiBridge:
                 if start_time:
                     scheduled = start_time + timedelta(hours=int(interval_hours) * i)
 
-                upload_to_youtube(
+                result = upload_to_youtube(
                     video_path,
                     title=meta.get("title", f"Viral Clip #{i + 1}"),
                     description=meta.get("description", ""),
@@ -1857,12 +1875,17 @@ class ApiBridge:
                     channel_id=channel_id,
                 )
 
+                if result is None:
+                    raise RuntimeError(f"Upload failed for clip {i + 1}")
+
+                uploaded += 1
+
                 # Auto-delete from disk after successful upload
                 if self._delete_after_upload:
                     self._delete_uploaded_clip(idx, video_path)
 
             self._push("upload", 100, f"All {total} clips uploaded!")
-            self._js(f"window.onPipelineComplete(true, {total}, {total}, null)") # type: ignore
+            self._js(f"window.onUploadComplete(true, {uploaded}, null)") # type: ignore
 
         except Exception as e:
             self._error(f"Upload failed: {e}")
@@ -1875,65 +1898,93 @@ class ApiBridge:
     def _scheduler_loop(self):
         """Check every 30s for scheduled uploads whose time has arrived."""
         while self._scheduler_running:
-            now = datetime.now()
+            now = datetime.now().astimezone()
             changed = False
 
-            for item in self._scheduled:
+            with self._scheduled_lock:
+                items = list(self._scheduled)
+
+            for item in items:
                 if item.get("uploaded"):
                     continue
                 try:
-                    sched_dt = datetime.fromisoformat(f"{item['date']}T{item['time']}") # type: ignore
-                except (KeyError, ValueError):
+                    sched_dt = datetime.fromisoformat(f"{item['date']}T{item['time']}")  # type: ignore
+                    # Make timezone-aware (assume local time)
+                    local_tz = datetime.now().astimezone().tzinfo
+                    sched_dt = sched_dt.replace(tzinfo=local_tz)
+                except KeyError:
+                    print(f"[scheduler] Warning: skipping malformed schedule item (missing keys): {item}")
+                    continue
+                except ValueError:
+                    print(f"[scheduler] Warning: skipping schedule item with invalid date/time: {item}")
                     continue
 
                 if now >= sched_dt:
                     clip_idx = item.get("clipIdx", -1)
-                    if 0 <= clip_idx < len(self._results):
-                        video_path = self._results[clip_idx]
-                        if video_path.exists(): # type: ignore
-                            title = item.get("title", f"Viral Clip #{clip_idx + 1}")
-                            print(f"[scheduler] Uploading Clip {clip_idx + 1}: {title}")
-                            self._js(f"window.onSchedulerStatus('Uploading: {self._esc(title)}')")
-                            try:
-                                tags = item.get("tags", "shorts, viral, clips")
-                                if isinstance(tags, str):
-                                    tags = [t.strip() for t in tags.split(",") if t.strip()]
-                                upload_to_youtube(
-                                    video_path,
-                                    title=title,
-                                    description=item.get("description", ""),
-                                    tags=tags,
-                                    category_id=str(item.get("category_id", "22")),
-                                    privacy=item.get("privacy", "private"),
-                                    channel_id=item.get("channel_id"),
-                                )
-                                item["uploaded"] = True
-                                changed = True # type: ignore
-                                print(f"[scheduler] Uploaded: {title}")
-                                self._js(f"window.onScheduledUploadDone({clip_idx}, true, null)")
+                    if clip_idx < 0 or clip_idx >= len(self._results):
+                        print(f"[scheduler] Warning: clipIdx {clip_idx} out of range (results have {len(self._results)} clips), marking as uploaded")
+                        item["uploaded"] = True
+                        changed = True
+                        continue
+                    video_path = self._results[clip_idx]
+                    if not video_path.exists(): # type: ignore
+                        print(f"[scheduler] Warning: clip file missing: {video_path}, marking as uploaded")
+                        item["uploaded"] = True
+                        changed = True
+                        continue
 
-                                # Auto-delete from disk after successful upload
-                                if self._delete_after_upload:
-                                    self._delete_uploaded_clip(clip_idx, video_path)
+                    title = item.get("title", f"Viral Clip #{clip_idx + 1}")
+                    print(f"[scheduler] Uploading Clip {clip_idx + 1}: {title}")
+                    self._js(f"window.onSchedulerStatus('Uploading: {self._esc(title)}')")
+                    try:
+                        tags = item.get("tags", "shorts, viral, clips")
+                        if isinstance(tags, str):
+                            tags = [t.strip() for t in tags.split(",") if t.strip()]
+                        result = upload_to_youtube(
+                            video_path,
+                            title=title,
+                            description=item.get("description", ""),
+                            tags=tags,
+                            category_id=str(item.get("category_id", "22")),
+                            privacy=item.get("privacy", "private"),
+                            channel_id=item.get("channel_id"),
+                        )
+                        if result is None:
+                            raise RuntimeError("upload_to_youtube returned None")
 
-                            except Exception as e:
-                                print(f"[scheduler] Upload failed: {e}")
-                                self._js(f"window.onScheduledUploadDone({clip_idx}, false, `{self._esc(str(e))}`)")
+                        item["uploaded"] = True
+                        changed = True # type: ignore
+                        print(f"[scheduler] Uploaded: {title}")
+                        self._js(f"window.onScheduledUploadDone({clip_idx}, true, null)")
+
+                        # Auto-delete from disk after successful upload
+                        if self._delete_after_upload:
+                            self._delete_uploaded_clip(clip_idx, video_path)
+
+                    except Exception as e:
+                        print(f"[scheduler] Upload failed: {e}")
+                        self._js(f"window.onScheduledUploadDone({clip_idx}, false, `{self._esc(str(e))}`)")
 
             if changed:
-                self._save_state() # type: ignore
+                with self._scheduled_lock:
+                    self._save_state() # type: ignore
                 self._js("window.onScheduleUpdated()")
 
             time.sleep(30)
 
     def _delete_uploaded_clip(self, clip_idx, video_path):
         """Delete a clip file from disk after successful upload."""
+        if clip_idx in self._uploading_indices:
+            return  # already being handled
+        self._uploading_indices.add(clip_idx)
         try:
             if self._robust_unlink(video_path):
                 logger.info(f"Deleted uploaded clip: {video_path.name}")
                 self._js(f"window.onClipDeleted({clip_idx}, `{self._esc(video_path.name)}`)")
         except Exception as e:
             print(f"[cleanup] Failed to delete {video_path.name}: {e}")
+        finally:
+            self._uploading_indices.discard(clip_idx)
 
     # ── State persistence ────────────────────────────────────────────────
 
