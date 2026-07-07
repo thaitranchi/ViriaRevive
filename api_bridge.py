@@ -255,6 +255,7 @@ class ApiBridge:
         self._worker_lock = threading.Lock()
         self._state_lock = threading.Lock()
         self._scheduled_lock = threading.Lock()
+        self._pending_js_lock = threading.Lock()
         self._active_item_index = None
 
         self._results: list[Path] = []
@@ -541,26 +542,25 @@ class ApiBridge:
         If transcripts are missing (e.g. clips from a previous session where
         moments were lost), auto-transcribe the clip audio first.
         """
-        num_clips = len(self._results)
-        # Sync moments to match results count exactly
-        if len(self._moments) > num_clips:
-            self._moments = self._moments[:num_clips]
-        while len(self._moments) < num_clips:
-            self._moments.append({})
-
-        # Backfill any clips missing transcripts
-        # If using Gemini, we only need to backfill if we want titles right now
-        results_count = len(self._results)
-        if num_clips > results_count:
-            num_clips = results_count
-        missing = [i for i in range(results_count)
-                   if not self._moments[i].get("transcript")]
+        with self._state_lock:
+            num_clips = len(self._results)
+            # Sync moments to match results count exactly
+            if len(self._moments) > num_clips:
+                self._moments = self._moments[:num_clips]
+            while len(self._moments) < num_clips:
+                self._moments.append({})
+            results_count = len(self._results)
+            if num_clips > results_count:
+                num_clips = results_count
+            missing = [i for i in range(results_count)
+                       if not self._moments[i].get("transcript")]
         if missing:
             for i in missing:
                 self._backfill_transcript_single(i)
             self._save_state()
 
-        transcripts = [m.get("transcript", "") for m in self._moments]
+        with self._state_lock:
+            transcripts = [m.get("transcript", "") for m in self._moments]
         if not any(transcripts):
             return {"titles": [], "error": "No transcripts available — process clips first"}
 
@@ -570,8 +570,9 @@ class ApiBridge:
     def generate_title_for_clip(self, clip_index):
         """Generate a title for a single clip."""
         # Ensure moments list matches results length
-        while len(self._moments) < len(self._results):
-            self._moments.append({})
+        with self._state_lock:
+            while len(self._moments) < len(self._results):
+                self._moments.append({})
 
         if clip_index < 0 or clip_index >= len(self._moments):
             return {"title": "", "error": "Invalid clip index"}
@@ -620,7 +621,8 @@ class ApiBridge:
 
         try:
             old_path.rename(new_path)
-            self._results[clip_index] = new_path
+            with self._state_lock:
+                self._results[clip_index] = new_path
             self._save_state() # type: ignore
             print(f"[rename] {old_path.name} → {new_path.name}")
             return {"filename": new_path.name, "path": str(new_path)}
@@ -662,13 +664,14 @@ class ApiBridge:
             num_clips = len(self._results) # type: ignore
             print(f"[title-gen] {num_clips} clips, {len(self._moments)} moments in state")
 
-            # Trim moments to match results (moments can accumulate beyond results
-            # if clips were deleted or state got out of sync)
-            if len(self._moments) > num_clips:
-                self._moments = self._moments[:num_clips]
-            # Pad if fewer
-            while len(self._moments) < num_clips:
-                self._moments.append({})
+            with self._state_lock:
+                # Trim moments to match results (moments can accumulate beyond results
+                # if clips were deleted or state got out of sync)
+                if len(self._moments) > num_clips:
+                    self._moments = self._moments[:num_clips]
+                # Pad if fewer
+                while len(self._moments) < num_clips:
+                    self._moments.append({})
 
             # Determine which indices to process
             target_indices = only_indices if only_indices is not None else list(range(num_clips))
@@ -756,8 +759,9 @@ class ApiBridge:
             return
 
         # Ensure moments slot exists
-        while len(self._moments) <= clip_index:
-            self._moments.append({})
+        with self._state_lock:
+            while len(self._moments) <= clip_index:
+                self._moments.append({})
         
         try:
             wav = Path(tempfile.gettempdir()) / f"viria_backfill_{clip_index}.wav"
@@ -1070,26 +1074,27 @@ class ApiBridge:
     # ── Exposed: results ─────────────────────────────────────────────────
 
     def get_results(self):
-        clips = []
-        for i, p in enumerate(self._results): # type: ignore
-            try:
-                st = p.stat()
-                size_mb = round(st.st_size / (1024 * 1024), 1)
-                url = f"http://127.0.0.1:{self._video_port}/{p.name}"
-            except OSError:
-                size_mb = 0
-                url = ""
-            clip = {
-                "path": str(p),
-                "filename": p.name,
-                "size_mb": size_mb,
-                "url": url,
-            }
-            # Include source_stem for grouping renamed clips
-            if i < len(self._moments) and self._moments[i].get("source_stem"):
-                clip["source_stem"] = self._moments[i]["source_stem"]
-            clips.append(clip)
-        return {"clips": clips, "moments": self._moments}
+        with self._state_lock:
+            clips = []
+            for i, p in enumerate(self._results): # type: ignore
+                try:
+                    st = p.stat()
+                    size_mb = round(st.st_size / (1024 * 1024), 1)
+                    url = f"http://127.0.0.1:{self._video_port}/{p.name}"
+                except OSError:
+                    size_mb = 0
+                    url = ""
+                clip = {
+                    "path": str(p),
+                    "filename": p.name,
+                    "size_mb": size_mb,
+                    "url": url,
+                }
+                # Include source_stem for grouping renamed clips
+                if i < len(self._moments) and self._moments[i].get("source_stem"):
+                    clip["source_stem"] = self._moments[i]["source_stem"]
+                clips.append(clip)
+            return {"clips": clips, "moments": self._moments}
 
     def open_output_folder(self):
         try:
@@ -1216,7 +1221,8 @@ class ApiBridge:
             try:
                 self._robust_unlink(target)
                 # Also remove from results if it was there
-                self._results = [p for p in self._results if p.name != filename]
+                with self._state_lock:
+                    self._results = [p for p in self._results if p.name != filename]
                 self._save_state()
                 return {"ok": True} # type: ignore
             except Exception as e:
@@ -1260,20 +1266,22 @@ class ApiBridge:
         Returns the updated results list.
         """
         _exts = {'.mp4', '.mkv', '.avi', '.mov', '.webm'}
-        existing = {p.resolve() for p in self._results if p.exists()}
-        added = 0
+        with self._state_lock:
+            existing = {p.resolve() for p in self._results if p.exists()}
+            added = 0
 
-        if self._clips_dir.exists(): # type: ignore
-            for p in sorted(self._clips_dir.iterdir(), key=lambda x: x.stat().st_mtime):
-                if p.suffix.lower() in _exts and p.resolve() not in existing:
-                    self._results.append(p)
-                    existing.add(p.resolve())
-                    added += 1
+            if self._clips_dir.exists(): # type: ignore
+                for p in sorted(self._clips_dir.iterdir(), key=lambda x: x.stat().st_mtime):
+                    if p.suffix.lower() in _exts and p.resolve() not in existing:
+                        self._results.append(p)
+                        existing.add(p.resolve())
+                        added += 1
 
+            if added:
+                # Ensure moments metadata list matches results length
+                while len(self._moments) < len(self._results):
+                    self._moments.append({})
         if added:
-            # Ensure moments metadata list matches results length
-            while len(self._moments) < len(self._results):
-                self._moments.append({})
             self._save_state() # type: ignore
             print(f"[+] Imported {added} clip(s) from clips folder")
 
@@ -1369,26 +1377,27 @@ class ApiBridge:
 
     def load_persisted_state(self):
         """Return persisted results/moments/scheduled for frontend init."""
-        clips = [] # type: ignore
-        for i, p in enumerate(self._results):
-            try:
-                st = p.stat()
-            except OSError:
-                continue
-            clip = {
-                "path": str(p),
-                "filename": p.name,
-                "size_mb": round(st.st_size / (1024 * 1024), 1),
+        with self._state_lock:
+            clips = []
+            for i, p in enumerate(self._results):
+                try:
+                    st = p.stat()
+                except OSError:
+                    continue
+                clip = {
+                    "path": str(p),
+                    "filename": p.name,
+                    "size_mb": round(st.st_size / (1024 * 1024), 1),
+                }
+                # Include source_stem so frontend can group renamed clips by source video
+                if i < len(self._moments) and self._moments[i].get("source_stem"):
+                    clip["source_stem"] = self._moments[i]["source_stem"]
+                clips.append(clip)
+            return {
+                "clips": clips,
+                "moments": self._moments[:len(self._results)],
+                "scheduled": list(self._scheduled),
             }
-            # Include source_stem so frontend can group renamed clips by source video
-            if i < len(self._moments) and self._moments[i].get("source_stem"):
-                clip["source_stem"] = self._moments[i]["source_stem"]
-            clips.append(clip)
-        return {
-            "clips": clips,
-            "moments": self._moments[:len(self._results)],
-            "scheduled": self._scheduled,
-        }
 
     # ── Pipeline orchestrator (background thread) ────────────────────────
 
@@ -2098,21 +2107,23 @@ class ApiBridge:
         # but ALWAYS keep completion/error/cancel callbacks.
         is_progress = "onPipelineProgress" in code or "onClipProgress" in code
         is_console = "onConsoleLog" in code
-        if is_progress:
-            # Replace previous progress of same type
-            self._pending_js = [c for c in self._pending_js
-                                if ("onPipelineProgress" not in c and "onClipProgress" not in c)]
-        if is_console and len([c for c in self._pending_js if "onConsoleLog" in c]) > 200:
-            # Trim old console logs to avoid memory bloat
-            non_console = [c for c in self._pending_js if "onConsoleLog" not in c]
-            console = [c for c in self._pending_js if "onConsoleLog" in c][-100:]
-            self._pending_js = non_console + console
-        self._pending_js.append(code)
+        with self._pending_js_lock:
+            if is_progress:
+                # Replace previous progress of same type
+                self._pending_js = [c for c in self._pending_js
+                                    if ("onPipelineProgress" not in c and "onClipProgress" not in c)]
+            if is_console and len([c for c in self._pending_js if "onConsoleLog" in c]) > 200:
+                # Trim old console logs to avoid memory bloat
+                non_console = [c for c in self._pending_js if "onConsoleLog" not in c]
+                console = [c for c in self._pending_js if "onConsoleLog" in c][-100:]
+                self._pending_js = non_console + console
+            self._pending_js.append(code)
 
     def flush_pending_js(self):
         """Called from frontend when window is restored — replay any queued JS calls."""
-        pending = list(self._pending_js)
-        self._pending_js.clear()
+        with self._pending_js_lock:
+            pending = list(self._pending_js)
+            self._pending_js.clear()
         for code in pending:
             try:
                 if self._window:
