@@ -119,24 +119,27 @@ def find_viral_moments(
     )
 
     # --- Pick top N non-overlapping peaks ---
+    # combined[i] corresponds to time i * 0.5 seconds (500ms windows)
     half = clip_duration // 2
     clips = []
+    combined = combined.copy()
     for _ in range(num_clips):
         if combined.max() <= 0:
             break
         peak = int(np.argmax(combined))
-        start = max(0, peak - half)
-        end = min(len(combined), start + clip_duration)
+        peak_sec = peak * 0.5
+        start = max(0.0, peak_sec - half)
+        end = min(float(total_seconds), start + clip_duration)
         if end - start < clip_duration and start > 0:
-            start = max(0, end - clip_duration)
+            start = max(0.0, end - clip_duration)
 
         clips.append(
             {"start": start, "end": end, "duration": end - start, "score": float(combined[peak])}
         )
 
-        # mask out neighbourhood
-        lo = max(0, peak - clip_duration - min_gap)
-        hi = min(len(combined), peak + clip_duration + min_gap)
+        # mask out neighbourhood (convert seconds to window indices)
+        lo = max(0, int((peak_sec - clip_duration - min_gap) * 2))
+        hi = min(len(combined), int((peak_sec + clip_duration + min_gap) * 2))
         combined[lo:hi] = 0
 
     clips.sort(key=lambda c: c["start"])

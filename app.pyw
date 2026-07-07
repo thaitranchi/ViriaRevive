@@ -7,6 +7,7 @@ Launch this file to start the GUI without a console window:
     pythonw app.pyw            (explicit)
 """
 
+import logging
 import sys
 import webview
 from pathlib import Path
@@ -74,8 +75,8 @@ def _force_quit(window, tray):
     tray.stop()
     try:
         window.destroy()
-    except Exception:
-        pass
+    except Exception as e:
+        logging.debug("Force quit destroy error: %s", e)
     sys.exit(0)
 
 

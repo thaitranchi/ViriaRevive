@@ -250,10 +250,9 @@ class TestCropperConstants(unittest.TestCase):
     @unittest.skipIf(not _has_module("numpy"), "numpy not installed")
     def test_constants_import(self):
         import cropper
-        self.assertIsNotNone(cropper.YOLO_CONF_BATCH)
-        self.assertIsNotNone(cropper.YOLO_CONF_RETRY)
+        self.assertIsNotNone(cropper.YOLO_CONF)
         self.assertIsNotNone(cropper.YOLO_CONF_SINGLE)
-        self.assertGreater(cropper.YOLO_CONF_SINGLE, cropper.YOLO_CONF_RETRY)
+        self.assertGreater(cropper.YOLO_CONF_SINGLE, cropper.YOLO_CONF)
 
     @unittest.skipIf(not _has_module("numpy"), "numpy not installed")
     def test_dimensions(self):

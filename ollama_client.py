@@ -81,7 +81,7 @@ def generate(
     model: str = DEFAULT_MODEL,
     timeout: int | float = 30,
     options: dict[str, Any] | None = None,
-    format: str | None = None,
+    response_format: str | None = None,
     context: list[int] | None = None,
     return_context: bool = False,
 ) -> str | tuple[str, list[int]] | None:
@@ -99,8 +99,8 @@ def generate(
         body_data["context"] = context
     if options:
         body_data["options"].update(options)  # Merge provided options, allowing overrides
-    if format:
-        body_data["format"] = format
+    if response_format:
+        body_data["format"] = response_format
 
     req = urllib.request.Request(
         GENERATE_URL,

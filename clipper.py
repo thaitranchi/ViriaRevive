@@ -100,7 +100,7 @@ def _fonts_dir_option(sub_dir: Path, use_cwd: bool) -> str:
 
 def _sanitize_filename(name: str) -> str:
     """Remove characters invalid on Windows filenames."""
-    return re.sub(r'[<>:"/\\|?*]', '_', name)[:80]
+    return re.sub(r'[<>:"/\\|?*\'`]', '_', name)[:80]
 
 def _prepare_subtitle_file(subtitle_path: Path, output_stem: str) -> tuple[Path | None, Path | None]:
     """Copy subtitle file to a temp location with a safe ASCII name.
@@ -380,7 +380,7 @@ def _build_lerp_expr(times: list, values: list) -> str:
     return _step_recursive(times, values, 0)
 
 
-def _step_recursive(times, values, idx):
+def _step_recursive(times: list[float], values: list[float], idx: int) -> str:
     """Recursively build nested if() for step function (instant cuts)."""
     if idx >= len(times) - 1:
         return str(int(values[-1]))
@@ -449,7 +449,7 @@ def _build_music_af(clip_duration: float, music_path: Path | None,
         )
     else:
         music_part = (
-            f"[1:a]aloop=loop=-1:size=2e+09,"
+            f"[1:a]aloop=loop=-1:size=2000000000,"
             f"atrim=duration={clip_duration:.3f},volume={volume:.2f}[bg]"
         )
     return f"{music_part};[0:a][bg]amix=inputs=2:duration=first:dropout_transition=2[aout]"
@@ -945,7 +945,7 @@ def add_background_music(
     else:
         # No trim — loop the full track
         af_music = (
-            f"[1:a]aloop=loop=-1:size=2e+09,"
+            f"[1:a]aloop=loop=-1:size=2000000000,"
             f"atrim=duration={clip_dur:.3f},volume={volume:.2f}[bg]"
         )
 

@@ -64,10 +64,11 @@ def _ensure_tokens_dir():
             # Only remove legacy file if migration succeeded or token is invalid
             # but don't delete a potentially valid token on transient errors
             _TOKEN_LEGACY.unlink()
-        except Exception:
+        except Exception as e:
             # Migration hit a transient error (network, quota, refresh failure).
             # Keep the legacy file so the user doesn't lose their account.
-            pass
+            import logging
+            logging.getLogger(__name__).warning("Legacy token migration failed: %s", e)
 
 
 def _build_service(creds):

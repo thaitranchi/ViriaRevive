@@ -27,6 +27,9 @@ _cv2_lock = threading.Lock()
 # ── Constants ────────────────────────────────────────────────────────────────
 
 YUNET_MODEL = Path(__file__).parent / "models" / "face_detection_yunet.onnx"
+YUNET_MODEL_EXISTS = YUNET_MODEL.exists()
+if not YUNET_MODEL_EXISTS:
+    logger.warning("YuNet face detection model not found at %s — falling back to YOLO/Haar", YUNET_MODEL)
 YUNET_CONF = 0.35
 YUNET_NMS = 0.3
 YOLO_CONF = 0.15

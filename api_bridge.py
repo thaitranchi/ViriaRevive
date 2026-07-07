@@ -33,6 +33,7 @@ try:
 except ImportError:
     keyring = None
 
+import utils
 import config
 from config import (
     BASE_DIR,
@@ -1011,33 +1012,41 @@ class ApiBridge:
 
     def _pipeline_worker(self):
         """Worker thread that pulls tasks from the queue and executes the pipeline."""
-        while not self._pipeline_queue.empty():
-            if self._is_cancelled():
-                break
-            
-            try:
-                task = self._pipeline_queue.get_nowait()
-            except queue.Empty:
-                break
+        try:
+            while not self._pipeline_queue.empty():
+                if self._is_cancelled():
+                    break
                 
-            self._processing = True
-            self._active_item_index = task["item_index"]
-            self._results_before = task["results_before"]
-            
-            # Reset cancellation state for this specific task
-            from subprocess_utils import reset_cancel
-            reset_cancel()
-            
-            try:
-                self._run_pipeline(task["url"], task["settings"], task["file_path"])
-            except Exception as e:
-                logger.exception("Critical error in pipeline")
-                self._error(f"Internal error: {e}")
-            finally:
-                self._pipeline_queue.task_done()
+                try:
+                    task = self._pipeline_queue.get_nowait()
+                except queue.Empty:
+                    break
                 
-        self._processing = False
-        self._active_item_index = None
+                # Check cancel again after dequeue — cancel may have been
+                # requested while we were waiting for a task
+                if self._is_cancelled():
+                    self._pipeline_queue.task_done()
+                    break
+                    
+                self._processing = True
+                self._active_item_index = task["item_index"]
+                self._results_before = task["results_before"]
+                
+                # Reset cancellation state for this specific task
+                from subprocess_utils import reset_cancel
+                reset_cancel()
+                
+                try:
+                    self._run_pipeline(task["url"], task["settings"], task["file_path"])
+                except Exception as e:
+                    logger.exception("Critical error in pipeline")
+                    self._error(f"Internal error: {e}")
+                finally:
+                    self._pipeline_queue.task_done()
+                    self._processing = False
+        finally:
+            self._processing = False
+            self._active_item_index = None
 
     def cancel_processing(self):
         with self._cancel_lock:
@@ -1385,13 +1394,16 @@ class ApiBridge:
 
     def _get_video_duration(self, path: Path) -> float:
         from subprocess_utils import run as _srun
-        r = _srun(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-             "-of", "csv=p=0", str(path)],
-            capture_output=True, text=True, timeout=10,
-        )
-        out = r.stdout.strip()
-        return float(out) if out else 0.0
+        try:
+            r = _srun(
+                ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                 "-of", "csv=p=0", str(path)],
+                capture_output=True, text=True, timeout=10,
+            )
+            out = r.stdout.strip()
+            return float(out) if out else 0.0
+        except Exception:
+            return 0.0
 
     def _run_pipeline(self, url, settings, local_file_path=None):
         video_path = None
@@ -1449,7 +1461,9 @@ class ApiBridge:
                     return self._error("No video URL provided.")
                 self._push("download", 0, "Downloading video...")
                 video_path = self._download_with_progress(url.strip())
-                is_downloaded = True
+                if video_path is None:
+                    return self._error("Failed to download video.")
+                is_downloaded = url.strip() != str(video_path)
                 stem = video_path.stem[:50]
                 self._push("download", 100, f"Downloaded: {video_path.name}")
 
@@ -1462,34 +1476,8 @@ class ApiBridge:
             
             # ── Auto clip count ──────────────────────────────────────
             if auto_clips:
-                vid_w, vid_h = get_dimensions(video_path)
-                # Smart auto: scale clips based on video length
-                #   < 5 min  → 2-3 clips
-                #   5-15 min → 3-5 clips
-                #   15-30 min → 5-8 clips
-                #   30-60 min → 8-15 clips
-                #   1-2 hrs  → 15-25 clips
-                #   2+ hrs   → 25-40 clips
-                # Formula: roughly 1 clip per 3-4 minutes, with a minimum of 2
+                num_clips = utils.auto_clip_count(vid_duration, clip_duration)
                 vid_mins = vid_duration / 60
-                if vid_mins < 5:
-                    num_clips = max(2, min(3, int(vid_mins / 1.5)))
-                elif vid_mins < 15:
-                    num_clips = max(3, int(vid_mins / 3))
-                elif vid_mins < 30:
-                    num_clips = max(5, int(vid_mins / 3.5))
-                elif vid_mins < 60:
-                    num_clips = max(8, int(vid_mins / 3.5))
-                elif vid_mins < 120:
-                    num_clips = max(15, min(30, int(vid_mins / 4)))
-                else:
-                    num_clips = max(25, min(50, int(vid_mins / 4)))
-                # Also consider clip duration — shorter clips = can fit more
-                if clip_duration < 20:
-                    num_clips = int(num_clips * 1.3)
-                elif clip_duration > 60:
-                    num_clips = max(2, int(num_clips * 0.7))
-                num_clips = max(2, min(50, num_clips))
                 self._push("detect", 0, f"Auto: {num_clips} clips for {int(vid_mins)}min video")
                 print(f"[+] Auto clip count: {num_clips} (video is {vid_duration:.0f}s / {vid_mins:.1f}min)")
 
@@ -1794,7 +1782,7 @@ class ApiBridge:
             self._js(f"window.onPipelineComplete(true, {len(done)}, {total}, null, {self._active_item_index if self._active_item_index is not None else 'null'})")
 
         except CancelledError:
-            return self._cancelled() # type: ignore
+            self._cancelled() # type: ignore
         except Exception:
             logger.exception("Pipeline error")
             self._error("An unexpected error occurred during processing.")
@@ -1802,28 +1790,25 @@ class ApiBridge:
             # Windows needs a moment to release handles (FFmpeg/Clipper/Whisper)
             time.sleep(1.5)
 
-            if debug_mode:
-                print("[debug] Skipping cleanup of temporary files.")
-                return
-            
-            if is_downloaded and video_path and video_path.exists():
-                try:
-                    self._robust_unlink(video_path)
-                    print(f"[cleanup] Automatically cleared downloaded source: {video_path.name}")
-                except Exception as e:
-                    print(f"[cleanup] Could not clear {video_path.name}: {e}")
+            if not debug_mode:
+                if is_downloaded and video_path and video_path.exists():
+                    try:
+                        self._robust_unlink(video_path)
+                        print(f"[cleanup] Automatically cleared downloaded source: {video_path.name}")
+                    except Exception as e:
+                        print(f"[cleanup] Could not clear {video_path.name}: {e}")
 
-            # Thorough cleanup of subtitles folder
-            for sf in subtitle_files: # type: ignore
-                try:
-                    self._robust_unlink(sf)
-                except Exception as e:
-                    logger.debug("Failed to cleanup subtitle %s: %s", sf, e)
+                # Thorough cleanup of subtitles folder
+                    for sf in subtitle_files:
+                        try:
+                            self._robust_unlink(sf)
+                        except Exception as e:
+                            logger.debug("Failed to cleanup subtitle %s: %s", sf, e)
 
-            # Catch any orphans using the video stem
-            if stem:
-                for p in SUBTITLES_DIR.glob(f"{stem}*"):
-                    self._robust_unlink(p)
+                # Catch any orphans using the video stem
+                if stem:
+                    for p in SUBTITLES_DIR.glob(f"{stem}*"):
+                        self._robust_unlink(p)
 
     # ── Download with real progress ──────────────────────────────────────
 
