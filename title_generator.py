@@ -150,7 +150,7 @@ def generate_title(transcript: str, model: str = DEFAULT_MODEL, language: str = 
         if result:
             print(f"[title-gen] LLM: {result}")
             return result
-        print(f"[title-gen] LLM returned empty/short, trying heuristic...")
+        print("[title-gen] LLM returned empty/short, trying heuristic...")
 
     # Fallback to heuristic
     result = _heuristic_title(transcript)

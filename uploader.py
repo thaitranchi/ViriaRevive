@@ -3,6 +3,7 @@
 import json
 import logging
 import sys
+logger = logging.getLogger(__name__)
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 UTC = timezone.utc

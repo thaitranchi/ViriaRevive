@@ -25,7 +25,6 @@ _force_closing = False
 
 
 def main():
-    global _force_closing
     start_minimized = "--minimized" in sys.argv or "--startup" in sys.argv
 
     api = ApiBridge()

@@ -515,7 +515,7 @@ def _swap_cmd_encode_to_cpu(cmd: list[str], preset: str, crf: str) -> list[str]:
             continue
 
         # 1b. Strip codec-based hardware decoders (before -i) during fallback
-        if (not seen_input and i + 1 < len(cmd) and cmd[i] == "-c:v" and 
+        if (not seen_input and i + 1 < len(cmd) and cmd[i] == "-c:v" and
             any(s in cmd[i + 1] for s in _HW_DECODER_SUFFIXES)):
             i += 2
             continue

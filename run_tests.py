@@ -367,7 +367,7 @@ class TestPipelineCache(unittest.TestCase):
         self.assertEqual(state.resume_step, "done")
 
     def test_all_clips_done(self):
-        state = type("S", (), {"num_clips": 3, "clips_completed": [1, 2, 3]})()
+        type("S", (), {"num_clips": 3, "clips_completed": [1, 2, 3]})()
         from pipeline_cache import PipelineState
         ps = PipelineState(num_clips=3, clips_completed=[1, 2, 3])
         self.assertTrue(ps.all_clips_done)

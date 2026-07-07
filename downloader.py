@@ -41,6 +41,6 @@ def download_video(url: str, output_dir: Path = DOWNLOADS_DIR) -> Path | None:
     except yt_dlp.DownloadError as e:
         logger.error(f"yt-dlp download failed for {url}: {e}")
         return None
-    except Exception as e:
+    except Exception:
         logger.exception(f"Unexpected download error for {url}")
         return None

@@ -1,6 +1,5 @@
 import os
 import re
-import shutil
 import subprocess
 import tempfile
 import time
@@ -10,9 +9,8 @@ from pathlib import Path
 from subprocess_utils import run as _run
 from hwaccel import (
     input_hwaccel_args,
-    run_ffmpeg_with_encode_fallback,
-    logger as hwaccel_logger,
     video_encode_args,
+    run_ffmpeg_with_encode_fallback,
 )
 from utils import fmt_time, wait_for_file_unlock
 
@@ -75,6 +73,7 @@ def _escape_sub_path_win(path: Path) -> str:
 def _copy_fonts_to_dir(dest_dir: Path):
     """Copy common fonts to subtitle temp dir so libass can find them without fontconfig."""
     import platform
+    import shutil
     if platform.system() != "Windows":
         return
     fonts_dir = Path(os.environ.get("WINDIR", "C:\\Windows")) / "Fonts"
@@ -108,6 +107,7 @@ def _prepare_subtitle_file(subtitle_path: Path, output_stem: str) -> tuple[Path 
 
     Returns (temp_sub_path, temp_dir) or (None, None).
     """
+    import shutil
     if not subtitle_path or not Path(subtitle_path).exists():
         return None, None
     if Path(subtitle_path).stat().st_size < 20:
@@ -618,7 +618,6 @@ def extract_clip(
       - (cw, ch, cx, cy)         → static crop (4-tuple)
       - (cw, ch, keyframes_list) → dynamic crop (3-tuple)
     """
-    import shutil
 
     duration = end - start
 
@@ -653,7 +652,6 @@ def extract_clip(
     logger.info(f"Clipping {fmt_time(start)} -> {fmt_time(end)}  ({duration}s)")
 
     # Build common filter components
-    effect_vf = _get_effect_vf(effect)
     music_af = _build_music_af(duration, music_path, music_volume, music_trim_start, music_trim_end)
     extra_inputs = _build_music_extra_inputs(music_path)
 

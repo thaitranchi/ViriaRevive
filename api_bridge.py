@@ -41,10 +41,8 @@ from config import (
     AI_PROVIDER,
     CLIENT_SECRETS_FILE,
     GEMINI_TOKEN_FILE,
-    GEMINI_API_KEY,
     CLIPS_DIR,
     CLIP_DURATION,
-    CROP_VERTICAL,
     DOWNLOADS_DIR,
     FFMPEG_PRESET,
     MIN_GAP,
@@ -54,9 +52,6 @@ from config import (
     OLLAMA_DETECTOR_CANDIDATE_MULTIPLIER,
     OLLAMA_DETECTOR_MODEL,
     OLLAMA_DETECTOR_TIMEOUT,
-    OPENROUTER_TOKEN_FILE,
-    OPENROUTER_API_KEY,
-    OPENROUTER_MODEL,
     SUBTITLE_STYLE,
     SUBTITLES_DIR,
     VIDEO_CRF,
@@ -68,7 +63,6 @@ from config import (
     YOLO_DEVICE,
 )
 import gemini_client
-import openrouter_client
 from hwaccel import log_hardware_startup, probe_ffmpeg, get_hardware_summary, video_encode_args, get_gpu_count, select_least_loaded_gpu
 from detector import find_viral_moments
 from ollama_detector import detector_ready, rerank_moments
@@ -79,13 +73,11 @@ from clipper import (
     get_effects_list,
     validate_shorts_output,
 )
-from cropper import get_crop_params, get_crop_params_dynamic, get_dimensions, detect_all_persons
+from cropper import get_crop_params_dynamic, get_dimensions, detect_all_persons
 from subprocess_utils import CancelledError
 from title_generator import generate_title, generate_titles_batch, list_ollama_models, ensure_model
 from uploader import (
     upload_to_youtube,
-    build_schedule,
-    get_youtube_service,
     is_connected,
     disconnect,
     list_channels,
@@ -504,7 +496,7 @@ class ApiBridge:
 
                 # Update runtime value so changes take effect without restart
                 config.GEMINI_API_KEY = gemini_key.strip()
-            except Exception as e:
+            except Exception:
                 logger.exception("Failed to write Gemini key to tokens file")
 
         # Check if debug mode changed and re-install logging tee
@@ -549,8 +541,6 @@ class ApiBridge:
         If transcripts are missing (e.g. clips from a previous session where
         moments were lost), auto-transcribe the clip audio first.
         """
-        from title_generator import ensure_model, DEFAULT_MODEL
-
         num_clips = len(self._results)
         # Sync moments to match results count exactly
         if len(self._moments) > num_clips:
@@ -743,7 +733,7 @@ class ApiBridge:
             payload = json.dumps({"titles": results, "renamed": renamed, "llm": llm_available, "total": len(target_indices)})
             self._js(f"window.onTitlesDone && window.onTitlesDone({payload})")
 
-        except Exception as e:
+        except Exception:
             logger.exception("Error in title generation")
             self._js(f"window.onTitlesDone && window.onTitlesDone({{error: {json.dumps('An internal error occurred during title generation.')}}})")
 
@@ -1680,7 +1670,7 @@ class ApiBridge:
                         print(f"[!] Crop detection failed for clip {clip_num}: {e}")
                         crop_params = None
                     if crop_params:
-                        crop_w, crop_h = crop_params[0], crop_params[1]
+                        pass
 
                 # ── 3d: subtitles ──
                 if self._is_cancelled():

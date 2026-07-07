@@ -265,7 +265,7 @@ def _get_yolo_model(device_pref: str = "auto",
     except ImportError:
         logger.warning("ultralytics not installed — falling back to face detection")
         return None, None
-    except Exception as e:
+    except Exception:
         logger.exception("YOLO initialization failed; falling back to face detection")
         return None, None
 
@@ -320,7 +320,7 @@ def _create_yunet_detector():
             str(YUNET_MODEL), "", (320, 320), YUNET_CONF, YUNET_NMS, 5000, # type: ignore
         )
         return detector
-    except Exception as e:
+    except Exception:
         logger.exception("YuNet initialization failed")
         return None
 
@@ -506,7 +506,6 @@ def detect_all_persons(video_path, start, end, width, height, sample_count,
             if abs(cv_w - height) < 4 and abs(cv_h - width) < 4:
                 logger.warning("Detected 90° rotation — swapping coordinate axes")
 
-    debug_frame = test_frame # type: ignore # save first frame for debug output
     debug_saved = False
     last_good_persons = None # for gap-filling frames with no detection
     last_good_time = -10.0  # timestamp of last valid detection
@@ -1005,7 +1004,7 @@ def _save_debug_frame(frame, persons, ffprobe_w, ffprobe_h, scale_x, scale_y,
         debug_path = Path(video_path).parent / "crop_debug.jpg"
         cv2.imwrite(str(debug_path), debug)
         logger.info(f"Debug frame saved: {debug_path}")
-    except Exception as e:
+    except Exception:
         logger.exception("Debug frame save failed")
 
 

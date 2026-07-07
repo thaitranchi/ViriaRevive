@@ -18,7 +18,6 @@ import logging
 import shutil
 import sys
 import threading
-import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -49,8 +48,8 @@ from config import (
     YOLO_DEVICE,
 )
 from hwaccel import log_hardware_startup, get_gpu_count, select_least_loaded_gpu
-from pipeline_cache import PipelineCache, PipelineState
-from utils import auto_clip_count, fmt_time
+from pipeline_cache import PipelineCache
+from utils import auto_clip_count
 from subprocess_utils import run as _run, is_cancelled, CancelledError, reset_cancel
 
 
@@ -160,7 +159,7 @@ def process(
     from subtitler import generate_subtitles
     from title_generator import generate_titles_batch
     from clipper import extract_clip, extract_audio_clip, validate_shorts_output
-    from cropper import get_crop_params_dynamic, get_dimensions, detect_all_persons
+    from cropper import get_crop_params_dynamic, detect_all_persons
     from uploader import upload_to_youtube, build_schedule
 
     if on_progress is None:
@@ -339,7 +338,6 @@ def process(
 
         # 3a. compute dynamic crop params for 9:16
         crop_params = None
-        vid_w, vid_h = get_dimensions(video_path)
         if crop:
             on_progress("clips", 0, f"Clip {clip_num}/{len(moments)}: Tracking speakers...")
             try:
@@ -348,7 +346,7 @@ def process(
                     gpu_index=gpu_idx,
                 )
                 if crop_params:
-                    vid_w, vid_h = crop_params[0], crop_params[1]
+                    pass
             except Exception as e:
                 print(f"[!] Crop detection failed for clip {clip_num}: {e}")
                 crop_params = None

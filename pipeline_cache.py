@@ -9,7 +9,6 @@ Cacheable artifacts:
 """
 
 import json
-import time
 import threading
 from pathlib import Path
 from dataclasses import dataclass, asdict, field

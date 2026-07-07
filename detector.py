@@ -33,6 +33,7 @@ def find_viral_moments(
 ) -> list:
     """Find viral moments using audio energy + scene change analysis (no AI)."""
     import numpy as np
+    from pydub import AudioSegment
 
     logger.info("Analyzing audio energy (waiting for file access)...")
     
@@ -157,7 +158,7 @@ def find_viral_moments(
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 
-def _scene_change_density(video_path: Path, length: int) -> np.ndarray:
+def _scene_change_density(video_path: Path, length: int) -> "np.ndarray":  # noqa: F821
     """Count scene changes per second using ffmpeg."""
     import numpy as np
     try:
