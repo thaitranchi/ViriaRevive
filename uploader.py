@@ -3,6 +3,7 @@
 import json
 import logging
 import sys
+import threading
 logger = logging.getLogger(__name__)
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
@@ -25,6 +26,7 @@ _SCOPES = [
 
 # Cache: account_id -> youtube service
 _service_cache: dict = {}
+_service_cache_lock = threading.Lock()
 
 # Default YouTube categories to use as fallback or before login
 DEFAULT_CATEGORIES = [
@@ -139,15 +141,17 @@ def get_youtube_service(account_id: str = None, force_new: bool = False):
             return None, "No YouTube accounts connected"
         account_id = accounts[0]["id"]
 
-    if account_id in _service_cache and not force_new:
-        return _service_cache[account_id], None
+    with _service_cache_lock:
+        if account_id in _service_cache and not force_new:
+            return _service_cache[account_id], None
 
     creds, err = _load_creds(account_id)
     if not creds:
         return None, err or f"Account {account_id} not connected"
 
     svc = _build_service(creds)
-    _service_cache[account_id] = svc
+    with _service_cache_lock:
+        _service_cache[account_id] = svc
     return svc, None
 
 
@@ -180,7 +184,8 @@ def add_account() -> dict:
     account_title = ch["snippet"]["title"]
 
     _save_token(account_id, account_title, creds)
-    _service_cache[account_id] = svc
+    with _service_cache_lock:
+        _service_cache[account_id] = svc
 
     print(f"[+] Added YouTube account: {account_title} ({account_id})")
     return {"id": account_id, "title": account_title}
@@ -217,13 +222,15 @@ def disconnect(account_id: str = None):
         path = _token_path(account_id)
         if path.exists():
             path.unlink()
-        _service_cache.pop(account_id, None)
+        with _service_cache_lock:
+            _service_cache.pop(account_id, None)
     else:
         # Remove all
         for f in _TOKENS_DIR.glob("*.json"):
             if f.name not in _SKIP_TOKEN_FILES:
                 f.unlink()
-        _service_cache.clear()
+        with _service_cache_lock:
+            _service_cache.clear()
 
 
 # ── Channel & Category listing ───────────────────────────────────────────────

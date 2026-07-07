@@ -192,6 +192,7 @@ def generate_titles_batch(
             for i, t in enumerate(transcripts)
             if t
         }
+        submitted = len(futures)
         for future in as_completed(futures):
             try:
                 idx, title = future.result()
@@ -202,5 +203,9 @@ def generate_titles_batch(
             except Exception as e:
                 done_count += 1
                 print(f"[openrouter-batch] Error generating title {idx}: {e}")
+
+    # Report remaining progress for empty transcripts (not submitted)
+    if on_progress and submitted < total:
+        on_progress(total, total, "")
 
     return results

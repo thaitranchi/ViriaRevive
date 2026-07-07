@@ -62,6 +62,8 @@ def find_viral_moments(
         r = _run(cmd, capture_output=True, timeout=300)
         audio = AudioSegment.from_file(BytesIO(r.stdout), format="wav")
         
+    except CancelledError:
+        raise
     except Exception as e:
         if isinstance(e, IndexError):
             detail = " (no audio stream found or file corrupted)"
