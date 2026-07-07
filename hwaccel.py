@@ -512,6 +512,9 @@ def _swap_cmd_encode_to_cpu(cmd: list[str], preset: str, crf: str) -> list[str]:
         # 1. Strip hardware decoder flags (retry should be pure software)
         if cmd[i] == "-hwaccel":
             i += 2
+            # Also skip companion --hwaccel_device flag if present
+            if i < len(cmd) and cmd[i] == "-hwaccel_device":
+                i += 2
             continue
 
         # 1b. Strip codec-based hardware decoders (before -i) during fallback

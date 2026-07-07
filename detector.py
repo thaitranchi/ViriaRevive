@@ -246,12 +246,12 @@ def _fallback_moments(
 
     clips = []
     for start in starts[:num_clips]:
-        end = min(total_seconds, int(start) + usable_duration)
+        end = min(total_seconds, float(start) + usable_duration)
         clips.append(
             {
-                "start": int(start),
-                "end": int(end),
-                "duration": int(end - start),
+                "start": float(start),
+                "end": float(end),
+                "duration": float(end - start),
                 "score": 0.0,
             }
         )

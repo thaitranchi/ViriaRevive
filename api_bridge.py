@@ -761,7 +761,17 @@ class ApiBridge:
         
         try:
             wav = Path(tempfile.gettempdir()) / f"viria_backfill_{clip_index}.wav"
-            extract_audio_clip(p, 0, 60, wav)  # max 60s
+            try:
+                import subprocess as _sp
+                r = _sp.run(
+                    ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                     "-of", "csv=p=0", str(p)],
+                    capture_output=True, text=True, timeout=15,
+                )
+                clip_dur = float(r.stdout.strip())
+            except Exception:
+                clip_dur = 60.0
+            extract_audio_clip(p, 0, max(clip_dur, 1.0), wav)
             try:
                 st = wav.stat()
             except OSError:
@@ -1789,6 +1799,7 @@ class ApiBridge:
                         print(f"[cleanup] Could not clear {video_path.name}: {e}")
 
                 # Thorough cleanup of subtitles folder
+                with results_lock:
                     for sf in subtitle_files:
                         try:
                             self._robust_unlink(sf)
@@ -1937,14 +1948,16 @@ class ApiBridge:
                     clip_idx = item.get("clipIdx", -1)
                     if clip_idx < 0 or clip_idx >= len(self._results):
                         print(f"[scheduler] Warning: clipIdx {clip_idx} out of range (results have {len(self._results)} clips), marking as uploaded")
-                        item["uploaded"] = True
-                        changed = True
+                        with self._scheduled_lock:
+                            item["uploaded"] = True
+                            changed = True
                         continue
                     video_path = self._results[clip_idx]
                     if not video_path.exists(): # type: ignore
                         print(f"[scheduler] Warning: clip file missing: {video_path}, marking as uploaded")
-                        item["uploaded"] = True
-                        changed = True
+                        with self._scheduled_lock:
+                            item["uploaded"] = True
+                            changed = True
                         continue
 
                     title = item.get("title", f"Viral Clip #{clip_idx + 1}")
@@ -1966,7 +1979,8 @@ class ApiBridge:
                         if result is None:
                             raise RuntimeError("upload_to_youtube returned None")
 
-                        item["uploaded"] = True
+                        with self._scheduled_lock:
+                            item["uploaded"] = True
                         changed = True # type: ignore
                         print(f"[scheduler] Uploaded: {title}")
                         self._js(f"window.onScheduledUploadDone({clip_idx}, true, null)")

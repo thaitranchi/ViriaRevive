@@ -194,7 +194,6 @@ def process(
         state = cache.load_state()
         state.url = url
         state.stem = stem
-        state.step_downloaded = True
         state.num_clips = num_clips
         state.clip_duration = clip_duration
         cache.save_state(state)
@@ -331,6 +330,14 @@ def process(
             print(f"  [+] Clip {clip_num}/{len(moments)} already done, skipping")
             on_progress("clips", int((idx + 1) / len(moments) * 100),
                         f"Clip {clip_num}/{len(moments)}: already done")
+            # Backfill transcript for title generation on resume path
+            wav = SUBTITLES_DIR / f"{stem}_c{clip_num}.wav"
+            if wav.exists():
+                words = transcribe_clip(
+                    wav, model_size=model, language=language,
+                    device_pref=WHISPER_DEVICE,
+                )
+                m["transcript"] = " ".join(w.get("word", w.get("text", "")) for w in words).strip()
             return out
 
         print(f"\n── clip {clip_num}/{len(moments)} {'GPU ' + str(gpu_idx) if gpu_idx is not None else ''}──")
@@ -470,7 +477,20 @@ def process(
     all_titles = []
     if done:
         on_progress("titles", 0, "Generating AI titles...")
-        transcripts = [m.get("transcript", "") for m in moments]
+        # Only collect transcripts for moments that actually completed
+        _path_to_idx = {}
+        _prefix = f"{stem}_viral"
+        for p in done:
+            name = p.name
+            if name.endswith(".mp4") and name.startswith(_prefix):
+                num_str = name[len(_prefix):-4]
+                try:
+                    idx = int(num_str) - 1
+                    if 0 <= idx < len(moments):
+                        _path_to_idx[p] = idx
+                except ValueError:
+                    pass
+        transcripts = [moments[_path_to_idx[p]].get("transcript", "") for p in done if p in _path_to_idx]
         if any(transcripts):
             all_titles = generate_titles_batch(
                 transcripts, model=ollama_model, language=title_language or language

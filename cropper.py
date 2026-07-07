@@ -470,117 +470,117 @@ def detect_all_persons(video_path, start, end, width, height, sample_count,
     if not cap.isOpened():
         return []
 
-    duration = max(1, end - start)
-    # Dense sampling — at least 4 samples per second for smooth tracking
-    effective_samples = max(sample_count, int(duration * 4))
-    step = max(0.25, duration / effective_samples)
-    sample_times = list(_frange(0, duration, step))
-    if not sample_times:
-        sample_times = [0]
+    try:
+        duration = max(1, end - start)
+        # Dense sampling — at least 4 samples per second for smooth tracking
+        effective_samples = max(sample_count, int(duration * 4))
+        step = max(0.25, duration / effective_samples)
+        sample_times = list(_frange(0, duration, step))
+        if not sample_times:
+            sample_times = [0]
 
-    scale = 0.5 if width > 800 else 0.75
-    detections = []
-    detected_frames = 0
-    yolo_frames = 0
-    face_frames = 0
+        scale = 0.5 if width > 800 else 0.75
+        detections = []
+        detected_frames = 0
+        yolo_frames = 0
+        face_frames = 0
 
-    # ── Detect dimension mismatch (rotation / codec quirks) ───────────
-    # Read one frame to get actual OpenCV dimensions
-    ok, test_frame = _read_frame_safe(cap, msec=start * 1000, timeout=10.0)
-    scale_x, scale_y = 1.0, 1.0
-    if ok and test_frame is not None: # type: ignore
-        cv_h, cv_w = test_frame.shape[:2]
-        if cv_w != width or cv_h != height:
-            # Dimensions differ — need to rescale coordinates
-            # OpenCV reads raw coded dimensions; ffprobe may report rotated
-            is_swapped = abs(cv_w - height) < 4 and abs(cv_h - width) < 4
-            if is_swapped:
-                scale_x = width / cv_h
-                scale_y = height / cv_w
-            else:
-                scale_x = width / cv_w
-                scale_y = height / cv_h
-            logger.warning(f"Dimension mismatch: ffprobe={width}x{height}, "
-                  f"OpenCV={cv_w}x{cv_h} → rescaling coords by {scale_x:.2f}x{scale_y:.2f}")
-            # Check if it's a 90°/270° rotation (width/height swapped)
-            if abs(cv_w - height) < 4 and abs(cv_h - width) < 4:
-                logger.warning("Detected 90° rotation — swapping coordinate axes")
-
-    debug_saved = False
-    last_good_persons = None # for gap-filling frames with no detection
-    last_good_time = -10.0  # timestamp of last valid detection
-
-    # ── Process in chunks to save memory ──
-    for i in range(0, len(sample_times), YOLO_BATCH_SIZE):
-        batch_times = sample_times[i : i + YOLO_BATCH_SIZE]
-        batch_frames = []
-        
-        for t in batch_times:
-            if is_cancelled():
-                cap.release()
-                raise CancelledError("Person detection cancelled")
-            ok, frame = _read_frame_safe(cap, msec=(start + t) * 1000)
-            if ok and frame is not None:
-                batch_frames.append((t, frame))
-
-        if not batch_frames: continue
-
-        # Run Inference
-        batch_results = []
-        if use_yolo:
-            y_frames = [f for _, f in batch_frames]
-            batch_persons = _detect_persons_yolo_batch(y_frames, yolo, yolo_dev, conf=YOLO_CONF)
-            for (t, frame), persons in zip(batch_frames, batch_persons):
-                batch_results.append((t, frame, persons))
-        else:
-            for t, frame in batch_frames:
-                persons = []
-                if yunet:
-                    persons = _detect_faces_yunet(frame, yunet)
-                if not persons and cascades:
-                    persons = _detect_faces_haar(frame, cascades, scale)
-                batch_results.append((t, frame, persons))
-
-        # Post-process detections
-        for t, frame, persons in batch_results:
-            if persons and (scale_x != 1.0 or scale_y != 1.0):
-                # Check for 90/270 swap logic
-                cv_h, cv_w = frame.shape[:2]
+        # ── Detect dimension mismatch (rotation / codec quirks) ───────────
+        # Read one frame to get actual OpenCV dimensions
+        ok, test_frame = _read_frame_safe(cap, msec=start * 1000, timeout=10.0)
+        scale_x, scale_y = 1.0, 1.0
+        if ok and test_frame is not None: # type: ignore
+            cv_h, cv_w = test_frame.shape[:2]
+            if cv_w != width or cv_h != height:
+                # Dimensions differ — need to rescale coordinates
+                # OpenCV reads raw coded dimensions; ffprobe may report rotated
                 is_swapped = abs(cv_w - height) < 4 and abs(cv_h - width) < 4
-                
-                new_persons = []
-                for hx, hy, a, c, h in persons:
-                    if is_swapped:
-                        # 90° or 270° rotation: swap x/y and handle scaling
-                        # Try both mappings and pick the one within frame bounds
-                        candidate1 = (int(hy * scale_x), int(hx * scale_y))
-                        candidate2 = (int((cv_w - hy) * scale_x), int((cv_h - hx) * scale_y))
-                        # Pick the candidate that places the head in the upper third
-                        if candidate1[1] < candidate2[1] or candidate2[1] >= height:
-                            new_hx, new_hy = candidate1
+                if is_swapped:
+                    scale_x = width / cv_h
+                    scale_y = height / cv_w
+                else:
+                    scale_x = width / cv_w
+                    scale_y = height / cv_h
+                logger.warning(f"Dimension mismatch: ffprobe={width}x{height}, "
+                      f"OpenCV={cv_w}x{cv_h} → rescaling coords by {scale_x:.2f}x{scale_y:.2f}")
+                # Check if it's a 90°/270° rotation (width/height swapped)
+                if abs(cv_w - height) < 4 and abs(cv_h - width) < 4:
+                    logger.warning("Detected 90° rotation — swapping coordinate axes")
+
+        debug_saved = False
+        last_good_persons = None # for gap-filling frames with no detection
+        last_good_time = -10.0  # timestamp of last valid detection
+
+        # ── Process in chunks to save memory ──
+        for i in range(0, len(sample_times), YOLO_BATCH_SIZE):
+            batch_times = sample_times[i : i + YOLO_BATCH_SIZE]
+            batch_frames = []
+            
+            for t in batch_times:
+                if is_cancelled():
+                    raise CancelledError("Person detection cancelled")
+                ok, frame = _read_frame_safe(cap, msec=(start + t) * 1000)
+                if ok and frame is not None:
+                    batch_frames.append((t, frame))
+
+            if not batch_frames: continue
+
+            # Run Inference
+            batch_results = []
+            if use_yolo:
+                y_frames = [f for _, f in batch_frames]
+                batch_persons = _detect_persons_yolo_batch(y_frames, yolo, yolo_dev, conf=YOLO_CONF)
+                for (t, frame), persons in zip(batch_frames, batch_persons):
+                    batch_results.append((t, frame, persons))
+            else:
+                for t, frame in batch_frames:
+                    persons = []
+                    if yunet:
+                        persons = _detect_faces_yunet(frame, yunet)
+                    if not persons and cascades:
+                        persons = _detect_faces_haar(frame, cascades, scale)
+                    batch_results.append((t, frame, persons))
+
+            # Post-process detections
+            for t, frame, persons in batch_results:
+                if persons and (scale_x != 1.0 or scale_y != 1.0):
+                    # Check for 90/270 swap logic
+                    cv_h, cv_w = frame.shape[:2]
+                    is_swapped = abs(cv_w - height) < 4 and abs(cv_h - width) < 4
+                    
+                    new_persons = []
+                    for hx, hy, a, c, h in persons:
+                        if is_swapped:
+                            # 90° or 270° rotation: swap x/y and handle scaling
+                            # Try both mappings and pick the one within frame bounds
+                            candidate1 = (int(hy * scale_x), int(hx * scale_y))
+                            candidate2 = (int((cv_w - hy) * scale_x), int((cv_h - hx) * scale_y))
+                            # Pick the candidate that places the head in the upper third
+                            if candidate1[1] < candidate2[1] or candidate2[1] >= height:
+                                new_hx, new_hy = candidate1
+                            else:
+                                new_hx, new_hy = candidate2
                         else:
-                            new_hx, new_hy = candidate2
-                    else:
-                        new_hx, new_hy = int(hx * scale_x), int(hy * scale_y)
-                    new_persons.append((new_hx, new_hy, int(a * scale_x * scale_y), c, int(h * scale_y)))
-                persons = new_persons
+                            new_hx, new_hy = int(hx * scale_x), int(hy * scale_y)
+                        new_persons.append((new_hx, new_hy, int(a * scale_x * scale_y), c, int(h * scale_y)))
+                    persons = new_persons
 
-            if persons:
-                detections.append((t, persons))
-                detected_frames += 1
-                if use_yolo: yolo_frames += 1
-                else: face_frames += 1
-                last_good_persons = persons
-                last_good_time = t
-                # Save debug frame only once for the first detection if debug_frames is True
-                if not debug_saved and use_yolo and debug_frames:
-                    _save_debug_frame(frame, persons, width, height, scale_x, scale_y, video_path)
-                    debug_saved = True
-            elif last_good_persons is not None and t - last_good_time <= 5.0:
-                # Only reuse last detection if within 5 seconds (avoids stale tracking)
-                detections.append((t, last_good_persons))
-
-    cap.release()
+                if persons:
+                    detections.append((t, persons))
+                    detected_frames += 1
+                    if use_yolo: yolo_frames += 1
+                    else: face_frames += 1
+                    last_good_persons = persons
+                    last_good_time = t
+                    # Save debug frame only once for the first detection if debug_frames is True
+                    if not debug_saved and use_yolo and debug_frames:
+                        _save_debug_frame(frame, persons, width, height, scale_x, scale_y, video_path)
+                        debug_saved = True
+                elif last_good_persons is not None and t - last_good_time <= 5.0:
+                    # Only reuse last detection if within 5 seconds (avoids stale tracking)
+                    detections.append((t, last_good_persons))
+    finally:
+        cap.release()
 
     total_persons = sum(len(p) for _, p in detections)
     method = "YOLO" if use_yolo else "face detection"
@@ -642,54 +642,54 @@ def _refine_transitions(detections, video_path, start, width, height,
     if not cap.isOpened():
         return detections
 
-    insertions = []  # (insert_after_index, [(t, persons), ...])
+    try:
+        insertions = []  # (insert_after_index, [(t, persons), ...])
 
-    for orig_idx, t_lo, t_hi, old_person_x in transitions:
-        refined = []
-        lo, hi = t_lo, t_hi
+        for orig_idx, t_lo, t_hi, old_person_x in transitions:
+            refined = []
+            lo, hi = t_lo, t_hi
 
-        for iteration in range(max_iterations):
-            if hi - lo < min_gap:
-                break
+            for iteration in range(max_iterations):
+                if hi - lo < min_gap:
+                    break
 
-            if is_cancelled():
-                cap.release()
-                raise CancelledError("Person detection cancelled")
+                if is_cancelled():
+                    raise CancelledError("Person detection cancelled")
 
-            t_mid = (lo + hi) / 2.0
-            cap.set(cv2.CAP_PROP_POS_MSEC, (start + t_mid) * 1000)
-            ok, frame = _read_frame_safe(cap, timeout=5.0)
-            if not ok or frame is None:
-                break
+                t_mid = (lo + hi) / 2.0
+                cap.set(cv2.CAP_PROP_POS_MSEC, (start + t_mid) * 1000)
+                ok, frame = _read_frame_safe(cap, timeout=5.0)
+                if not ok or frame is None:
+                    break
 
-            persons = _detect_persons_yolo(frame, yolo, yolo_dev, conf=YOLO_CONF)
+                persons = _detect_persons_yolo(frame, yolo, yolo_dev, conf=YOLO_CONF)
 
-            # Rescale coordinates if needed
-            if persons and (scale_x != 1.0 or scale_y != 1.0):
-                persons = [
-                    (int(hx * scale_x), int(hy * scale_y),
-                     int(a * scale_x * scale_y), c, int(h * scale_y))
-                    for hx, hy, a, c, h in persons
-                ]
+                # Rescale coordinates if needed
+                if persons and (scale_x != 1.0 or scale_y != 1.0):
+                    persons = [
+                        (int(hx * scale_x), int(hy * scale_y),
+                         int(a * scale_x * scale_y), c, int(h * scale_y))
+                        for hx, hy, a, c, h in persons
+                    ]
 
-            if persons:
-                best_mid = max(persons, key=lambda p: p[2])
-                if abs(best_mid[0] - old_person_x) > cut_threshold:
-                    # Mid looks like the new scene → cut is between lo and mid
-                    hi = t_mid
+                if persons:
+                    best_mid = max(persons, key=lambda p: p[2])
+                    if abs(best_mid[0] - old_person_x) > cut_threshold:
+                        # Mid looks like the new scene → cut is between lo and mid
+                        hi = t_mid
+                    else:
+                        # Mid looks like the old scene → cut is between mid and hi
+                        lo = t_mid
+                    refined.append((t_mid, persons))
                 else:
-                    # Mid looks like the old scene → cut is between mid and hi
-                    lo = t_mid
-                refined.append((t_mid, persons))
-            else:
-                # No detection (motion blur / black frame during cut)
-                # Assume cut is happening here, narrow to upper half
-                hi = t_mid
+                    # No detection (motion blur / black frame during cut)
+                    # Assume cut is happening here, narrow to upper half
+                    hi = t_mid
 
-        if refined:
-            insertions.append((orig_idx, refined))
-
-    cap.release()
+            if refined:
+                insertions.append((orig_idx, refined))
+    finally:
+        cap.release()
 
     if not insertions:
         return detections

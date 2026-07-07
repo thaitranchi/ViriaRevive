@@ -126,14 +126,21 @@ def find_sentence_boundary(words: list, clip_duration: float,
     """
     if not words or len(words) < 3:
         return None
+    from subprocess_utils import is_cancelled
+    if is_cancelled():
+        return None
 
     min_time = clip_duration * min_keep    # don't cut before this
     max_time = clip_duration + max_extend  # don't extend past this
 
     # ── Pass 1: sentence-ending punctuation (.!?) ──
     # Search backward from the end — prefer the latest sentence end
+    if is_cancelled():
+        return None
     best_sentence_end = None
     for w in reversed(words):
+        if is_cancelled():
+            return None
         if w["end"] < min_time:
             break
         if w["end"] > max_time:
@@ -151,8 +158,12 @@ def find_sentence_boundary(words: list, clip_duration: float,
         return result
 
     # ── Pass 2: long natural pause between words ──
+    if is_cancelled():
+        return None
     best_pause_end = None
     for i in range(len(words) - 1, 0, -1):
+        if is_cancelled():
+            return None
         word_end = words[i - 1]["end"]
         next_start = words[i]["start"]
         if word_end < min_time:
@@ -171,8 +182,12 @@ def find_sentence_boundary(words: list, clip_duration: float,
         return result
 
     # ── Pass 3: soft punctuation (comma, colon, etc.) ──
+    if is_cancelled():
+        return None
     best_soft_end = None
     for w in reversed(words):
+        if is_cancelled():
+            return None
         if w["end"] < min_time:
             break
         if w["end"] > max_time:

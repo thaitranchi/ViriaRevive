@@ -181,6 +181,14 @@ class PipelineCache:
 
     def set_moments(self, moments: list[dict]):
         state = self.load_state()
+        # Preserve existing keys (transcript, crop_params) from stored moments
+        existing = {m.get("start"): m for m in state.moments if isinstance(m, dict) and "start" in m}
+        for m in moments:
+            stored = existing.get(m.get("start"))
+            if stored:
+                for k in ("transcript", "crop_params", "end", "duration"):
+                    if k in stored and k not in m:
+                        m[k] = stored[k]
         state.moments = moments
         self.save_state(state)
 

@@ -127,6 +127,11 @@ def generate_subtitles(
         print("[!] No words for subtitles")
         return None
 
+    from subprocess_utils import is_cancelled
+    if is_cancelled():
+        print("[!] Subtitles cancelled")
+        return None
+
     s = dict(STYLES.get(style, STYLES["tiktok"]))  # copy
 
     # ── adapt for vertical video ─────────────────────────────────────────
@@ -253,7 +258,9 @@ def generate_drawtext_vf(
     font_name = s.get("font", "Arial")
     font_file = _FONT_FILES.get(font_name, "arial.ttf")
     if platform.system() == "Windows":
-        fontfile_escaped = f"C\\:/Windows/Fonts/{font_file}"
+        windir = os.environ.get("SystemRoot", "C:\\Windows")
+        font_root = windir.replace(":", "\\:").replace("\\", "/")
+        fontfile_escaped = f"{font_root}/Fonts/{font_file}"
     else:
         fontfile_escaped = f"/usr/share/fonts/truetype/{font_file}"
 
@@ -266,9 +273,10 @@ def generate_drawtext_vf(
         start = phrase["start"]
         end = phrase["end"]
 
-        # Escape for ffmpeg drawtext: colons, backslashes, single quotes
+        # Escape for ffmpeg drawtext: colons, commas, backslashes, single quotes
         text = text.replace("\\", "\\\\")
         text = text.replace(":", "\\:")
+        text = text.replace(",", "\\,")
         text = text.replace("'", "\u2019")  # replace apostrophe with unicode right single quote
 
         # Time-based y: visible during phrase, off-screen otherwise

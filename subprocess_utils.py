@@ -34,6 +34,11 @@ def reset_cancel():
     """Clear the cancel flag (call before starting a new pipeline)."""
     _cancel_flag.clear()
     with _lock:
+        for proc in _active_processes:
+            try:
+                proc.terminate()
+            except OSError as e:
+                logger.debug("Failed to terminate process %d: %s", proc.pid, e)
         _active_processes.clear()
 
 
