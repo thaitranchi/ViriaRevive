@@ -7,9 +7,11 @@ raising into the pipeline.
 from __future__ import annotations
 
 import json
-import urllib.error
+import logging
 import urllib.request
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 BASE_URL = "http://127.0.0.1:11434"
@@ -25,7 +27,8 @@ def ollama_available(timeout: int | float = 3) -> bool:
         req = urllib.request.Request(TAGS_URL)
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.status == 200
-    except Exception:
+    except Exception as e:
+        logger.debug("Ollama not available: %s", e)
         return False
 
 
@@ -36,7 +39,8 @@ def list_models(timeout: int | float = 3) -> list[str]:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read())
             return [m["name"] for m in data.get("models", []) if m.get("name")]
-    except Exception:
+    except Exception as e:
+        logger.debug("Failed to list Ollama models: %s", e)
         return []
 
 

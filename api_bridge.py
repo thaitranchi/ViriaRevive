@@ -1186,10 +1186,10 @@ class ApiBridge:
                 return True
             except OSError as e:
                 if i < retries - 1:
-                    logger.warning(f"Retrying unlink of {path.name} (attempt {i+1}/{retries}): {e}")
+                    logger.warning("Retrying unlink of %s (attempt %d/%d): %s", path.name, i + 1, retries, e)
                     time.sleep(delay)
                 else:
-                    logger.error(f"Failed to unlink {path.name} after {retries} attempts: {e}")
+                    logger.error("Failed to unlink %s after %d attempts: %s", path.name, retries, e)
                     return False
             except Exception as e:
                 print(f"[cleanup] Unexpected error unlinking {path.name}: {e}")
@@ -1411,7 +1411,8 @@ class ApiBridge:
             )
             out = r.stdout.strip()
             return float(out) if out else 0.0
-        except Exception:
+        except Exception as e:
+            logger.debug("ffprobe duration probe failed for %s: %s", path.name, e)
             return 0.0
 
     def _run_pipeline(self, url, settings, local_file_path=None):
@@ -2045,7 +2046,7 @@ class ApiBridge:
                     return
                 except Exception as e:
                     if i == 4: # type: ignore
-                        logger.error(f"Failed to save state after 5 retries: {e}")
+                        logger.error("Failed to save state after 5 retries: %s", e)
                     time.sleep(0.2)
 
     def _load_state(self):

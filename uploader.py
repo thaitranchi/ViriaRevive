@@ -101,8 +101,11 @@ def _load_creds(account_id: str):
     path = _token_path(account_id)
     if not path.exists():
         return None, "Token file not found"
-    raw = path.read_text(encoding="utf-8")
-    data = json.loads(raw)
+    try:
+        raw = path.read_text(encoding="utf-8")
+        data = json.loads(raw)
+    except (OSError, json.JSONDecodeError) as e:
+        return None, f"Corrupt token file: {e}"
     creds = Credentials.from_authorized_user_info(data, _SCOPES)
     if not creds:
         return None, "Failed to parse token file"

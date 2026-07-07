@@ -2,6 +2,7 @@
 
 import time
 from pathlib import Path
+from subprocess_utils import is_cancelled
 
 
 def fmt_time(seconds: int | float) -> str:
@@ -21,6 +22,8 @@ def wait_for_file_unlock(path: Path, timeout: float = 5.0, interval: float = 0.5
     """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
+        if is_cancelled():
+            return False
         try:
             with open(path, 'rb'):
                 return True

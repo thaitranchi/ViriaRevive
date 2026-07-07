@@ -7,6 +7,7 @@ quick access to restore, open output folder, or quit.
 import logging
 import sys
 import threading
+import time
 from pathlib import Path
 from PIL import Image, ImageDraw
 
@@ -86,7 +87,6 @@ class TrayManager:
             except Exception as e:
                 if self._running:
                     logger.warning("Tray icon error, restarting: %s", e)
-                    import time
                     time.sleep(1)
 
     def stop(self):

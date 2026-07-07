@@ -1,5 +1,6 @@
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import time
@@ -73,7 +74,6 @@ def _escape_sub_path_win(path: Path) -> str:
 def _copy_fonts_to_dir(dest_dir: Path):
     """Copy common fonts to subtitle temp dir so libass can find them without fontconfig."""
     import platform
-    import shutil
     if platform.system() != "Windows":
         return
     fonts_dir = Path(os.environ.get("WINDIR", "C:\\Windows")) / "Fonts"
@@ -107,7 +107,6 @@ def _prepare_subtitle_file(subtitle_path: Path, output_stem: str) -> tuple[Path 
 
     Returns (temp_sub_path, temp_dir) or (None, None).
     """
-    import shutil
     if not subtitle_path or not Path(subtitle_path).exists():
         return None, None
     if Path(subtitle_path).stat().st_size < 20:
@@ -831,7 +830,6 @@ def extract_audio_clip(video_path: Path, start: float, end: float, output_path: 
 
 
 def _rename_safe(src: Path, dst: Path):
-    import shutil
     import time
     # Try a few times to handle Windows file locks (e.g. from the UI preview or OS indexer)
     for i in range(10):
