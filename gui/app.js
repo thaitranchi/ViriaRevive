@@ -139,8 +139,16 @@ function _decodeThumbnail(videoUrl, targetEl, seekTime) {
     vid.muted = true;
     vid.preload = 'metadata';
     vid.playsInline = true;
+    let _cleaned = false;
 
-    const cleanup = () => { vid.src = ''; vid.load(); _thumbActive--; _processThumbQueue(); };
+    const cleanup = () => {
+        if (_cleaned) return;
+        _cleaned = true;
+        vid.src = '';
+        vid.load();
+        _thumbActive--;
+        _processThumbQueue();
+    };
 
     vid.addEventListener('loadeddata', () => {
         vid.currentTime = Math.min(seekTime, vid.duration * 0.5 || seekTime);
@@ -263,8 +271,10 @@ window.addEventListener('pywebviewready', async () => {
 
         // Start background upload scheduler
         await pywebview.api.start_scheduler();
+        _startSchedulerTick();
         if (state.scheduled.some(s => !s.uploaded)) {
-            document.getElementById('scheduler-bar').classList.remove('hidden');
+            const bar = document.getElementById('scheduler-bar');
+            if (bar) bar.classList.remove('hidden');
         }
     } catch (e) {
         console.error('Init error:', e);
@@ -360,7 +370,8 @@ async function startProcessing() {
     if (state.processing) return;
 
     if (state.inputMode === 'url') {
-        const urlInput = document.getElementById('url-input').value.trim();
+        const urlInputEl = document.getElementById('url-input');
+        const urlInput = urlInputEl ? urlInputEl.value.trim() : '';
 
         if (!state.batchQueue.length && !urlInput) {
             showErrorDialog('YouTube URL required', 'Paste at least one video URL (starting with http:// or https://), or add links to the queue with the + button.');
@@ -763,7 +774,7 @@ function initTrimmerDrag() {
 
     document.addEventListener('mousemove', _trimmerMove);
 
-    document.addEventListener('mouseup', () => {
+    const _onTrimmerUp = () => {
         if (trimmerState.dragging) {
             trimmerState.dragging = null;
             // Ensure minimum selection
@@ -772,7 +783,14 @@ function initTrimmerDrag() {
                 updateTrimmerSelection();
             }
         }
-    });
+    };
+    document.addEventListener('mouseup', _onTrimmerUp);
+
+    // Store cleanup so it can be removed when modal closes
+    trimmerState._cleanup = () => {
+        document.removeEventListener('mousemove', _trimmerMove);
+        document.removeEventListener('mouseup', _onTrimmerUp);
+    };
 }
 
 function trimmerReset() {
@@ -864,6 +882,7 @@ function confirmStyleAndGenerate() {
         musicTrimEnd: trimValues ? trimValues.end : null,
     });
 
+    if (trimmerState._cleanup) { trimmerState._cleanup(); trimmerState._cleanup = null; }
     closeModal('style-picker-modal');
 
     // Snapshot settings for the entire batch
@@ -1062,7 +1081,7 @@ async function processNextInQueue() {
             item.status = 'error';
             toast(`Failed: ${item.label} — ${r.error}`, 'error');
             renderBatchQueue();
-            processNextInQueue();
+            return processNextInQueue();
         }
         // Otherwise, onPipelineComplete will call processNextInQueue
     } catch (e) {
@@ -1148,28 +1167,32 @@ function resetGenerate() {
 
 function toggleConsole() {
     const panel = document.getElementById('console-panel');
+    if (!panel) return;
     panel.classList.toggle('hidden');
     if (!panel.classList.contains('hidden')) {
         const log = document.getElementById('console-log');
-        log.scrollTop = log.scrollHeight;
+        if (log) log.scrollTop = log.scrollHeight;
     }
 }
 
 function clearConsole() {
-    document.getElementById('console-log').innerHTML = '';
+    const el = document.getElementById('console-log');
+    if (el) el.innerHTML = '';
 }
 
 function toggleGlobalConsole() {
     const panel = document.getElementById('global-console');
+    if (!panel) return;
     panel.classList.toggle('hidden');
     if (!panel.classList.contains('hidden')) {
         const log = document.getElementById('global-console-log');
-        log.scrollTop = log.scrollHeight;
+        if (log) log.scrollTop = log.scrollHeight;
     }
 }
 
 function clearGlobalConsole() {
-    document.getElementById('global-console-log').innerHTML = '';
+    const el = document.getElementById('global-console-log');
+    if (el) el.innerHTML = '';
 }
 
 function _appendLogLine(log, text, isDebug) {
@@ -1300,8 +1323,10 @@ window.onPipelineCancelled = function () {
 
 window.onSchedulerStatus = function (msg) {
     const bar = document.getElementById('scheduler-bar');
+    if (!bar) return;
     bar.classList.remove('hidden');
-    document.getElementById('scheduler-status-text').textContent = msg;
+    const statusText = document.getElementById('scheduler-status-text');
+    if (statusText) statusText.textContent = msg;
     // Add uploading notification if it looks like an active upload
     if (msg.toLowerCase().includes('uploading')) {
         addNotification('Uploading', msg, 'uploading');
@@ -1311,8 +1336,18 @@ window.onSchedulerStatus = function (msg) {
 // Update scheduler bar — cache next upload and only recalc when needed
 let _cachedNextUpload = null;
 let _nextUploadCacheTime = 0;
+let _schedulerTick = null;
 
-setInterval(() => {
+function _startSchedulerTick() {
+    if (_schedulerTick) return;
+    _schedulerTick = setInterval(_onSchedulerTick, 30000);
+}
+
+function _stopSchedulerTick() {
+    if (_schedulerTick) { clearInterval(_schedulerTick); _schedulerTick = null; }
+}
+
+function _onSchedulerTick() {
     const bar = document.getElementById('scheduler-bar');
     if (!bar || bar.classList.contains('hidden')) return;
 
@@ -1334,10 +1369,11 @@ setInterval(() => {
     if (diffMs > 0) {
         const hrs = Math.floor(diffMs / 3600000);
         const mins = Math.floor((diffMs % 3600000) / 60000);
-        document.getElementById('scheduler-status-text').textContent =
+        const st = document.getElementById('scheduler-status-text');
+        if (st) st.textContent =
             `Next upload: Clip ${_cachedNextUpload.clipIdx + 1} in ${hrs}h ${mins}m`;
     }
-}, 30000);
+}
 
 window.onScheduledUploadDone = function (clipIdx, success, error) {
     const clipName = state.results[clipIdx]?.filename || `Clip ${clipIdx + 1}`;
@@ -3052,7 +3088,7 @@ function uploadOverdueNow() {
 
     if (count > 0) {
         toast(`${count} clip${count > 1 ? 's' : ''} queued for immediate upload`, 'success');
-        try { pywebview.api.start_scheduler(); } catch (_) { }
+        pywebview.api.start_scheduler().catch(() => {});
     }
 }
 
@@ -3137,9 +3173,7 @@ function pickClipForDate(clipIdx) {
 
 function persistSchedule() {
     _cachedNextUpload = null; _nextUploadCacheTime = 0; // invalidate scheduler cache
-    try {
-        pywebview.api.save_scheduled(state.scheduled);
-    } catch (_) { }
+    pywebview.api.save_scheduled(state.scheduled).catch(() => {});
 }
 
 /* ── Meta Modal (edit scheduled item) ─────────────────────────────────── */
@@ -3239,7 +3273,7 @@ async function startUpload() {
 
     // Set channel_id for items that don't have one yet (preserve per-item assignments)
     state.scheduled.forEach(s => { if (!s.channel_id) s.channel_id = state.selectedChannel; });
-    pywebview.api.save_scheduled(state.scheduled);
+    await pywebview.api.save_scheduled(state.scheduled);
 
     document.getElementById('upload-progress-card').classList.remove('hidden');
     document.getElementById('btn-upload').disabled = true;
@@ -3492,7 +3526,9 @@ function setTitleLanguage(lang) {
 
 function resetSettings() {
     localStorage.removeItem('viria_settings');
-    pywebview.api.get_settings().then(s => { state.settings = s; populateSettings(s); toast('Settings reset', 'success'); });
+    pywebview.api.get_settings()
+        .then(s => { state.settings = s; populateSettings(s); toast('Settings reset', 'success'); })
+        .catch(() => toast('Failed to load settings', 'error'));
 }
 
 function updateHwEncoderStatus(deps) {
