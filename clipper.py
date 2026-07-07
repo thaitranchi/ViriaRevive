@@ -421,13 +421,6 @@ def _fallback_shorts_encode(video_path: Path, start: float, duration: float,
 # ── Helpers for merged FFmpeg pass ───────────────────────────────────────────
 
 
-def _get_effect_vf(effect: str | None) -> str | None:
-    """Return the video filter string for an effect preset, or None."""
-    if not effect or effect == "none" or effect not in EFFECTS_PRESETS:
-        return None
-    return EFFECTS_PRESETS[effect]["vf"]
-
-
 def _build_music_extra_inputs(music_path: Path | None) -> list[str]:
     """Return extra -i args if a music file is provided and exists."""
     if not music_path or not Path(music_path).exists():
@@ -595,15 +588,15 @@ def extract_clip(
     start: int,
     end: int,
     output_path: Path,
-    subtitle_path: Path = None,
-    crop_params: tuple = None,
+    subtitle_path: Path | None = None,
+    crop_params: tuple | None = None,
     preset: str = "ultrafast",
     crf: str = "23",
     encoder: str = "auto",
     decoder: str = "auto",
     shorts_format: str = "crop",  # "crop" | "blur_pad" | "none"
-    effect: str = None,
-    music_path: Path = None,
+    effect: str | None = None,
+    music_path: Path | None = None,
     music_volume: float = 0.12,
     music_trim_start: float = 0,
     music_trim_end: float = 0,

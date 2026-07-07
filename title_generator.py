@@ -11,27 +11,9 @@ from ollama_client import (
     ensure_model,
     generate,
     list_models,
-    model_exists,
-    ollama_available,
-    pull_model,
 )
 
 TIMEOUT = 30  # seconds per title request
-
-
-def _ollama_available() -> bool:
-    """Quick check if Ollama is running."""
-    return ollama_available()
-
-
-def _model_exists(model: str = DEFAULT_MODEL) -> bool:
-    """Check if a specific model is already downloaded in Ollama."""
-    return model_exists(model)
-
-
-def _pull_model(model: str = DEFAULT_MODEL) -> bool:
-    """Pull (download) a model via Ollama. Blocks until complete."""
-    return pull_model(model)
 
 
 def _ask_ollama(transcript: str, model: str = DEFAULT_MODEL, language: str = None) -> str | None:

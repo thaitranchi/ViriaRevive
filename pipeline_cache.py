@@ -89,6 +89,17 @@ class PipelineCache:
                 json.dump(asdict(state), f, indent=2, default=str)
             tmp.replace(self._state_path)
 
+    def _modify_state(self, fn):
+        """Load state, apply fn(state), then save — all under the lock."""
+        with self._lock:
+            state = self.load_state()
+            fn(state)
+            self._state_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._state_path.with_suffix(".json.tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(asdict(state), f, indent=2, default=str)
+            tmp.replace(self._state_path)
+
     def clear_state(self):
         self._state_path.unlink(missing_ok=True)
 
@@ -117,15 +128,14 @@ class PipelineCache:
         return None
 
     def set_transcript(self, clip_num: int, words: list, transcript_text: str):
-        state = self.load_state()
-        for m in state.moments:
-            if m.get("_clip_num") == clip_num:
-                m["_words"] = words
-                m["transcript"] = transcript_text
-                break
-        else:
+        def _update(state):
+            for m in state.moments:
+                if m.get("_clip_num") == clip_num:
+                    m["_words"] = words
+                    m["transcript"] = transcript_text
+                    return
             state.moments.append({"_clip_num": clip_num, "_words": words, "transcript": transcript_text})
-        self.save_state(state)
+        self._modify_state(_update)
 
     # ── Crop params caching ─────────────────────────────────────────────
 
@@ -152,14 +162,13 @@ class PipelineCache:
         return None
 
     def set_crop_params(self, clip_num: int, crop_params):
-        state = self.load_state()
-        for m in state.moments:
-            if m.get("_clip_num") == clip_num:
-                m["_crop_params"] = crop_params
-                break
-        else:
+        def _update(state):
+            for m in state.moments:
+                if m.get("_clip_num") == clip_num:
+                    m["_crop_params"] = crop_params
+                    return
             state.moments.append({"_clip_num": clip_num, "_crop_params": crop_params})
-        self.save_state(state)
+        self._modify_state(_update)
 
     # ── Completed clip detection ────────────────────────────────────────
 
@@ -168,10 +177,10 @@ class PipelineCache:
         return clip_num in state.clips_completed
 
     def mark_clip_done(self, clip_num: int):
-        state = self.load_state()
-        if clip_num not in state.clips_completed:
-            state.clips_completed.append(clip_num)
-        self.save_state(state)
+        def _update(state):
+            if clip_num not in state.clips_completed:
+                state.clips_completed.append(clip_num)
+        self._modify_state(_update)
 
     def done_clips(self) -> set[int]:
         state = self.load_state()
@@ -180,17 +189,16 @@ class PipelineCache:
     # ── Moments cache (lightweight: just start/end/duration) ────────────
 
     def set_moments(self, moments: list[dict]):
-        state = self.load_state()
-        # Preserve existing keys (transcript, crop_params) from stored moments
-        existing = {m.get("start"): m for m in state.moments if isinstance(m, dict) and "start" in m}
-        for m in moments:
-            stored = existing.get(m.get("start"))
-            if stored:
-                for k in ("transcript", "crop_params", "end", "duration"):
-                    if k in stored and k not in m:
-                        m[k] = stored[k]
-        state.moments = moments
-        self.save_state(state)
+        def _update(state):
+            existing = {m.get("start"): m for m in state.moments if isinstance(m, dict) and "start" in m}
+            for m in moments:
+                stored = existing.get(m.get("start"))
+                if stored:
+                    for k in ("transcript", "crop_params", "end", "duration"):
+                        if k in stored and k not in m:
+                            m[k] = stored[k]
+            state.moments = moments
+        self._modify_state(_update)
 
     def get_moments(self) -> list[dict]:
         state = self.load_state()

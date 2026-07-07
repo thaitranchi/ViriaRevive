@@ -6,6 +6,7 @@ import logging
 import re
 import shutil
 import sys
+import threading
 from dataclasses import dataclass
 
 from subprocess_utils import run as _run
@@ -147,6 +148,7 @@ class HwProfile:
 
 
 _profile: HwProfile | None = None
+_profile_lock = threading.Lock()
 
 
 def _ffmpeg_available() -> bool:
@@ -259,8 +261,9 @@ def _resolve_encoder(codec: str | None, available: frozenset[str], verify: bool 
 def probe_ffmpeg(encoder_pref: str = "auto") -> HwProfile:
     """Probe ffmpeg once per process; return cached HwProfile."""
     global _profile
-    if _profile is not None and encoder_pref in ("auto", None):
-        return _profile
+    with _profile_lock:
+        if _profile is not None and encoder_pref in ("auto", None):
+            return _profile
 
     enc_out = _run_ffmpeg_list("-encoders")
     hw_out = _run_ffmpeg_list("-hwaccels")
@@ -289,7 +292,8 @@ def probe_ffmpeg(encoder_pref: str = "auto") -> HwProfile:
         active_hwaccel=hwaccel,
     )
     if encoder_pref in ("auto", None):
-        _profile = profile
+        with _profile_lock:
+            _profile = profile
     return profile
 
 

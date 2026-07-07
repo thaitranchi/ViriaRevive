@@ -194,6 +194,7 @@ def process(
         state = cache.load_state()
         state.url = url
         state.stem = stem
+        state.step_downloaded = True
         state.num_clips = num_clips
         state.clip_duration = clip_duration
         cache.save_state(state)

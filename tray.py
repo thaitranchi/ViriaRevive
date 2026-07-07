@@ -27,8 +27,11 @@ _ICON_PATH = _BASE / "gui" / "tray_icon.png"
 def _create_icon_image():
     """Generate a simple 64x64 tray icon (purple/cyan gradient V shape)."""
     if _ICON_PATH.exists():
-        with Image.open(str(_ICON_PATH)) as img:
-            return img.copy()
+        try:
+            with Image.open(str(_ICON_PATH)) as img:
+                return img.copy()
+        except Exception as e:
+            logger.warning("Failed to load tray icon image: %s — using fallback", e)
 
     size = 64
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))

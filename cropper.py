@@ -242,15 +242,10 @@ def _get_yolo_model(device_pref: str = "auto",
     device = resolve_yolo_device(device_pref, gpu_index=gpu_index)
     with _yolo_lock:
         _yolo_device_pref = device_pref
-
-        # Return cached instance for this device if available
         if device in _yolo_models:
             return _yolo_models[device], _yolo_devices.get(device, device)
-
-        # Avoid re-probing failed devices
         if device in _yolo_checked_devices:
             return _yolo_models.get(device), _yolo_devices.get(device)
-
         _yolo_checked_devices.add(device)
     try:
         from ultralytics import YOLO

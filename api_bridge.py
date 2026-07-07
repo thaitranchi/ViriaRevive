@@ -762,8 +762,8 @@ class ApiBridge:
         try:
             wav = Path(tempfile.gettempdir()) / f"viria_backfill_{clip_index}.wav"
             try:
-                import subprocess as _sp
-                r = _sp.run(
+                from subprocess_utils import run as _srun
+                r = _srun(
                     ["ffprobe", "-v", "error", "-show_entries", "format=duration",
                      "-of", "csv=p=0", str(p)],
                     capture_output=True, text=True, timeout=15,
@@ -1787,9 +1787,6 @@ class ApiBridge:
             logger.exception("Pipeline error")
             self._error("An unexpected error occurred during processing.")
         finally:
-            # Windows needs a moment to release handles (FFmpeg/Clipper/Whisper)
-            time.sleep(1.5)
-
             if not debug_mode:
                 if is_downloaded and video_path and video_path.exists():
                     try:

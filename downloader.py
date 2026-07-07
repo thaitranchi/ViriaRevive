@@ -39,8 +39,8 @@ def download_video(url: str, output_dir: Path = DOWNLOADS_DIR) -> Path | None:
                 wait_for_file_unlock(path, timeout=2.0)
             return path
     except yt_dlp.DownloadError as e:
-        logger.error(f"yt-dlp download failed for {url}: {e}")
+        logger.error("yt-dlp download failed for %s: %s", url, e)
         return None
     except Exception:
-        logger.exception(f"Unexpected download error for {url}")
+        logger.exception("Unexpected download error for %s", url)
         return None
