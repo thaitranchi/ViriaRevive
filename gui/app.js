@@ -3377,7 +3377,6 @@ async function clearGeminiKey() {
 
 function populateSettings(s) {
     s.clip_duration = parseInt(s.clip_duration || 30);
-    // Restore auto-clips checkbox state
     const autoClipsEl = document.getElementById('set-auto-clips');
     const isAuto = s.num_clips === 'auto';
     if (autoClipsEl) {
@@ -3399,7 +3398,7 @@ function populateSettings(s) {
     setSelect('set-model', s.whisper_model);
     setSelect('set-preset', s.ffmpeg_preset);
     setSelect('set-encoder', s.video_encoder || 'auto');
-    setSelect('set-decoder', s.video_decoder || 'auto'); // Add this line
+    setSelect('set-decoder', s.video_decoder || 'auto');
     setSelect('set-whisper-device', s.whisper_device || 'auto');
     setSelect('set-category', s.upload_category || '20');
     setSelect('set-upload-region', s.upload_region || 'US');
@@ -3417,6 +3416,14 @@ function populateSettings(s) {
             ? (s.gemini_key_hint ? `Saved ${s.gemini_key_hint} — enter new to replace` : 'Key saved — enter new to replace')
             : 'AIza...';
     }
+    const orInput = document.getElementById('set-openrouter-key');
+    if (orInput && !orInput.value) {
+        orInput.placeholder = s.openrouter_key_configured
+            ? (s.openrouter_key_hint ? `Saved ${s.openrouter_key_hint} — enter new to replace` : 'Key saved — enter new to replace')
+            : 'sk-or-v1...';
+    }
+    setSelect('set-openrouter-model', s.openrouter_model || 'openai/gpt-4o-mini');
+    setVal('set-ollama-model', s.ollama_detector_model || 'qwen2.5:3b');
     const debugToggle = document.getElementById('set-debug-logging');
     if (debugToggle) debugToggle.checked = !!s.debug_logging;
     const mode = s.shorts_mode || (s.crop_vertical !== false ? 'crop' : 'none');
@@ -3430,6 +3437,7 @@ function populateSettings(s) {
         opt.classList.toggle('active', opt.dataset.style === style);
         opt.querySelector('input').checked = opt.dataset.style === style;
     });
+    updateAIProviderUI();
 }
 
 function gatherSettings() {
@@ -3446,7 +3454,7 @@ function gatherSettings() {
         ffmpeg_preset: getVal('set-preset'),
         video_crf: getVal('set-crf'),
         video_encoder: getVal('set-encoder'),
-        video_decoder: getVal('set-decoder'), // Add this line
+        video_decoder: getVal('set-decoder'),
         whisper_device: getVal('set-whisper-device'),
         yolo_device: getVal('set-yolo-device'),
         upload_category: getVal('set-category') || '20',
@@ -3456,6 +3464,8 @@ function gatherSettings() {
         upload_description: getVal('set-upload-desc') || '',
         ai_detector: getVal('set-ai-detector') || 'auto',
         ai_provider: getVal('set-ai-provider') || 'gemini',
+        ollama_detector_model: getVal('set-ollama-model') || 'qwen2.5:3b',
+        openrouter_model: getVal('set-openrouter-model') || 'openai/gpt-4o-mini',
         clips_path: getVal('set-clips-path') || '',
         debug_logging: document.getElementById('set-debug-logging')?.checked || false,
         shorts_mode: document.getElementById('set-shorts-enabled')?.checked ? 'crop' : 'none',
@@ -3463,8 +3473,9 @@ function gatherSettings() {
     };
     const geminiKey = getVal('set-gemini-key').trim();
     if (geminiKey) s.gemini_api_key = geminiKey;
+    const orKey = getVal('set-openrouter-key').trim();
+    if (orKey) s.openrouter_api_key = orKey;
     saveLocal('settings', s);
-    // Also persist to Python backend (survives localStorage clears)
     try { pywebview.api.save_settings(s); } catch (_) { }
     return s;
 }
@@ -3506,6 +3517,24 @@ function updateEncoderPresetUI() {
         }
     }
 }
+
+function updateAIProviderUI() {
+    const provider = getVal('set-ai-provider') || 'gemini';
+    const geminiRow = document.getElementById('set-gemini-key')?.closest('.setting-row');
+    const geminiHint = geminiRow?.nextElementSibling?.tagName === 'SPAN' ? geminiRow.nextElementSibling : null;
+    const orKeyRow = document.getElementById('openrouter-key-row');
+    const orModelRow = document.getElementById('openrouter-model-row');
+    const ollamaRow = document.getElementById('ollama-model-row');
+
+    if (geminiRow) geminiRow.style.display = provider === 'gemini' ? '' : 'none';
+    if (geminiHint && geminiHint.classList.contains('setting-hint')) geminiHint.style.display = provider === 'gemini' ? '' : 'none';
+    if (orKeyRow) orKeyRow.style.display = provider === 'openrouter' ? '' : 'none';
+    if (orModelRow) orModelRow.style.display = provider === 'openrouter' ? '' : 'none';
+    if (ollamaRow) ollamaRow.style.display = provider === 'ollama' ? '' : 'none';
+}
+
+// Show/hide provider-specific settings on change
+document.getElementById('set-ai-provider')?.addEventListener('change', updateAIProviderUI);
 
 function updateSliderLabel(el) {
     const lbl = document.getElementById('val-' + el.id.replace('set-', ''));
@@ -3723,3 +3752,4 @@ function showModal(id) {
     }
 }
 function closeModal(id) { document.getElementById(id)?.classList.add('hidden'); }
+

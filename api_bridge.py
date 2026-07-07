@@ -53,6 +53,9 @@ from config import (
     OLLAMA_DETECTOR_CANDIDATE_MULTIPLIER,
     OLLAMA_DETECTOR_MODEL,
     OLLAMA_DETECTOR_TIMEOUT,
+    OPENROUTER_TOKEN_FILE,
+    OPENROUTER_API_KEY,
+    OPENROUTER_MODEL,
     SUBTITLE_STYLE,
     SUBTITLES_DIR,
     VIDEO_CRF,
@@ -64,6 +67,7 @@ from config import (
     YOLO_DEVICE,
 )
 import gemini_client
+import openrouter_client
 from hwaccel import log_hardware_startup, probe_ffmpeg, get_hardware_summary, video_encode_args, get_gpu_count, select_least_loaded_gpu
 from detector import find_viral_moments
 from ollama_detector import detector_ready, rerank_moments
@@ -2136,3 +2140,6 @@ class ApiBridge:
         return str(s).replace("\\", "\\\\").replace("`", "\\`").replace("$", "\\$") \
                       .replace("\n", "\\n").replace("\r", "\\r") \
                       .replace("'", "\\'")
+
+
+

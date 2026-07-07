@@ -111,6 +111,7 @@ def process(
     encoder: str = VIDEO_ENCODER,
     decoder: str = VIDEO_DECODER,
     sentence_buffer: float = SENTENCE_BUFFER,
+    ollama_model: str = OLLAMA_DETECTOR_MODEL,
     resume: bool = True,
     on_progress: ProgressCB = None,
 ) -> list[Path]:
@@ -139,6 +140,7 @@ def process(
         encoder: Video encoder ('nvenc', 'qsv', 'amf', 'cpu').
         decoder: Video decoder ('cuda', 'd3d11va', etc.).
         sentence_buffer: Extra seconds to extend audio for sentence boundary detection.
+        ollama_model: Ollama model name for AI reranking & title gen.
         resume: Whether to attempt resume from previous pipeline state.
         on_progress: Callback(step, pct, msg) for progress updates.
 
@@ -219,7 +221,7 @@ def process(
     ai_ready = False
     candidate_count = num_clips
     if ai_detector != "off":
-        ai_ready = detector_ready(OLLAMA_DETECTOR_MODEL)
+        ai_ready = detector_ready(ollama_model)
         if ai_ready:
             candidate_count = max(
                 num_clips,
@@ -299,7 +301,7 @@ def process(
                 candidates,
                 clip_duration=clip_duration,
                 keep=num_clips,
-                model=OLLAMA_DETECTOR_MODEL,
+                model=ollama_model,
                 timeout=OLLAMA_DETECTOR_TIMEOUT,
                 on_progress=lambda done, total, score: print(
                     f"[ai-detector] {done}/{total}: {'scored' if score else 'skipped'}"
@@ -492,7 +494,7 @@ def process(
         transcripts = [m.get("transcript", "") for m in moments]
         if any(transcripts):
             all_titles = generate_titles_batch(
-                transcripts, model=OLLAMA_DETECTOR_MODEL, language=title_language or language
+                transcripts, model=ollama_model, language=title_language or language
             )
         else:
             print("[title-gen] No transcripts found; using default titles")
@@ -566,6 +568,7 @@ def main():
     p.add_argument("--schedule",       type=int, default=24, help="hours between scheduled uploads")
     p.add_argument("--no-crop",        action="store_true", help="skip YOLO person-detection cropping (uses center crop)")
     p.add_argument("--ai-detector",    choices=["auto", "off", "on"], default=AI_DETECTOR_MODE, help="local Ollama AI detector mode")
+    p.add_argument("--ollama-model",   default=OLLAMA_DETECTOR_MODEL, help=f"Ollama model name  (default {OLLAMA_DETECTOR_MODEL})")
 
     # ── New options ────────────────────────────────────────────────────
     p.add_argument("--auto-clips",     action="store_true", help="auto-compute clip count from video duration")
@@ -599,6 +602,7 @@ def main():
         schedule_hours=a.schedule,
         crop=not a.no_crop,
         ai_detector=a.ai_detector,
+        ollama_model=a.ollama_model,
         auto_clips=a.auto_clips,
         effect=a.effect,
         music_path=a.music,
@@ -616,3 +620,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

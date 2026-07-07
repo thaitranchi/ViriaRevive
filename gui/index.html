@@ -1086,6 +1086,7 @@
                             <label for="set-ai-provider">AI Provider</label>
                             <select id="set-ai-provider" class="form-select" onchange="gatherSettings()">
                                 <option value="gemini">Google Gemini (Cloud)</option>
+                                <option value="openrouter">OpenRouter (Cloud)</option>
                                 <option value="ollama">Ollama (Local)</option>
                             </select>
                         </div>
@@ -1100,6 +1101,39 @@
                             </div>
                             <input type="password" id="set-gemini-key" class="form-input" placeholder="AIza..." onchange="saveGeminiKey()">
                             <span class="setting-hint">Get one for free at <a href="https://aistudio.google.com/app/apikey" target="_blank" style="text-decoration:underline">Google AI Studio</a>. Stored locally in <code>tokens/gemini_key.json</code>.</span>
+                        </div>
+                        <div class="setting-row" id="openrouter-key-row">
+                            <label for="set-openrouter-key">OpenRouter API Key</label>
+                            <div class="cred-row">
+                                <span id="openrouter-key-status" class="cred-status missing">Not configured</span>
+                                <div class="cred-actions">
+                                    <button type="button" class="btn-secondary btn-sm" onclick="testOpenrouterKey()">Test</button>
+                                    <button type="button" class="btn-secondary btn-sm" id="btn-or-clear" onclick="clearOpenrouterKey()" disabled>Clear</button>
+                                </div>
+                            </div>
+                            <input type="password" id="set-openrouter-key" class="form-input" placeholder="sk-or-v1..." onchange="saveOpenrouterKey()">
+                            <span class="setting-hint">Get a key at <a href="https://openrouter.ai/keys" target="_blank" style="text-decoration:underline">openrouter.ai/keys</a>. Stored locally in <code>tokens/openrouter_key.json</code>.</span>
+                        </div>
+                        <div class="setting-row" id="openrouter-model-row">
+                            <label for="set-openrouter-model">OpenRouter Model</label>
+                            <select id="set-openrouter-model" class="form-select" onchange="gatherSettings()">
+                                <option value="openai/gpt-4o-mini">OpenAI GPT-4o Mini (recommended)</option>
+                                <option value="openai/gpt-4o">OpenAI GPT-4o</option>
+                                <option value="anthropic/claude-3-haiku">Anthropic Claude 3 Haiku</option>
+                                <option value="anthropic/claude-3.5-sonnet">Anthropic Claude 3.5 Sonnet</option>
+                                <option value="google/gemini-2.0-flash">Google Gemini 2.0 Flash</option>
+                                <option value="google/gemini-2.0-flash-lite-preview-02-05">Google Gemini 2.0 Flash Lite</option>
+                                <option value="meta-llama/llama-3.1-8b-instruct">Meta Llama 3.1 8B (free)</option>
+                                <option value="meta-llama/llama-3.1-70b-instruct">Meta Llama 3.1 70B (free)</option>
+                                <option value="mistralai/mistral-7b-instruct">Mistral 7B (free)</option>
+                                <option value="deepseek/deepseek-chat">DeepSeek V2</option>
+                            </select>
+                            <span class="setting-hint">See all models at <a href="https://openrouter.ai/models" target="_blank" style="text-decoration:underline">openrouter.ai/models</a>.</span>
+                        </div>
+                        <div class="setting-row" id="ollama-model-row">
+                            <label for="set-ollama-model">Ollama Model</label>
+                            <input type="text" id="set-ollama-model" class="form-input" placeholder="qwen2.5:3b" onchange="gatherSettings()">
+                            <span class="setting-hint">Any model installed in Ollama (e.g. <code>qwen2.5:7b</code>, <code>llama3.1:8b</code>). Run <code>ollama pull &lt;model&gt;</code> first.</span>
                         </div>
                         <div class="setting-row">
                             <label for="set-title-language">Title language</label>
@@ -1706,3 +1740,4 @@
 </body>
 
 </html>
+
