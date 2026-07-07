@@ -1,6 +1,9 @@
+import logging
 import sys
 import json
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 # In PyInstaller frozen builds, __file__ resolves to the temp _MEIPASS dir.
 # User data (downloads, clips, tokens, secrets) must live next to the .exe.
@@ -35,8 +38,8 @@ if GEMINI_TOKEN_FILE.exists():
             if _val.startswith("gAAAA"):
                 GEMINI_API_KEY_ENCRYPTED = True
             GEMINI_API_KEY = _val
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("Failed to load Gemini key from %s: %s", GEMINI_TOKEN_FILE, e)
 elif CLIENT_SECRETS_FILE.exists():
     # Migration: check old location if new one doesn't exist
     try:
@@ -46,13 +49,14 @@ elif CLIENT_SECRETS_FILE.exists():
             if _val.startswith("gAAAA"):
                 GEMINI_API_KEY_ENCRYPTED = True
             GEMINI_API_KEY = _val
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("Failed to load Gemini key from %s: %s", CLIENT_SECRETS_FILE, e)
 
 # Clip detection (gaming-tuned: more clips, shorter duration, tighter gaps)
 NUM_CLIPS = 8
 CLIP_DURATION = 25
 MIN_GAP = 10
+SENTENCE_BUFFER = 5
 AI_DETECTOR_MODE = "auto"  # auto | off | on
 AI_PROVIDER = "gemini"     # gemini | ollama
 OLLAMA_DETECTOR_MODEL = "qwen2.5:3b"

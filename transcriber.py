@@ -1,9 +1,11 @@
+import threading
 from pathlib import Path
 
 from hwaccel import resolve_whisper_device
 
 # Per-GPU model cache: key = (model_size, device, compute, gpu_index)
 _model_cache = {}
+_cache_lock = threading.Lock()
 
 
 def _get_device(device_pref: str = "auto",
@@ -20,21 +22,25 @@ def _load_whisper_model(model_size: str, device: str, compute: str,
     from faster_whisper import WhisperModel
 
     cache_key = (model_size, device, compute, device_index)
-    if cache_key not in _model_cache:
-        print(f"[*] Loading Whisper {model_size} ({device}/{compute},"
-              f" device_index={device_index})...")
-        try:
-            _model_cache[cache_key] = WhisperModel(
-                model_size, device=device, device_index=device_index,
-                compute_type=compute,
-            )
-        except Exception as e:
-            if device != "cpu":
-                print(f"[!] Whisper GPU init failed ({e}), falling back to CPU...")
-                return _load_whisper_model(model_size, "cpu", "int8", 0)
-            print(f"[!] Whisper CPU init also failed ({e})")
-            raise
-    return _model_cache[cache_key]
+    with _cache_lock:
+        if cache_key in _model_cache:
+            return _model_cache[cache_key]
+    print(f"[*] Loading Whisper {model_size} ({device}/{compute},"
+          f" device_index={device_index})...")
+    try:
+        model = WhisperModel(
+            model_size, device=device, device_index=device_index,
+            compute_type=compute,
+        )
+    except Exception as e:
+        if device != "cpu":
+            print(f"[!] Whisper GPU init failed ({e}), falling back to CPU...")
+            return _load_whisper_model(model_size, "cpu", "int8", 0)
+        print(f"[!] Whisper CPU init also failed ({e})")
+        raise
+    with _cache_lock:
+        _model_cache[cache_key] = model
+    return model
 
 
 def transcribe_clip(

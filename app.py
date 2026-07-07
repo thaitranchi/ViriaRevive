@@ -2,11 +2,14 @@
 """ViriaRevive Desktop App – debug mode (shows console for logs).
 For no-console launch, double-click app.pyw instead."""
 
+import logging
 import sys
 import webview
 from pathlib import Path
 from api_bridge import ApiBridge
 from tray import TrayManager
+
+logger = logging.getLogger(__name__)
 
 
 def _get_base_dir():
@@ -86,8 +89,8 @@ def _force_quit(window, tray):
     tray.stop()
     try:
         window.destroy()
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("Force quit destroy error: %s", e)
     sys.exit(0)
 
 

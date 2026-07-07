@@ -1301,6 +1301,22 @@ code { background: rgba(255,255,255,0.06); padding: 2px 8px; border-radius: 5px;
 }
 .yt-channel-card:hover .yt-channel-remove-inline { opacity: 1; }
 
+.yt-error-banner {
+    padding: 10px 14px;
+    margin-bottom: 10px;
+    border-radius: 8px;
+    background: rgba(255, 107, 107, 0.08);
+    border: 1px solid rgba(255, 107, 107, 0.2);
+    color: var(--error);
+    font-size: 12px;
+    line-height: 1.4;
+}
+.yt-empty-info {
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid var(--glass-border);
+    color: var(--text-3);
+}
+
 /* ── Calendar Layout ──────────────────────────────────────────────────── */
 
 /* ── Smart Schedule Panel ─────────────────────────────────────────────── */

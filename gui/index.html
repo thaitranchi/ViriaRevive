@@ -829,6 +829,13 @@
                             </div>
                         </div>
                         <div class="setting-row">
+                            <label>Sentence buffer (s)</label>
+                            <div class="slider-group">
+                                <input type="range" id="set-sentence-buffer" min="0" max="10" step="1" value="5" oninput="updateSliderLabel(this)">
+                                <span class="slider-val" id="val-sentence-buffer">5s</span>
+                            </div>
+                        </div>
+                        <div class="setting-row">
                             <label>Min gap between clips (s)</label>
                             <div class="slider-group">
                                 <input type="range" id="set-min-gap" min="5" max="60" step="5" value="15"
