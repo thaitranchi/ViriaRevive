@@ -1505,7 +1505,7 @@ class ApiBridge:
                 if use_gemini:
                     ai_ready = True
                 else:
-                    ai_ready = detector_ready(OLLAMA_DETECTOR_MODEL)
+                    ai_ready = detector_ready(settings.get("ollama_detector_model", OLLAMA_DETECTOR_MODEL))
                 
                 if ai_ready:
                     candidate_count = max(
@@ -1582,7 +1582,7 @@ class ApiBridge:
                             candidate_moments,
                             clip_duration=clip_duration,
                             keep=num_clips,
-                            model=OLLAMA_DETECTOR_MODEL,
+                            model=settings.get("ollama_detector_model", OLLAMA_DETECTOR_MODEL),
                             timeout=OLLAMA_DETECTOR_TIMEOUT,
                             on_progress=_rank_progress,
                         )
