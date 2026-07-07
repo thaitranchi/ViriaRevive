@@ -17,6 +17,7 @@ import argparse
 import logging
 import shutil
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
@@ -84,7 +85,8 @@ def _get_video_duration(video_path: Path) -> float:
             capture_output=True, text=True, timeout=15,
         )
         return float((r.stdout or "0").strip().split()[0])
-    except Exception:
+    except Exception as e:
+        logger.warning("Failed to probe video duration: %s — defaulting to 600s", e)
         return 600.0
 
 
@@ -179,23 +181,16 @@ def process(
 
     cache = PipelineCache(stem)
 
-    # Resume: check if clips are already done
-    if resume:
-        state = cache.load_state()
-        if state.step_downloaded and state.url == url:
-            print(f"[resume] Found previous pipeline state for '{stem}'")
-            # Check which clips already have valid outputs
-            done_paths = []
-            for cn in sorted(state.clips_completed):
-                cp = CLIPS_DIR / f"{stem}_viral{cn}.mp4"
-                if cp.exists() and validate_shorts_output(cp):
-                    done_paths.append(cp)
-            if done_paths:
-                print(f"[resume] {len(done_paths)} clips already completed")
-
     on_progress("download", 100, f"Downloaded: {video_path.name}")
 
-    # Save download state
+    # ── Video duration + auto clips ─────────────────────────────────────
+    vid_duration = _get_video_duration(video_path)
+    if auto_clips:
+        old_n = num_clips
+        num_clips = auto_clip_count(vid_duration, clip_duration)
+        print(f"[auto-clips] {old_n} → {num_clips} clips (video: {vid_duration:.0f}s)")
+
+    # Save download state (after auto_clips may have updated num_clips)
     if resume:
         state = cache.load_state()
         state.url = url
@@ -205,17 +200,6 @@ def process(
         state.clip_duration = clip_duration
         cache.save_state(state)
 
-    # ── Video duration + auto clips ─────────────────────────────────────
-    vid_duration = _get_video_duration(video_path)
-    if auto_clips:
-        old_n = num_clips
-        num_clips = auto_clip_count(vid_duration, clip_duration)
-        print(f"[auto-clips] {old_n} → {num_clips} clips (video: {vid_duration:.0f}s)")
-        if resume:
-            state = cache.load_state()
-            state.num_clips = num_clips
-            cache.save_state(state)
-
     # ── 2. Detect viral moments ──────────────────────────────────────────
     on_progress("detect", 0, "Finding viral moments...")
     ai_ready = False
@@ -223,10 +207,7 @@ def process(
     if ai_detector != "off":
         ai_ready = detector_ready(ollama_model)
         if ai_ready:
-            candidate_count = max(
-                num_clips,
-                num_clips * OLLAMA_DETECTOR_CANDIDATE_MULTIPLIER,
-            )
+            candidate_count = num_clips * OLLAMA_DETECTOR_CANDIDATE_MULTIPLIER
             print(f"[*] AI detector ready; scanning {candidate_count} candidates")
         elif ai_detector == "on":
             print("[ai-detector] Ollama detector requested but unavailable; using heuristic detector")
@@ -244,7 +225,7 @@ def process(
         on_progress("detect", 35, f"Processing {len(moments)} AI candidates (parallel)...")
 
         # ── Parallel candidate processing ───────────────────────────────
-        candidate_lock = __import__("threading").Lock()
+        candidate_lock = threading.Lock()
         candidates: list[dict] = []
 
         def _process_candidate(args):
@@ -531,18 +512,6 @@ def process(
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
-
-
-def _comma_separated(values):
-    """Parse comma-separated tags."""
-    if not values:
-        return []
-    result = []
-    for v in values.split(","):
-        v = v.strip()
-        if v:
-            result.append(v)
-    return result
 
 
 def main():

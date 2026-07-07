@@ -1,6 +1,7 @@
 """YouTube upload with multi-account support, channel selection, and full metadata."""
 
 import json
+import logging
 import sys
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
@@ -67,8 +68,7 @@ def _ensure_tokens_dir():
         except Exception as e:
             # Migration hit a transient error (network, quota, refresh failure).
             # Keep the legacy file so the user doesn't lose their account.
-            import logging
-            logging.getLogger(__name__).warning("Legacy token migration failed: %s", e)
+            logger.warning("Legacy token migration failed: %s", e)
 
 
 def _build_service(creds):
@@ -98,9 +98,12 @@ def _load_creds(account_id: str):
     path = _token_path(account_id)
     if not path.exists():
         return None, "Token file not found"
-    creds = Credentials.from_authorized_user_file(str(path), _SCOPES)
+    raw = path.read_text(encoding="utf-8")
+    data = json.loads(raw)
+    creds = Credentials.from_authorized_user_info(data, _SCOPES)
     if not creds:
         return None, "Failed to parse token file"
+    title = data.get("_account_title", account_id)
     if creds.valid:
         return creds, None
     # Token expired — try to refresh
@@ -109,8 +112,6 @@ def _load_creds(account_id: str):
             return None, "Token expired and no refresh token available — reconnect account"
         try:
             creds.refresh(Request())
-            data = json.loads(path.read_text(encoding="utf-8"))
-            title = data.get("_account_title", account_id)
             _save_token(account_id, title, creds)
             print(f"[+] Refreshed token for {title}")
             return creds, None

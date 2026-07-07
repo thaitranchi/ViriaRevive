@@ -30,6 +30,7 @@ class ClipResult:
 
 SHORTS_WIDTH = 1080
 SHORTS_HEIGHT = 1920
+ALOOP_MAX_SIZE = 2000000000  # 2e9 samples (~41h at 48kHz) for infinite audio loop
 
 
 # ── Subtitle filter detection (cached) ────────────────────────────────────────
@@ -449,7 +450,7 @@ def _build_music_af(clip_duration: float, music_path: Path | None,
         )
     else:
         music_part = (
-            f"[1:a]aloop=loop=-1:size=2000000000,"
+            f"[1:a]aloop=loop=-1:size={ALOOP_MAX_SIZE},"
             f"atrim=duration={clip_duration:.3f},volume={volume:.2f}[bg]"
         )
     return f"{music_part};[0:a][bg]amix=inputs=2:duration=first:dropout_transition=2[aout]"
@@ -819,7 +820,7 @@ def extract_clip(
     return ClipResult(path=None)
 
 
-def extract_audio_clip(video_path: Path, start: int, end: int, output_path: Path) -> Path | None:
+def extract_audio_clip(video_path: Path, start: float, end: float, output_path: Path) -> Path | None:
     """Extract mono 16 kHz WAV audio for whisper transcription."""
     cmd = [
         "ffmpeg", "-y",
@@ -945,7 +946,7 @@ def add_background_music(
     else:
         # No trim — loop the full track
         af_music = (
-            f"[1:a]aloop=loop=-1:size=2000000000,"
+            f"[1:a]aloop=loop=-1:size={ALOOP_MAX_SIZE},"
             f"atrim=duration={clip_dur:.3f},volume={volume:.2f}[bg]"
         )
 

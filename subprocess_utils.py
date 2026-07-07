@@ -128,6 +128,7 @@ def run(*args, **kwargs):
             elapsed = time.monotonic() - _start_time
             if timeout is not None and elapsed >= timeout:
                 _kill_process_tree(proc)
+                logger.warning("Process %d timed out after %.1fs (limit %ss)", proc.pid, elapsed, timeout)
                 raise subprocess.TimeoutExpired(proc.args, timeout=timeout)
             # Wait a bit before next poll
             try:

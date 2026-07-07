@@ -366,22 +366,25 @@ def video_encode_args(
         ])
     if codec == "h264_qsv":
         qsv_preset = _X264_TO_QSV.get(x264_preset, "veryfast")
-        return [
+        args = [
             "-c:v", "h264_qsv",
             "-preset", qsv_preset,
             "-global_quality:v", cq,
             "-pix_fmt", "yuv420p",
         ]
+        if gpu_index is not None and gpu_index >= 0:
+            args += ["-engine:v", str(gpu_index)]
+        return args
     if codec == "h264_amf":
         amf_preset = _X264_TO_AMF.get(x264_preset, "balanced")
-        return [
+        return _maybe_gpu_flag([
             "-c:v", "h264_amf",
             "-quality", amf_preset,
             "-rc:v", "vbr_latency",
             "-qp_i:v", cq,
             "-qp_p:v", cq,
             "-pix_fmt", "yuv420p",
-        ]
+        ])
     if codec == "hevc_nvenc":
         nv_preset = _X264_TO_NVENC.get(x264_preset, "p4")
         return _maybe_gpu_flag([
@@ -393,22 +396,25 @@ def video_encode_args(
         ])
     if codec == "hevc_qsv":
         qsv_preset = _X264_TO_QSV.get(x264_preset, "veryfast")
-        return [
+        args = [
             "-c:v", "hevc_qsv",
             "-preset", qsv_preset,
             "-global_quality:v", cq,
             "-pix_fmt", "yuv420p",
         ]
+        if gpu_index is not None and gpu_index >= 0:
+            args += ["-engine:v", str(gpu_index)]
+        return args
     if codec == "hevc_amf":
         amf_preset = _X264_TO_AMF.get(x264_preset, "balanced")
-        return [
+        return _maybe_gpu_flag([
             "-c:v", "hevc_amf",
             "-quality", amf_preset,
             "-rc:v", "vbr_latency",
             "-qp_i:v", cq,
             "-qp_p:v", cq,
             "-pix_fmt", "yuv420p",
-        ]
+        ])
     if codec == "libx265":
         return [
             "-c:v", "libx265",

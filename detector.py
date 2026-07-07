@@ -1,9 +1,8 @@
+from __future__ import annotations
 import os
 import re
 import subprocess
 import shutil
-import numpy as np
-from pydub import AudioSegment
 from pathlib import Path
 
 from subprocess_utils import run as _run, is_cancelled, CancelledError
@@ -15,6 +14,7 @@ logger = logging.getLogger(__name__)
 
 # Explicitly point pydub to ffmpeg/ffprobe binaries found in PATH
 def _sync_pydub_paths():
+    from pydub import AudioSegment
     _ffmpeg_path = shutil.which("ffmpeg")
     _ffprobe_path = shutil.which("ffprobe")
     if _ffmpeg_path:
@@ -32,6 +32,7 @@ def find_viral_moments(
     min_gap: int = 15,
 ) -> list:
     """Find viral moments using audio energy + scene change analysis (no AI)."""
+    import numpy as np
 
     logger.info("Analyzing audio energy (waiting for file access)...")
     
@@ -158,6 +159,7 @@ def find_viral_moments(
 
 def _scene_change_density(video_path: Path, length: int) -> np.ndarray:
     """Count scene changes per second using ffmpeg."""
+    import numpy as np
     try:
         cmd = [
             "ffmpeg",

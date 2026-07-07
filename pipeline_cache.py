@@ -15,9 +15,11 @@ from pathlib import Path
 from dataclasses import dataclass, asdict, field
 from typing import Optional
 
+import logging
+
 import config
 
-logger = __import__("logging").getLogger(__name__)
+logger = logging.getLogger(__name__)
 
 
 # ── Pipeline State ───────────────────────────────────────────────────────────

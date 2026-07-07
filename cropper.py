@@ -21,6 +21,8 @@ from hwaccel import resolve_yolo_device
 
 import logging
 
+logger = logging.getLogger(__name__)
+
 # OpenCV VideoCapture is not thread-safe; protect with a lock
 _cv2_lock = threading.Lock()
 
@@ -48,8 +50,6 @@ _yolo_devices: dict[str, str] = {}          # device_str → resolved device str
 _yolo_checked_devices: set[str] = set()     # set of device strings that have been probed
 _yolo_device_pref = "auto"
 YOLO_BATCH_SIZE = 32
-
-logger = logging.getLogger(__name__)
 
 
 # ── Public API ───────────────────────────────────────────────────────────────
@@ -504,7 +504,7 @@ def detect_all_persons(video_path, start, end, width, height, sample_count,
                   f"OpenCV={cv_w}x{cv_h} → rescaling coords by {scale_x:.2f}x{scale_y:.2f}")
             # Check if it's a 90°/270° rotation (width/height swapped)
             if abs(cv_w - height) < 4 and abs(cv_h - width) < 4:
-                print(f"[!] Detected 90° rotation — swapping coordinate axes")
+                logger.warning("Detected 90° rotation — swapping coordinate axes")
 
     debug_frame = test_frame # type: ignore # save first frame for debug output
     debug_saved = False
