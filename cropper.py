@@ -11,7 +11,6 @@ Body-aware cropping: the crop is positioned so the person's head is at ~30%
 from the top ("rule of thirds"), keeping their full body visible.
 """
 
-import subprocess
 import threading
 import numpy as np
 import cv2
@@ -40,6 +39,7 @@ CUT_DELAY_SEC = 0.200     # delay crop switch 200ms after detected cut to avoid 
 CUT_HOLD_BEFORE = 0.050   # hold old crop 50ms before the cut too (covers early-switch)
 
 # YOLO caches its model per-device so we only load once per GPU
+_yolo_lock = threading.Lock()
 _yolo_models: dict[str, object] = {}       # device_str → YOLO model instance
 _yolo_devices: dict[str, str] = {}          # device_str → resolved device string
 _yolo_checked_devices: set[str] = set()     # set of device strings that have been probed
@@ -237,26 +237,28 @@ def _get_yolo_model(device_pref: str = "auto",
     """
     global _yolo_device_pref
     device = resolve_yolo_device(device_pref, gpu_index=gpu_index)
-    _yolo_device_pref = device_pref
+    with _yolo_lock:
+        _yolo_device_pref = device_pref
 
-    # Return cached instance for this device if available
-    if device in _yolo_models:
-        return _yolo_models[device], _yolo_devices.get(device, device)
+        # Return cached instance for this device if available
+        if device in _yolo_models:
+            return _yolo_models[device], _yolo_devices.get(device, device)
 
-    # Avoid re-probing failed devices
-    if device in _yolo_checked_devices:
-        return _yolo_models.get(device), _yolo_devices.get(device)
+        # Avoid re-probing failed devices
+        if device in _yolo_checked_devices:
+            return _yolo_models.get(device), _yolo_devices.get(device)
 
-    _yolo_checked_devices.add(device)
+        _yolo_checked_devices.add(device)
     try:
         from ultralytics import YOLO
         model = YOLO("yolov8n.pt")
         if device != "cpu":
             model.to(device)
-        _yolo_models[device] = model
-        _yolo_devices[device] = device
-        logger.info(f"YOLO person detector loaded on {device}")
-        return _yolo_models[device], _yolo_devices[device]
+        with _yolo_lock:
+            _yolo_models[device] = model
+            _yolo_devices[device] = device
+        logger.info("YOLO person detector loaded on %s", device)
+        return model, device
     except ImportError:
         logger.warning("ultralytics not installed — falling back to face detection")
         return None, None

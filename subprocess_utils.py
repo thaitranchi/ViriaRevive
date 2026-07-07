@@ -1,9 +1,12 @@
 """Subprocess helper — hides console windows on Windows + cancellation support."""
 
+import logging
 import subprocess
 import sys
 import threading
 import time
+
+logger = logging.getLogger(__name__)
 
 # On Windows, prevent ffmpeg/ffprobe from flashing a console window
 _CREATION_FLAGS = (
@@ -23,8 +26,8 @@ def request_cancel():
         for proc in _active_processes:
             try:
                 proc.terminate()
-            except OSError:
-                pass
+            except OSError as e:
+                logger.debug("Failed to terminate process %d: %s", proc.pid, e)
 
 
 def reset_cancel():
@@ -51,9 +54,10 @@ def _kill_process_tree(proc):
             subprocess.run(
                 ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
                 capture_output=True, timeout=5,
-                creationflags=subprocess.CREATE_NO_WINDOW,
+                creationflags=_CREATION_FLAGS,
             )
-        except Exception:
+        except Exception as e:
+            logger.warning("taskkill failed, fallback to proc.kill(): %s", e)
             proc.kill()
     else:
         proc.terminate()
@@ -101,8 +105,8 @@ def run(*args, **kwargs):
                     if not chunk:
                         break
                     buf.append(chunk)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Pipe drain error: %s", e)
 
         drain_threads = []
         if proc.stdout:
@@ -114,9 +118,9 @@ def run(*args, **kwargs):
             t.start()
             drain_threads.append(t)
 
-        # Poll the process, checking cancel flag every 2s
+        # Poll the process, checking cancel flag every 500ms
         _start_time = time.monotonic()
-        poll_interval = 2.0
+        poll_interval = 0.5
         while proc.poll() is None:
             if _cancel_flag.is_set():
                 _kill_process_tree(proc)
@@ -124,7 +128,7 @@ def run(*args, **kwargs):
             elapsed = time.monotonic() - _start_time
             if timeout is not None and elapsed >= timeout:
                 _kill_process_tree(proc)
-                raise subprocess.TimeoutExpired(proc.args, timeout)
+                raise subprocess.TimeoutExpired(proc.args, timeout=timeout)
             # Wait a bit before next poll
             try:
                 proc.wait(timeout=poll_interval)
@@ -168,15 +172,15 @@ def run(*args, **kwargs):
         if proc.stdout:
             try:
                 proc.stdout.close()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Failed to close stdout pipe: %s", e)
         if proc.stderr:
             try:
                 proc.stderr.close()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Failed to close stderr pipe: %s", e)
         with _lock:
             try:
                 _active_processes.remove(proc)
             except ValueError:
-                pass
+                logger.debug("Process %d not in active list (already removed)", proc.pid)

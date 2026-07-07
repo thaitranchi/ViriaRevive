@@ -1,9 +1,9 @@
+import os
 import re
 import subprocess
 import shutil
 import numpy as np
 from pydub import AudioSegment
-import time
 from pathlib import Path
 
 from subprocess_utils import run as _run, is_cancelled, CancelledError
@@ -163,7 +163,7 @@ def _scene_change_density(video_path: Path, length: int) -> np.ndarray:
             "-an", "-sn",
             "-vf", "fps=2,select='gt(scene,0.15)',showinfo",
             "-vsync", "vfr", "-f", "null", "-",
-            "-threads", "4",
+            "-threads", str(os.cpu_count() or 4),
         ]
         r = _run(cmd, capture_output=True, text=True, timeout=600, errors="replace")
         if r.returncode != 0:
@@ -255,4 +255,4 @@ def _fallback_moments(
     return clips
 
 
-_fmt = fmt_time
+

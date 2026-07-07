@@ -1,3 +1,4 @@
+import os
 import re
 import shutil
 import subprocess
@@ -75,15 +76,15 @@ def _copy_fonts_to_dir(dest_dir: Path):
     import platform
     if platform.system() != "Windows":
         return
-    fonts_dir = Path("C:/Windows/Fonts")
+    fonts_dir = Path(os.environ.get("WINDIR", "C:\\Windows")) / "Fonts"
     for name in ["arial.ttf", "arialbd.ttf", "ariblk.ttf", "impact.ttf", "verdana.ttf"]:
         src = fonts_dir / name
         dst = dest_dir / name
         if src.exists() and not dst.exists():
             try:
                 shutil.copy2(str(src), str(dst))
-            except OSError:
-                pass
+            except OSError as e:
+                logger.debug("Failed to copy font %s: %s", name, e)
 
 
 def _fonts_dir_option(sub_dir: Path, use_cwd: bool) -> str:
@@ -97,6 +98,10 @@ def _fonts_dir_option(sub_dir: Path, use_cwd: bool) -> str:
     return f":fontsdir={escaped}"
 
 
+def _sanitize_filename(name: str) -> str:
+    """Remove characters invalid on Windows filenames."""
+    return re.sub(r'[<>:"/\\|?*]', '_', name)[:80]
+
 def _prepare_subtitle_file(subtitle_path: Path, output_stem: str) -> tuple[Path | None, Path | None]:
     """Copy subtitle file to a temp location with a safe ASCII name.
 
@@ -109,7 +114,7 @@ def _prepare_subtitle_file(subtitle_path: Path, output_stem: str) -> tuple[Path 
 
     sub_dir = Path(tempfile.gettempdir()) / "viria_subs"
     sub_dir.mkdir(exist_ok=True)
-    temp_sub = sub_dir / f"sub_{output_stem}.ass"
+    temp_sub = sub_dir / f"sub_{_sanitize_filename(output_stem)}.ass"
 
     # Plain copy — no BOM (BOM breaks libass ASS header parsing)
     shutil.copy2(str(subtitle_path), str(temp_sub))
@@ -224,8 +229,8 @@ def _try_subtitle_burn(input_path: Path, output_path: Path, temp_sub: Path, sub_
                 logger.info(f"Subtitles burned successfully ({other} filter)")
                 return True
             logger.warning(f"Attempt 3 ({other}) failed: {(r3.stderr or '')[-200:]}")
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("Alternate subtitle filter failed: %s", e)
 
     return False
 
@@ -575,8 +580,8 @@ def _try_sub_filter_approaches(
             )
             if r and r.returncode == 0 and output_path.exists():
                 return True
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("Fallback subtitle filter failed: %s", e)
 
     return False
 
@@ -847,8 +852,8 @@ def _rename_safe(src: Path, dst: Path):
             if i == 9:  # Final attempt
                 try:
                     shutil.move(str(src), str(dst))
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("shutil.move fallback failed for %s: %s", src, e)
             time.sleep(0.3)
 
 
@@ -873,7 +878,7 @@ def _cleanup(path):
     _robust_unlink(path)
 
 
-_fmt = fmt_time
+
 
 
 # ── Post-processing: background music ───────────────────────────────────────

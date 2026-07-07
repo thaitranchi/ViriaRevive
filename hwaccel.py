@@ -614,7 +614,7 @@ def resolve_whisper_device(pref: str = "auto", gpu_index: int | None = None) -> 
             if torch.backends.mps.is_available():
                 return "cpu", "int8", 0  # faster-whisper lacks stable MPS — stay CPU
     except ImportError:
-        pass
+        logger.debug("torch not available, falling back to CPU whisper device")
     return "cpu", "int8", 0
 
 

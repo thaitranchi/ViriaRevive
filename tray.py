@@ -4,12 +4,15 @@ Minimizes to tray instead of closing. Tray icon shows status and provides
 quick access to restore, open output folder, or quit.
 """
 
+import logging
 import sys
 import threading
 from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 
 import pystray
+
+logger = logging.getLogger(__name__)
 
 
 def _get_base():
@@ -24,7 +27,8 @@ _ICON_PATH = _BASE / "gui" / "tray_icon.png"
 def _create_icon_image():
     """Generate a simple 64x64 tray icon (purple/cyan gradient V shape)."""
     if _ICON_PATH.exists():
-        return Image.open(str(_ICON_PATH))
+        with Image.open(str(_ICON_PATH)) as img:
+            return img.copy()
 
     size = 64
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
@@ -42,8 +46,8 @@ def _create_icon_image():
     if not getattr(sys, 'frozen', False):
         try:
             img.save(str(_ICON_PATH))
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Failed to save tray icon: %s", e)
     return img
 
 
@@ -76,8 +80,9 @@ class TrayManager:
         while self._running and self._icon is not None:
             try:
                 self._icon.run()
-            except Exception:
+            except Exception as e:
                 if self._running:
+                    logger.warning("Tray icon error, restarting: %s", e)
                     import time
                     time.sleep(1)
 
@@ -87,8 +92,8 @@ class TrayManager:
         if self._icon:
             try:
                 self._icon.stop()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Tray icon stop error: %s", e)
 
     def update_tooltip(self, text: str):
         """Update the tray icon tooltip text."""
@@ -101,8 +106,8 @@ class TrayManager:
             try:
                 self._window.hide()
                 self._visible = False
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Window hide error: %s", e)
 
     def _show_window(self, icon=None, item=None):
         """Restore the window from tray."""
@@ -111,8 +116,8 @@ class TrayManager:
                 self._window.show()
                 self._window.restore()
                 self._visible = True
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Window show error: %s", e)
 
     def _quit(self, icon=None, item=None):
         """Quit the application entirely."""
@@ -122,5 +127,5 @@ class TrayManager:
         elif self._window:
             try:
                 self._window.destroy()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Window destroy error: %s", e)

@@ -1,6 +1,5 @@
 import yt_dlp
 from pathlib import Path
-import time
 import logging
 from config import DOWNLOADS_DIR
 from utils import wait_for_file_unlock

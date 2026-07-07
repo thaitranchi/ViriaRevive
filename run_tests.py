@@ -5,7 +5,6 @@ Run with: python run_tests.py [-v]
 
 import sys
 import os
-import json
 import unittest
 import importlib
 from pathlib import Path
@@ -272,6 +271,182 @@ class TestMainLogic(unittest.TestCase):
         import main
         result = main.process("invalid://url", num_clips=1, clip_duration=10)
         self.assertIsInstance(result, list)
+
+    def test_auto_clip_count_short(self):
+        from utils import auto_clip_count
+        n = auto_clip_count(vid_duration=120, clip_duration=25)
+        self.assertIsInstance(n, int)
+        self.assertGreaterEqual(n, 2)
+
+    def test_auto_clip_count_medium(self):
+        from utils import auto_clip_count
+        n = auto_clip_count(vid_duration=600, clip_duration=25)
+        self.assertIsInstance(n, int)
+        self.assertGreaterEqual(n, 3)
+
+    def test_auto_clip_count_long(self):
+        from utils import auto_clip_count
+        n = auto_clip_count(vid_duration=3600, clip_duration=25)
+        self.assertIsInstance(n, int)
+        self.assertGreaterEqual(n, 5)
+
+    def test_auto_clip_count_very_long(self):
+        from utils import auto_clip_count
+        n = auto_clip_count(vid_duration=7200, clip_duration=25)
+        self.assertIsInstance(n, int)
+        self.assertGreaterEqual(n, 15)
+
+    def test_auto_clip_count_clamps_min(self):
+        from utils import auto_clip_count
+        n = auto_clip_count(vid_duration=10, clip_duration=25)
+        self.assertGreaterEqual(n, 2)
+
+    def test_auto_clip_count_clamps_max(self):
+        from utils import auto_clip_count
+        n = auto_clip_count(vid_duration=86400, clip_duration=25)
+        self.assertLessEqual(n, 50)
+
+    def test_auto_clip_count_short_clip_duration(self):
+        from utils import auto_clip_count
+        n = auto_clip_count(vid_duration=600, clip_duration=15)
+        n_default = auto_clip_count(vid_duration=600, clip_duration=25)
+        self.assertGreaterEqual(n, n_default)
+
+
+class TestPipelineCache(unittest.TestCase):
+    """Tests for pipeline cache."""
+
+    def setUp(self):
+        import pipeline_cache
+        # Use a unique stem to avoid cross-test contamination
+        self.cache = pipeline_cache.PipelineCache("_test_stem_" + str(id(self)))
+
+    def tearDown(self):
+        self.cache.clear_state()
+        self.cache.cleanup_all_wavs()
+
+    def test_state_roundtrip(self):
+        state = self.cache.load_state()
+        self.assertIsNotNone(state)
+        self.assertEqual(state.stem, self.cache.stem)
+
+    def test_save_and_load_state(self):
+        from pipeline_cache import PipelineState
+        state = PipelineState(stem=self.cache.stem, num_clips=5, step_downloaded=True)
+        self.cache.save_state(state)
+        loaded = self.cache.load_state()
+        self.assertEqual(loaded.num_clips, 5)
+        self.assertTrue(loaded.step_downloaded)
+
+    def test_mark_and_check_clip_done(self):
+        self.assertFalse(self.cache.is_clip_done(1))
+        self.cache.mark_clip_done(1)
+        self.assertTrue(self.cache.is_clip_done(1))
+
+    def test_done_clips(self):
+        self.cache.mark_clip_done(1)
+        self.cache.mark_clip_done(3)
+        done = self.cache.done_clips()
+        self.assertIn(1, done)
+        self.assertIn(3, done)
+        self.assertNotIn(2, done)
+
+    def test_resume_step_download(self):
+        from pipeline_cache import PipelineState
+        state = PipelineState()
+        self.assertEqual(state.resume_step, "download")
+
+    def test_resume_step_clips(self):
+        from pipeline_cache import PipelineState
+        state = PipelineState(step_downloaded=True, step_detected=True, step_reranked=True, num_clips=5)
+        self.assertEqual(state.resume_step, "clips")
+
+    def test_resume_step_done(self):
+        from pipeline_cache import PipelineState
+        state = PipelineState(step_downloaded=True, step_detected=True, step_reranked=True,
+                              num_clips=3, clips_completed=[1, 2, 3])
+        self.assertEqual(state.resume_step, "done")
+
+    def test_all_clips_done(self):
+        state = type("S", (), {"num_clips": 3, "clips_completed": [1, 2, 3]})()
+        from pipeline_cache import PipelineState
+        ps = PipelineState(num_clips=3, clips_completed=[1, 2, 3])
+        self.assertTrue(ps.all_clips_done)
+        ps2 = PipelineState(num_clips=3, clips_completed=[1, 2])
+        self.assertFalse(ps2.all_clips_done)
+
+    def test_set_and_get_moments(self):
+        moments = [{"start": 10, "end": 35}]
+        self.cache.set_moments(moments)
+        loaded = self.cache.get_moments()
+        self.assertEqual(len(loaded), 1)
+        self.assertEqual(loaded[0]["start"], 10)
+
+    def test_transcript_cache(self):
+        words = [{"text": "hello", "start": 0.0, "end": 0.5}]
+        self.cache.set_transcript(1, words, "hello")
+        loaded = self.cache.get_transcript(1)
+        self.assertIsNotNone(loaded)
+        self.assertEqual(loaded[0]["text"], "hello")
+
+    def test_set_and_get_crop_params(self):
+        crop = (540, 960, 100, 0)
+        self.cache.set_crop_params(1, crop)
+        loaded = self.cache.get_crop_params(1)
+        self.assertEqual(loaded, crop)
+
+
+class TestSentenceBoundary(unittest.TestCase):
+    """Tests for sentence boundary detection."""
+
+    def setUp(self):
+        from transcriber import find_sentence_boundary
+        self.find_sentence_boundary = find_sentence_boundary
+
+    def test_no_words_returns_none(self):
+        result = self.find_sentence_boundary([], clip_duration=30.0)
+        self.assertIsNone(result)
+
+    def test_period_boundary(self):
+        words = [
+            {"text": "This", "start": 0.0, "end": 0.3},
+            {"text": "is", "start": 0.4, "end": 0.6},
+            {"text": "amazing.", "start": 0.7, "end": 1.0},
+            {"text": "Next", "start": 1.1, "end": 1.3},
+        ]
+        result = self.find_sentence_boundary(words, clip_duration=30.0, min_keep=0.0, max_extend=5.0)
+        self.assertIsNotNone(result)
+        self.assertAlmostEqual(result, 1.3, delta=0.1)  # 1.0 + 0.3 pad
+
+    def test_exclamation_boundary(self):
+        words = [
+            {"text": "Wow", "start": 0.0, "end": 0.3},
+            {"text": "that", "start": 0.4, "end": 0.6},
+            {"text": "was", "start": 0.7, "end": 0.9},
+            {"text": "insane!", "start": 1.0, "end": 1.3},
+        ]
+        result = self.find_sentence_boundary(words, clip_duration=30.0, min_keep=0.0, max_extend=5.0)
+        self.assertIsNotNone(result)
+        self.assertAlmostEqual(result, 1.6, delta=0.1)
+
+    def test_no_boundary_returns_none(self):
+        words = [
+            {"text": "Hello", "start": 0.0, "end": 0.3},
+            {"text": "world", "start": 0.3, "end": 0.6},
+        ]
+        result = self.find_sentence_boundary(words, clip_duration=30.0, min_keep=0.0, max_extend=5.0)
+        self.assertIsNone(result)
+
+    def test_respects_min_keep(self):
+        words = [
+            {"text": "A.", "start": 0.0, "end": 0.2},
+            {"text": "B.", "start": 0.3, "end": 0.5},
+            {"text": "C.", "start": 0.6, "end": 0.8},
+            {"text": "D.", "start": 10.0, "end": 10.3},
+        ]
+        # min_keep=0.8 → don't cut before 24s
+        result = self.find_sentence_boundary(words, clip_duration=30.0, min_keep=0.8, max_extend=5.0)
+        self.assertIsNone(result)
 
 
 class TestConfig(unittest.TestCase):

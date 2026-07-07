@@ -1,7 +1,6 @@
 """YouTube upload with multi-account support, channel selection, and full metadata."""
 
 import json
-import os
 import sys
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
@@ -62,13 +61,13 @@ def _ensure_tokens_dir():
                     acct_id = items[0]["id"]
                     acct_title = items[0]["snippet"]["title"]
                     _save_token(acct_id, acct_title, creds)
+            # Only remove legacy file if migration succeeded or token is invalid
+            # but don't delete a potentially valid token on transient errors
             _TOKEN_LEGACY.unlink()
         except Exception:
-            # Migration failed — just remove the old file
-            try:
-                _TOKEN_LEGACY.unlink()
-            except Exception:
-                pass
+            # Migration hit a transient error (network, quota, refresh failure).
+            # Keep the legacy file so the user doesn't lose their account.
+            pass
 
 
 def _build_service(creds):
@@ -85,56 +84,68 @@ def _save_token(account_id: str, account_title: str, creds):
     data = json.loads(creds.to_json())
     data["_account_id"] = account_id
     data["_account_title"] = account_title
-    _token_path(account_id).write_text(json.dumps(data, indent=2))
+    _token_path(account_id).write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
 def _load_creds(account_id: str):
-    """Load credentials for a specific account, refreshing if expired."""
+    """Load credentials for a specific account, refreshing if expired.
+
+    Returns (creds, error_message) tuple. creds is None on failure.
+    """
     from google.oauth2.credentials import Credentials
     from google.auth.transport.requests import Request
     path = _token_path(account_id)
     if not path.exists():
-        return None
+        return None, "Token file not found"
     creds = Credentials.from_authorized_user_file(str(path), _SCOPES)
     if not creds:
-        return None
+        return None, "Failed to parse token file"
     if creds.valid:
-        return creds
+        return creds, None
     # Token expired — try to refresh
-    if creds.expired and creds.refresh_token:
+    if creds.expired:
+        if not creds.refresh_token:
+            return None, "Token expired and no refresh token available — reconnect account"
         try:
             creds.refresh(Request())
-            # Save the refreshed token
-            data = json.loads(path.read_text())
+            data = json.loads(path.read_text(encoding="utf-8"))
             title = data.get("_account_title", account_id)
             _save_token(account_id, title, creds)
             print(f"[+] Refreshed token for {title}")
-            return creds
+            return creds, None
         except Exception as e:
-            print(f"[!] Token refresh failed for {account_id}: {e}")
-    return None
+            err_str = str(e).lower()
+            if "invalid_grant" in err_str or "deleted" in err_str:
+                return None, "Token revoked or invalid — reconnect account"
+            if "network" in err_str or "timeout" in err_str or "connection" in err_str:
+                return None, f"Network error during token refresh: {e}"
+            return None, f"Token refresh failed: {e}"
+    return None, "Token expired and cannot be refreshed"
 
 
 def get_youtube_service(account_id: str = None, force_new: bool = False):
-    """Get YouTube service for a specific account. If account_id is None, use first available."""
+    """Get YouTube service for a specific account. If account_id is None, use first available.
+
+    Returns (service, error_message). service is None on failure.
+    """
     _ensure_tokens_dir()
 
     if account_id is None:
         accounts = list_accounts()
         if not accounts:
-            raise RuntimeError("No YouTube accounts connected")
+            return None, "No YouTube accounts connected"
         account_id = accounts[0]["id"]
 
     if account_id in _service_cache and not force_new:
-        return _service_cache[account_id]
+        return _service_cache[account_id], None
 
-    creds = _load_creds(account_id)
+    creds, err = _load_creds(account_id)
     if not creds:
-        raise RuntimeError(f"Account {account_id} not connected or token expired")
+        return None, err or f"Account {account_id} not connected"
 
     svc = _build_service(creds)
     _service_cache[account_id] = svc
-    return svc
+    return svc, None
 
 
 def add_account() -> dict:
@@ -180,7 +191,7 @@ def list_accounts() -> list[dict]:
         if f.name in _SKIP_TOKEN_FILES:
             continue
         try:
-            data = json.loads(f.read_text())
+            data = json.loads(f.read_text(encoding="utf-8"))
             accounts.append({
                 "id": data.get("_account_id", f.stem),
                 "title": data.get("_account_title", f.stem),
@@ -222,7 +233,10 @@ def list_channels() -> list[dict]:
     seen_ids = set()
     for acct in list_accounts():
         try:
-            yt = get_youtube_service(acct["id"])
+            yt, svc_err = get_youtube_service(acct["id"])
+            if not yt:
+                print(f"[!] Skipping account {acct['title']}: {svc_err}")
+                continue
             # Primary channel (mine=True)
             resp = yt.channels().list(part="snippet,statistics", mine=True).execute()
             for ch in resp.get("items", []):
@@ -264,7 +278,10 @@ def list_categories(region: str = "US") -> list[dict]:
         return DEFAULT_CATEGORIES
 
     try:
-        yt = get_youtube_service(accounts[0]["id"])
+        yt, svc_err = get_youtube_service(accounts[0]["id"])
+        if not yt:
+            print(f"[!] Failed to get YouTube service for categories: {svc_err}")
+            return DEFAULT_CATEGORIES
         resp = yt.videoCategories().list(part="snippet", regionCode=region).execute()
         api_categories = [
             {"id": cat["id"], "title": cat["snippet"]["title"]}
@@ -316,7 +333,9 @@ def upload_to_youtube(
                 account_id = ch.get("account_id")
                 break
 
-    yt = get_youtube_service(account_id or channel_id)
+    yt, svc_err = get_youtube_service(account_id or channel_id)
+    if not yt:
+        raise RuntimeError(svc_err or "Failed to get YouTube service")
 
     # Ensure Shorts format — append #Shorts to title and description
     if "#Shorts" not in title and "#shorts" not in title:

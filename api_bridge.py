@@ -48,6 +48,7 @@ from config import (
     FFMPEG_PRESET,
     MIN_GAP,
     MUSIC_DIR,
+    SENTENCE_BUFFER,
     NUM_CLIPS,
     OLLAMA_DETECTOR_CANDIDATE_MULTIPLIER,
     OLLAMA_DETECTOR_MODEL,
@@ -115,16 +116,16 @@ class _LogTee:
             self._orig.write(text)
         except (UnicodeEncodeError, UnicodeDecodeError):
             # Windows console can't handle some Unicode chars — strip them
-            safe = text.encode('ascii', errors='replace').decode('ascii')
+            safe = text.encode('ascii', errors='xmlcharrefreplace').decode('ascii')
             try:
                 self._orig.write(safe)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Failed to write sanitized text to console: %s", e)
         if text and text.strip():
             try:
                 self._cb(text.strip())
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Log callback failed: %s", e)
         return len(text)
 
     def flush(self):
@@ -191,15 +192,15 @@ def _log_pusher_thread():
             if _log_bridge:
                 text = "\n".join(lines)
                 safe_text = "".join(ch for ch in text if ch.isprintable() or ch in "\n\r\t")
-                escaped = safe_text.replace("\\", "\\\\").replace("`", "\\`").replace("$", "\\$")
                 debug_val = 1 if _log_bridge._user_settings.get("debug_logging", False) else 0
                 
                 _forwarding.active = True
                 try:
-                    _log_bridge._js(f"window.onConsoleLog(`{escaped}`, {debug_val})")
+                    _log_bridge._js(f"window.onConsoleLog({json.dumps(safe_text)}, {debug_val})")
                 finally:
                     _forwarding.active = False
-        except Exception:
+        except Exception as e:
+            logger.debug("Log pusher error: %s", e)
             time.sleep(0.5)
 
 threading.Thread(target=_log_pusher_thread, daemon=True).start()
@@ -251,6 +252,7 @@ class ApiBridge:
         self._window = None
         self._processing = False
         self._cancel = False
+        self._cancel_lock = threading.Lock()
         self._pipeline_queue = queue.Queue()
         self._worker_thread = None
         self._worker_lock = threading.Lock()
@@ -283,7 +285,7 @@ class ApiBridge:
             self._clips_dir = CLIPS_DIR
 
         self._video_port, self._video_server = _start_video_server(self._clips_dir)
-        self._music_port, _ = _start_video_server(MUSIC_DIR)
+        self._music_port, self._music_server = _start_video_server(MUSIC_DIR)
 
         # Initialize logging based on saved setting
         is_debug = self._user_settings.get("debug_logging", False)
@@ -369,13 +371,16 @@ class ApiBridge:
         cipher = self._get_cipher()
         if not text or not cipher: return text
         try: return cipher.decrypt(text.encode()).decode()
-        except Exception: return text
+        except Exception as e:
+            logger.error("Failed to decrypt value: %s", e)
+            return text
 
     def get_settings(self):
         """Return user settings (persisted overrides merged with defaults)."""
         defaults = {
             "num_clips": NUM_CLIPS,
             "clip_duration": CLIP_DURATION,
+            "sentence_buffer": SENTENCE_BUFFER,
             "min_gap": MIN_GAP,
             "whisper_model": WHISPER_MODEL,
             "whisper_language": WHISPER_LANGUAGE or "",
@@ -705,7 +710,7 @@ class ApiBridge:
                     self._moments[i]["source_stem"] = m.group(1) if m else p.stem
 
             def _on_progress(done, total, title):
-                self._js(f"window.onTitleProgress && window.onTitleProgress({done}, {total}, `{self._esc(title or '')}`)")
+                self._js(f"window.onTitleProgress && window.onTitleProgress({done}, {total}, {json.dumps(title or '')})")
 
             titles, llm_available = self._batch_generate_titles(transcripts, on_progress=_on_progress)
 
@@ -735,7 +740,7 @@ class ApiBridge:
 
         except Exception as e:
             logger.exception("Error in title generation")
-            self._js(f"window.onTitlesDone && window.onTitlesDone({{error: `{self._esc('An internal error occurred during title generation.')}`}})")
+            self._js(f"window.onTitlesDone && window.onTitlesDone({{error: {json.dumps('An internal error occurred during title generation.')}}})")
 
     def _backfill_transcripts(self): # type: ignore
         """Transcribe clips that are missing transcripts (e.g. from previous sessions)."""
@@ -859,9 +864,12 @@ class ApiBridge:
 
     def get_channels(self):
         try:
-            return {"channels": list_channels()}
+            channels = list_channels()
+            accounts = list_accounts()
+            return {"channels": channels, "accounts": accounts, "account_count": len(accounts), "error": None}
         except Exception as e:
-            return {"error": str(e), "channels": []}
+            accounts = list_accounts()
+            return {"channels": [], "accounts": accounts, "account_count": len(accounts), "error": str(e)}
 
     def get_categories(self):
         try:
@@ -903,8 +911,8 @@ class ApiBridge:
         MUSIC_DIR.mkdir(exist_ok=True)
         try:
             os.startfile(str(MUSIC_DIR))
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Failed to open music folder: %s", e)
         return {"ok": True}
 
     def get_music_waveform(self, filename):
@@ -984,18 +992,23 @@ class ApiBridge:
         
         with self._worker_lock:
             if not self._worker_thread or not self._worker_thread.is_alive():
-                self._cancel = False
+                with self._cancel_lock:
+                    self._cancel = False
                 from subprocess_utils import reset_cancel
                 reset_cancel()
                 self._worker_thread = threading.Thread(target=self._pipeline_worker, daemon=True)
                 self._worker_thread.start()
-                
+                 
         return {"ok": True, "queued": self._pipeline_queue.qsize()}
+
+    def _is_cancelled(self) -> bool:
+        with self._cancel_lock:
+            return self._cancel
 
     def _pipeline_worker(self):
         """Worker thread that pulls tasks from the queue and executes the pipeline."""
         while not self._pipeline_queue.empty():
-            if self._cancel:
+            if self._is_cancelled():
                 break
             
             try:
@@ -1023,7 +1036,8 @@ class ApiBridge:
         self._active_item_index = None
 
     def cancel_processing(self):
-        self._cancel = True
+        with self._cancel_lock:
+            self._cancel = True
         
         # Clear the pending queue
         while not self._pipeline_queue.empty():
@@ -1067,8 +1081,8 @@ class ApiBridge:
     def open_output_folder(self):
         try:
             os.startfile(str(self._clips_dir))
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Failed to open output folder: %s", e)
         return {"ok": True}
 
     def select_clips_folder(self):
@@ -1081,8 +1095,8 @@ class ApiBridge:
             )
             if result and len(result) > 0:
                 return {"path": result[0]}
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("select_clips_folder failed: %s", e)
         return {"path": None}
 
     def select_file(self):
@@ -1111,13 +1125,24 @@ class ApiBridge:
 
     # ── Exposed: video preview ───────────────────────────────────────────
 
+    def _cleanup_servers(self):
+        """Shut down both video and music HTTP servers."""
+        for server in ('_video_server', '_music_server'):
+            srv = getattr(self, server, None)
+            if srv:
+                try:
+                    srv.shutdown()
+                    srv.server_close()
+                except Exception as e:
+                    logger.debug("Error shutting down %s: %s", server, e)
+
     def _restart_video_server(self, new_dir: Path):
         """Shut down the old video server and start a new one serving new_dir."""
         try:
             self._video_server.shutdown()
             self._video_server.server_close()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Error shutting down old video server: %s", e)
         new_dir.mkdir(parents=True, exist_ok=True)
         self._video_port, self._video_server = _start_video_server(new_dir)
         self._clips_dir = new_dir
@@ -1275,7 +1300,8 @@ class ApiBridge:
         if self._processing:
             return {"error": "Processing in progress"}
         self._processing = True
-        self._cancel = False
+        with self._cancel_lock:
+            self._cancel = False
         self._active_item_index = item_index
         threading.Thread(
             target=self._run_upload,
@@ -1374,6 +1400,7 @@ class ApiBridge:
             num_clips = NUM_CLIPS if auto_clips else int(num_clips_raw)
             print(f"[*] Pipeline settings: num_clips_raw={num_clips_raw!r}, auto_clips={auto_clips}, num_clips={num_clips}")
             clip_duration = int(settings.get("clip_duration", CLIP_DURATION))
+            sentence_buffer = float(settings.get("sentence_buffer", SENTENCE_BUFFER))
             min_gap = int(settings.get("min_gap", MIN_GAP))
             style = settings.get("subtitle_style", SUBTITLE_STYLE)
             model = settings.get("whisper_model", WHISPER_MODEL)
@@ -1394,7 +1421,7 @@ class ApiBridge:
             debug_mode = bool(settings.get("debug_logging", False))
 
             # ── 1. Download or load local file ───────────────────────
-            if self._cancel:
+            if self._is_cancelled():
                 return self._cancelled()
 
             if local_file_path:
@@ -1463,7 +1490,7 @@ class ApiBridge:
                 print(f"[+] Auto clip count: {num_clips} (video is {vid_duration:.0f}s / {vid_mins:.1f}min)")
 
             # ── 2. Detect viral moments ──────────────────────────────
-            if self._cancel:
+            if self._is_cancelled():
                 return self._cancelled()
             self._push("detect", 0, "Detecting viral moments...")
 
@@ -1499,7 +1526,7 @@ class ApiBridge:
                 self._push("detect", 35, "Transcribing AI detector candidates...")
                 candidate_moments: list[dict] = []
                 for cand_idx, m in enumerate(moments, 1):
-                    if self._cancel:
+                    if self._is_cancelled():
                         return self._cancelled()
                     start, end = m["start"], m["end"]
                     wav = SUBTITLES_DIR / f"{video_path.stem[:50]}_candidate{cand_idx}.wav"
@@ -1535,8 +1562,8 @@ class ApiBridge:
                     finally:
                         try:
                             wav.unlink(missing_ok=True) # type: ignore
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            logger.debug("Failed to cleanup wav %s: %s", wav, e)
 
                 if candidate_moments:
                     self._push("detect", 72, f"Reranking candidates with {'Gemini' if use_gemini else 'Ollama'}...")
@@ -1583,7 +1610,6 @@ class ApiBridge:
             # ── 3. Process each clip (parallel with multi-GPU) ──────────
             done: list[Path] = []
             total = len(moments)
-            SENTENCE_BUFFER = 5
             results_lock = threading.Lock()
             gpu_count = get_gpu_count()
 
@@ -1592,7 +1618,7 @@ class ApiBridge:
 
                 *gpu_idx* pins whisper / YOLO / NVENC to a specific GPU.
                 """
-                if self._cancel:
+                if self._is_cancelled():
                     return None
                 clip_num = idx + 1
                 out = self._clips_dir / f"{stem}_viral{clip_num}.mp4"
@@ -1609,7 +1635,7 @@ class ApiBridge:
                 # ── 3b: extract audio WITH extended buffer ──
                 self._clip_push(clip_num, total, "audio", 50, f"Clip {clip_num}/{total}: Extracting audio...")
                 wav = SUBTITLES_DIR / f"{stem}_c{clip_num}.wav"
-                extended_end = min(end + SENTENCE_BUFFER, int(vid_duration))
+                extended_end = min(end + sentence_buffer, int(vid_duration))
                 r = extract_audio_clip(video_path, start, extended_end, wav) # type: ignore
                 if not r:
                     self._clip_push(clip_num, total, "render", 100, f"Clip {clip_num}: failed, skipping")
@@ -1617,7 +1643,7 @@ class ApiBridge:
                 self._clip_push(clip_num, total, "audio", 100, "Audio extracted")
 
                 # ── 3c: transcribe the extended audio ──
-                if self._cancel:
+                if self._is_cancelled():
                     return None
                 self._clip_push(clip_num, total, "transcribe", 0, f"Clip {clip_num}/{total}: Transcribing...")
                 words = transcribe_clip( # type: ignore
@@ -1631,7 +1657,7 @@ class ApiBridge:
                     words,
                     clip_duration=float(original_duration), # type: ignore
                     min_keep=0.60,
-                    max_extend=float(SENTENCE_BUFFER),
+                    max_extend=float(sentence_buffer),
                 )
                 if new_duration is not None:
                     end = start + int(new_duration + 0.5)
@@ -1650,7 +1676,7 @@ class ApiBridge:
                 crop_params = None
                 crop_w, crop_h = get_dimensions(video_path)
                 if crop_vertical:
-                    if self._cancel:
+                    if self._is_cancelled():
                         return None
                     self._clip_push(clip_num, total, "audio", 0, f"Clip {clip_num}/{total}: Tracking speakers...")
                     try:
@@ -1665,7 +1691,7 @@ class ApiBridge:
                         crop_w, crop_h = crop_params[0], crop_params[1]
 
                 # ── 3d: subtitles ──
-                if self._cancel:
+                if self._is_cancelled():
                     return None
                 self._clip_push(clip_num, total, "subtitle", 0, f"Clip {clip_num}/{total}: Generating subtitles...")
                 ass = SUBTITLES_DIR / f"{stem}_c{clip_num}.ass" # type: ignore
@@ -1680,7 +1706,7 @@ class ApiBridge:
                 self._clip_push(clip_num, total, "subtitle", 100, "Subtitles generated")
 
                 # ── 3e: render clip ──
-                if self._cancel:
+                if self._is_cancelled():
                     return None
                 self._clip_push(clip_num, total, "render", 0, f"Clip {clip_num}/{total}: Rendering...")
 
@@ -1728,8 +1754,8 @@ class ApiBridge:
                 # cleanup temp wav
                 try:
                     self._robust_unlink(wav) # type: ignore
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("Failed to cleanup wav %s: %s", wav, e)
 
                 return result
 
@@ -1738,7 +1764,7 @@ class ApiBridge:
             futures = {}
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 for idx, m in enumerate(moments):
-                    if self._cancel:
+                    if self._is_cancelled():
                         return self._cancelled()
                     gpu_idx = select_least_loaded_gpu(
                         list(range(gpu_count)) if gpu_count > 0 else None
@@ -1787,8 +1813,8 @@ class ApiBridge:
             for sf in subtitle_files: # type: ignore
                 try:
                     self._robust_unlink(sf)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("Failed to cleanup subtitle %s: %s", sf, e)
 
             # Catch any orphans using the video stem
             if stem:
@@ -1801,7 +1827,7 @@ class ApiBridge:
         """Download via yt-dlp with progress_hooks for live percent updates."""
 
         def hook(d):
-            if self._cancel:
+            if self._is_cancelled():
                 raise CancelledError("Download cancelled")
             if d["status"] == "downloading":
                 total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
@@ -1841,7 +1867,7 @@ class ApiBridge:
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
-            if self._cancel:
+            if self._is_cancelled():
                 raise CancelledError("Download cancelled after completion")
             return Path(ydl.prepare_filename(info))
 
@@ -1857,7 +1883,7 @@ class ApiBridge:
             uploaded = 0
 
             for i, meta in enumerate(clips_metadata):
-                if self._cancel:
+                if self._is_cancelled():
                     self._js(f"window.onUploadComplete(false, {uploaded}, 'Cancelled')")
                     return
                 pct = int((i / total) * 100)
@@ -1899,7 +1925,8 @@ class ApiBridge:
             self._error(f"Upload failed: {e}")
         finally:
             self._processing = False
-            self._cancel = False
+            with self._cancel_lock:
+                self._cancel = False
 
     # ── Background upload scheduler ──────────────────────────────────────
 
@@ -1943,7 +1970,7 @@ class ApiBridge:
 
                     title = item.get("title", f"Viral Clip #{clip_idx + 1}")
                     print(f"[scheduler] Uploading Clip {clip_idx + 1}: {title}")
-                    self._js(f"window.onSchedulerStatus('Uploading: {self._esc(title)}')")
+                    self._js(f"window.onSchedulerStatus({json.dumps(f'Uploading: {title}')})")
                     try:
                         tags = item.get("tags", "shorts, viral, clips")
                         if isinstance(tags, str):
@@ -1971,7 +1998,7 @@ class ApiBridge:
 
                     except Exception as e:
                         print(f"[scheduler] Upload failed: {e}")
-                        self._js(f"window.onScheduledUploadDone({clip_idx}, false, `{self._esc(str(e))}`)")
+                        self._js(f"window.onScheduledUploadDone({clip_idx}, false, {json.dumps(str(e))})")
 
             if changed:
                 with self._scheduled_lock:
@@ -1988,7 +2015,7 @@ class ApiBridge:
         try:
             if self._robust_unlink(video_path):
                 logger.info(f"Deleted uploaded clip: {video_path.name}")
-                self._js(f"window.onClipDeleted({clip_idx}, `{self._esc(video_path.name)}`)")
+                self._js(f"window.onClipDeleted({clip_idx}, {json.dumps(video_path.name)})")
         except Exception as e:
             print(f"[cleanup] Failed to delete {video_path.name}: {e}")
         finally:
@@ -2053,19 +2080,19 @@ class ApiBridge:
     # ── Progress push helpers ────────────────────────────────────────────
 
     def _push(self, stage, pct, msg):
-        self._js(f"window.onPipelineProgress('{stage}', {pct}, `{self._esc(msg)}`, {self._active_item_index if self._active_item_index is not None else 'null'})")
+        self._js(f"window.onPipelineProgress({json.dumps(stage)}, {pct}, {json.dumps(msg)}, {json.dumps(self._active_item_index)})")
 
     def _clip_push(self, num, total, substep, pct, msg):
         self._js(
-            f"window.onClipProgress({num}, {total}, '{substep}', {pct}, `{self._esc(msg)}`, {self._active_item_index if self._active_item_index is not None else 'null'})"
+            f"window.onClipProgress({num}, {total}, {json.dumps(substep)}, {pct}, {json.dumps(msg)}, {json.dumps(self._active_item_index)})"
         )
 
     def _error(self, msg):
-        self._js(f"window.onPipelineComplete(false, 0, 0, `{self._esc(msg)}`, {self._active_item_index if self._active_item_index is not None else 'null'})")
+        self._js(f"window.onPipelineComplete(false, 0, 0, {json.dumps(msg)}, {json.dumps(self._active_item_index)})")
         self._processing = False
 
     def _cancelled(self):
-        self._js(f"window.onPipelineCancelled({self._active_item_index if self._active_item_index is not None else 'null'})")
+        self._js(f"window.onPipelineCancelled({json.dumps(self._active_item_index)})")
         self._processing = False
 
     def _js(self, code):
@@ -2074,8 +2101,8 @@ class ApiBridge:
             if self._window:
                 self._window.evaluate_js(code)
                 return
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Failed to push JS to frontend: %s", e)
         # Window is hidden or unavailable — queue for when it comes back.
         # Only keep the last progress update per type (avoid flooding the queue)
         # but ALWAYS keep completion/error/cancel callbacks.
@@ -2100,8 +2127,8 @@ class ApiBridge:
             try:
                 if self._window:
                     self._window.evaluate_js(code)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Failed to flush pending JS: %s", e)
         return {"flushed": len(pending)}
 
     @staticmethod

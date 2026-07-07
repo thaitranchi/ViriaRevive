@@ -251,7 +251,8 @@ window.addEventListener('pywebviewready', async () => {
         const yt = await pywebview.api.youtube_status();
         if (yt.connected) {
             state.ytConnected = true;
-            loadChannelsAndCategories().then(() => updateYtUI(true));
+            const result = await loadChannelsAndCategories();
+            updateYtUI(result || true);
         } else {
             // Load categories even if not connected for default settings
             loadChannelsAndCategories();
@@ -485,7 +486,7 @@ async function loadEffectsGrid() {
             const card = document.createElement('div');
             card.className = 'effect-card' + (fx.id === (saved.effect || 'none') ? ' active' : '');
             card.dataset.effect = fx.id;
-            card.innerHTML = `<span class="effect-card-name">${fx.label}</span><span class="effect-card-desc">${fx.desc}</span>`;
+            card.innerHTML = `<span class="effect-card-name">${escHtml(fx.label)}</span><span class="effect-card-desc">${escHtml(fx.desc)}</span>`;
             card.onclick = () => {
                 document.querySelectorAll('.effect-card').forEach(c => c.classList.remove('active'));
                 card.classList.add('active');
@@ -1861,23 +1862,50 @@ function updateYtUI(connected) {
     const channelArea = document.getElementById('yt-channel-area');
     if (connected) {
         const accountCount = new Set(state.channels.map(c => c.account_id)).size;
-        statusText.textContent = `${accountCount} account${accountCount !== 1 ? 's' : ''} · ${state.channels.length} channel${state.channels.length !== 1 ? 's' : ''}`;
+        if (accountCount > 0) {
+            statusText.textContent = `${accountCount} account${accountCount !== 1 ? 's' : ''} · ${state.channels.length} channel${state.channels.length !== 1 ? 's' : ''}`;
+        } else {
+            // Channels failed to load — show account count from backend if available
+            statusText.textContent = 'Connected — loading channels...';
+            // Try to get account count from the last get_channels response
+            pywebview.api.get_channels().then(r => {
+                if (r.account_count > 0) {
+                    statusText.textContent = `${r.account_count} account${r.account_count !== 1 ? 's' : ''} — ${r.error || 'channels unavailable'}`;
+                }
+            }).catch(() => {});
+        }
         statusText.classList.add('connected');
     } else {
         statusText.textContent = 'No accounts connected';
         statusText.classList.remove('connected');
     }
-    // Always show Add Account button (can add more accounts)
     channelArea.classList.toggle('hidden', !connected);
 }
 
 async function loadChannelsAndCategories() {
+    let hasError = false;
+    let errorMsg = '';
+
     try {
         const [chRes, catRes] = await Promise.all([pywebview.api.get_channels(), pywebview.api.get_categories()]);
         state.channels = chRes.channels || [];
         state.categories = catRes.categories || [];
+
+        if (chRes.error) {
+            hasError = true;
+            errorMsg = chRes.error;
+        }
+
         const list = document.getElementById('yt-channel-list');
         list.innerHTML = '';
+
+        // Show account-level error banner if channels failed but accounts exist
+        if (hasError && chRes.accounts && chRes.accounts.length > 0) {
+            const errBanner = document.createElement('div');
+            errBanner.className = 'yt-error-banner';
+            errBanner.textContent = '⚠ ' + errorMsg;
+            list.appendChild(errBanner);
+        }
 
         // Group channels by account
         const accountGroups = {};
@@ -1919,10 +1947,29 @@ async function loadChannelsAndCategories() {
             });
         });
 
+        // If no channels but accounts exist, show a placeholder
+        if (state.channels.length === 0 && chRes.accounts && chRes.accounts.length > 0 && !hasError) {
+            const emptyMsg = document.createElement('div');
+            emptyMsg.className = 'yt-error-banner yt-empty-info';
+            emptyMsg.textContent = 'Connected but no channels found';
+            list.appendChild(emptyMsg);
+        }
+
         if (state.channels.length && !state.selectedChannel) state.selectedChannel = state.channels[0].id;
         updateCategoryDropdowns();
         _populateScheduleChannelDropdown();
-    } catch (e) { console.error('Load channels/cats error:', e); }
+    } catch (e) {
+        console.error('Load channels/cats error:', e);
+        hasError = true;
+        errorMsg = e.message || 'Failed to load channels';
+        const list = document.getElementById('yt-channel-list');
+        if (list) {
+            list.innerHTML = `<div class="yt-error-banner">⚠ ${escHtml(errorMsg)}</div>`;
+        }
+    }
+
+    // Return whether channels were loaded successfully
+    return !hasError;
 }
 
 function selectChannel(id) {
@@ -2119,7 +2166,7 @@ function _createTrayClipEl(clip, idx) {
     el.dataset.clipIdx = idx;
     const isScheduled = state.scheduled.some(s => s.clipIdx === idx && !s.uploaded);
     if (isScheduled) el.classList.add('scheduled');
-    el.innerHTML = `<span class="tray-clip-num">C${idx + 1}</span><span class="tray-clip-name">${clip.filename}</span><span class="tray-clip-size">${clip.size_mb} MB</span>`;
+    el.innerHTML = `<span class="tray-clip-num">C${idx + 1}</span><span class="tray-clip-name">${escHtml(clip.filename)}</span><span class="tray-clip-size">${clip.size_mb} MB</span>`;
     el.addEventListener('dragstart', e => {
         e.dataTransfer.setData('text/plain', String(idx));
         e.dataTransfer.effectAllowed = 'copy';
@@ -2352,7 +2399,13 @@ function _renderCalChannelTabs() {
         const tab = document.createElement('button');
         tab.className = 'cal-ch-tab' + (state.calChannelFilter === ch.id ? ' active' : '');
         tab.dataset.channel = ch.id;
-        if (ch.thumbnail) tab.innerHTML = `<img class="cal-ch-thumb" src="${ch.thumbnail}" alt="">`;
+        if (ch.thumbnail) {
+            const img = document.createElement('img');
+            img.className = 'cal-ch-thumb';
+            img.src = ch.thumbnail;
+            img.alt = '';
+            tab.appendChild(img);
+        }
         tab.innerHTML += escHtml(ch.title);
         tab.onclick = () => filterCalendarByChannel(ch.id);
         tabs.appendChild(tab);
@@ -3045,7 +3098,7 @@ function openClipPicker(dateStr) {
     state.results.forEach((clip, i) => {
         const item = document.createElement('div');
         item.className = 'clip-picker-item';
-        item.innerHTML = `<span class="tray-clip-num">Clip ${i + 1}</span><span class="tray-clip-name">${clip.filename}</span>`;
+        item.innerHTML = `<span class="tray-clip-num">Clip ${i + 1}</span><span class="tray-clip-name">${escHtml(clip.filename)}</span>`;
         item.onclick = () => pickClipForDate(i);
         list.appendChild(item);
     });
@@ -3340,6 +3393,7 @@ function populateSettings(s) {
         setSlider('set-num-clips', s.num_clips);
     }
     setSlider('set-clip-duration', s.clip_duration);
+    setSlider('set-sentence-buffer', s.sentence_buffer);
     setSlider('set-min-gap', s.min_gap);
     setSlider('set-crf', s.video_crf);
     setSelect('set-model', s.whisper_model);
@@ -3383,6 +3437,7 @@ function gatherSettings() {
     const s = {
         num_clips: autoClips ? 'auto' : parseInt(getVal('set-num-clips')),
         clip_duration: parseInt(getVal('set-clip-duration')),
+        sentence_buffer: parseFloat(getVal('set-sentence-buffer')),
         min_gap: parseInt(getVal('set-min-gap')),
         whisper_model: getVal('set-model'),
         whisper_language: getVal('set-language') || null,
@@ -3466,6 +3521,9 @@ function updateSliderLabel(el) {
         }
     } else if (el.id === 'set-min-gap') {
         lbl.textContent = el.value + 's';
+    } else if (el.id === 'set-sentence-buffer') {
+        const v = parseInt(el.value);
+        lbl.textContent = v === 0 ? 'Off' : v + 's';
     } else {
         lbl.textContent = el.value;
     }
