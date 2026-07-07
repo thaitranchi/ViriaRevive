@@ -1419,6 +1419,7 @@ class ApiBridge:
         video_path = None
         is_downloaded = False
         subtitle_files = []
+        results_lock = threading.Lock()
         stem = None
         try:
             num_clips_raw = settings.get("num_clips", NUM_CLIPS)
@@ -1612,7 +1613,6 @@ class ApiBridge:
             # ── 3. Process each clip (parallel with multi-GPU) ──────────
             done: list[Path] = []
             total = len(moments)
-            results_lock = threading.Lock()
             gpu_count = get_gpu_count()
 
             def _process_one(idx: int, m: dict, gpu_idx: int | None = None) -> Path | None:
