@@ -39,6 +39,8 @@ from config import (
     SENTENCE_BUFFER,
     SUBTITLE_STYLE,
     SUBTITLES_DIR,
+    TRANSLATE_TARGET,
+    TRANSLATE_MODEL,
     VIDEO_CRF,
     VIDEO_ENCODER,
     VIDEO_DECODER,
@@ -113,6 +115,8 @@ def process(
     decoder: str = VIDEO_DECODER,
     sentence_buffer: float = SENTENCE_BUFFER,
     ollama_model: str = OLLAMA_DETECTOR_MODEL,
+    translate_to: str | None = None,
+    translate_model: str = TRANSLATE_MODEL,
     resume: bool = True,
     on_progress: ProgressCB = None,
 ) -> list[Path]:
@@ -158,6 +162,7 @@ def process(
     from transcriber import transcribe_clip, find_sentence_boundary
     from subtitler import generate_subtitles
     from title_generator import generate_titles_batch
+    from translator import translate_words
     from clipper import extract_clip, extract_audio_clip, validate_shorts_output
     from cropper import get_crop_params_dynamic, detect_all_persons
     from uploader import upload_to_youtube, build_schedule
@@ -416,6 +421,12 @@ def process(
         else:
             words = [w for w in words if w["end"] <= original_duration + 0.1]
 
+        # 3c.2. translate words to target language (if requested)
+        if translate_to and words:
+            on_progress("clips", 0, f"Clip {clip_num}/{len(moments)}: Translating...")
+            print(f"  [translate] Translating {len(words)} words to {translate_to}")
+            words = translate_words(words, translate_to, model=translate_model)
+
         m["end"] = new_end
         m["duration"] = new_end - start
         m["transcript"] = " ".join(w.get("word", w.get("text", "")) for w in words).strip()
@@ -583,6 +594,7 @@ def main():
     p.add_argument("--no-crop",        action="store_true", help="skip YOLO person-detection cropping (uses center crop)")
     p.add_argument("--ai-detector",    choices=["auto", "off", "on"], default=AI_DETECTOR_MODE, help="local Ollama AI detector mode")
     p.add_argument("--ollama-model",   default=OLLAMA_DETECTOR_MODEL, help=f"Ollama model name  (default {OLLAMA_DETECTOR_MODEL})")
+    p.add_argument("--translate",      default=None, help="translate subtitles to language (es, fr, de, ja, ...)")
 
     # ── New options ────────────────────────────────────────────────────
     p.add_argument("--auto-clips",     action="store_true", help="auto-compute clip count from video duration")
@@ -617,6 +629,7 @@ def main():
         crop=not a.no_crop,
         ai_detector=a.ai_detector,
         ollama_model=a.ollama_model,
+        translate_to=a.translate or TRANSLATE_TARGET,
         auto_clips=a.auto_clips,
         effect=a.effect,
         music_path=a.music,

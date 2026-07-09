@@ -3465,6 +3465,7 @@ function populateSettings(s) {
     if (shortsToggle) shortsToggle.checked = (mode !== 'none');
     setVal('set-language', s.whisper_language || '');
     setVal('set-title-language', s.title_language || '');
+    setVal('set-translate-target', s.translate_target || '');
     updateEncoderPresetUI();
     const style = s.subtitle_style || 'tiktok';
     document.querySelectorAll('.style-option').forEach(opt => {
@@ -3483,6 +3484,7 @@ function gatherSettings() {
         min_gap: parseInt(getVal('set-min-gap')),
         whisper_model: getVal('set-model'),
         whisper_language: getVal('set-language') || null,
+        translate_target: getVal('set-translate-target') || null,
         title_language: getVal('set-title-language') || null,
         subtitle_style: document.querySelector('input[name="subtitle-style"]:checked')?.value || 'tiktok',
         ffmpeg_preset: getVal('set-preset'),
@@ -3521,6 +3523,11 @@ function setLanguage(lang) {
 
 function setTitleLanguage(lang) {
     const el = document.getElementById('set-title-language');
+    if (el) { el.value = lang; gatherSettings(); }
+}
+
+function setTranslateTarget(lang) {
+    const el = document.getElementById('set-translate-target');
     if (el) { el.value = lang; gatherSettings(); }
 }
 

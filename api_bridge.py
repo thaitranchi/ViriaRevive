@@ -54,6 +54,7 @@ from config import (
     OLLAMA_DETECTOR_TIMEOUT,
     SUBTITLE_STYLE,
     SUBTITLES_DIR,
+    TRANSLATE_TARGET,
     VIDEO_CRF,
     VIDEO_ENCODER,
     VIDEO_DECODER,
@@ -382,6 +383,7 @@ class ApiBridge:
             "min_gap": MIN_GAP,
             "whisper_model": WHISPER_MODEL,
             "whisper_language": WHISPER_LANGUAGE or "",
+            "translate_target": TRANSLATE_TARGET or "",
             "subtitle_style": SUBTITLE_STYLE,
             "ffmpeg_preset": FFMPEG_PRESET,
             "video_crf": VIDEO_CRF,
@@ -1668,6 +1670,14 @@ class ApiBridge:
                                     f"Adjusted to {end - start}s (sentence end)")
                 else:
                     words = [w for w in words if w["end"] <= original_duration + 0.1]
+
+                # ── 3c.2: translate words to target language (if requested) ──
+                translate_to = settings.get("translate_target") or None
+                if translate_to and words:
+                    from translator import translate_words as _tw
+                    self._clip_push(clip_num, total, "transcribe", 95,
+                                    f"Translating to {translate_to}...")
+                    words = _tw(words, translate_to)
 
                 # Update moment info for UI (thread-safe: each thread writes to its own slot)
                 m["end"] = end # type: ignore

@@ -1157,6 +1157,24 @@
                             <span class="setting-hint">Forces the AI to generate titles in this language.</span>
                         </div>
                         <div class="setting-row">
+                            <label for="set-translate-target">Translate subtitles</label>
+                            <div class="input-with-presets">
+                                <input type="text" id="set-translate-target" class="form-input" placeholder="Off (original language)"
+                                    spellcheck="false" onchange="gatherSettings()">
+                                <div class="lang-presets">
+                                    <button class="btn-preset-sm" onclick="setTranslateTarget('')">OFF</button>
+                                    <button class="btn-preset-sm" onclick="setTranslateTarget('Spanish')">ES</button>
+                                    <button class="btn-preset-sm" onclick="setTranslateTarget('French')">FR</button>
+                                    <button class="btn-preset-sm" onclick="setTranslateTarget('German')">DE</button>
+                                    <button class="btn-preset-sm" onclick="setTranslateTarget('Portuguese')">PT</button>
+                                    <button class="btn-preset-sm" onclick="setTranslateTarget('Japanese')">JA</button>
+                                    <button class="btn-preset-sm" onclick="setTranslateTarget('English')">EN</button>
+                                    <button class="btn-preset-sm" onclick="setTranslateTarget('Vietnamese')">VI</button>
+                                </div>
+                            </div>
+                            <span class="setting-hint">Translates subtitles to this language using Ollama (<code>--translate</code> in CLI).</span>
+                        </div>
+                        <div class="setting-row">
                             <label>Debug Logging</label>
                             <label class="toggle">
                                 <input type="checkbox" id="set-debug-logging" onchange="gatherSettings()">

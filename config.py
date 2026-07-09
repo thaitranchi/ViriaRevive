@@ -3,6 +3,8 @@ import sys
 import json
 from pathlib import Path
 
+from ollama_client import DEFAULT_MODEL
+
 logger = logging.getLogger(__name__)
 
 # In PyInstaller frozen builds, __file__ resolves to the temp _MEIPASS dir.
@@ -84,6 +86,10 @@ OLLAMA_DETECTOR_TIMEOUT = 20
 # Whisper
 WHISPER_MODEL = "base"
 WHISPER_LANGUAGE = None
+
+# Translation (LLM post-transcription)
+TRANSLATE_TARGET = None       # None = off, "es" = translate to Spanish, etc.
+TRANSLATE_MODEL = DEFAULT_MODEL
 
 # Subtitle style
 SUBTITLE_STYLE = "tiktok"
