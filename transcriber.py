@@ -178,7 +178,7 @@ def find_sentence_boundary(words: list, clip_duration: float,
     if best_pause_end is not None:
         result = best_pause_end + 0.2
         print(f"    [sentence] Snapped to natural pause at {result:.1f}s "
-              f"(was {clip_duration}s, gap={best_pause_end:.2f}s)")
+              f"(was {clip_duration}s, gap={gap:.2f}s)")
         return result
 
     # ── Pass 3: soft punctuation (comma, colon, etc.) ──

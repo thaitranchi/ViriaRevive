@@ -164,15 +164,21 @@ def generate_titles_batch(
         }
         
         for future in as_completed(futures):
+            idx = futures[future]
             try:
-                idx, title = future.result()
-                results[idx] = title
+                idx_res, title = future.result()
+                results[idx_res] = title
                 done_count += 1
                 if on_progress:
                     # Report progress back to the UI
                     on_progress(done_count, total, title)
             except Exception as e:
                 done_count += 1
+                if on_progress:
+                    on_progress(done_count, total, "")
                 print(f"[gemini-batch] Error generating title {idx}: {e}")
+
+    if on_progress and done_count < total:
+        on_progress(total, total, "")
 
     return results

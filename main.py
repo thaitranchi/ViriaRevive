@@ -509,7 +509,7 @@ def process(
         on_progress("upload", 0, f"Uploading {len(done)} clips...")
         sched = build_schedule(
             done,
-            start_time=datetime.utcnow() + timedelta(hours=1),
+            start_time=datetime.now().astimezone() + timedelta(hours=1),
             interval_hours=schedule_hours,
         )
         for i, item in enumerate(sched):

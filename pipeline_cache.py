@@ -194,9 +194,9 @@ class PipelineCache:
             for m in moments:
                 stored = existing.get(m.get("start"))
                 if stored:
-                    for k in ("transcript", "crop_params", "end", "duration"):
-                        if k in stored and k not in m:
-                            m[k] = stored[k]
+                    for k, v in stored.items():
+                        if k not in m:
+                            m[k] = v
             state.moments = moments
         self._modify_state(_update)
 

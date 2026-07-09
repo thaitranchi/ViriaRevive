@@ -647,21 +647,29 @@ def extract_clip(
     music_af = _build_music_af(duration, music_path, music_volume, music_trim_start, music_trim_end)
     extra_inputs = _build_music_extra_inputs(music_path)
 
-    # Build video base filter (crop + shorts format)
+    # Build video base filter (crop + shorts format + effect)
+    effect_vf = None
+    if effect and effect in EFFECTS_PRESETS:
+        effect_vf = EFFECTS_PRESETS[effect]["vf"]
+
     if crop_params:
         if shorts_format == "none":
-            vf_base = None
+            vf_base = effect_vf
         elif shorts_format == "blur_pad":
             vf_base = _blur_pad_vf()
+            if effect_vf:
+                vf_base = f"{vf_base},{effect_vf}"
         else:
-            vf_base = _chain_vf(_build_crop_vf(crop_params, duration), _shorts_vf())
+            vf_base = _chain_vf(_build_crop_vf(crop_params, duration), _shorts_vf(), effect_vf)
     else:
         if shorts_format == "none":
-            vf_base = None
+            vf_base = effect_vf
         elif shorts_format == "blur_pad":
             vf_base = _blur_pad_vf()
+            if effect_vf:
+                vf_base = f"{vf_base},{effect_vf}"
         else:
-            vf_base = _shorts_vf()
+            vf_base = _chain_vf(_shorts_vf(), effect_vf)
 
     # ── CASE A: crop + subtitles → try merged single-pass first ──────────
     if crop_params and temp_sub:

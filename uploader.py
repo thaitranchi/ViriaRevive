@@ -412,7 +412,7 @@ def build_schedule(
     interval_hours: int = 24,
 ) -> list:
     if start_time is None:
-        start_time = datetime.utcnow() + timedelta(hours=1)
+        start_time = datetime.now().astimezone() + timedelta(hours=1)
     return [
         {"path": p, "scheduled_time": start_time + timedelta(hours=interval_hours * i)}
         for i, p in enumerate(clip_paths)

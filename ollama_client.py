@@ -154,7 +154,7 @@ def generate_json(
         model=model,
         timeout=timeout,
         options=options,
-        format="json",
+        response_format="json",
     )
     if not response:
         return None
