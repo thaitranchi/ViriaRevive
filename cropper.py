@@ -359,7 +359,11 @@ def _load_cascades(cv2):
 
 
 def _detect_faces_haar(frame, cascades, scale=0.5):
-    """Detect faces using Haar cascades. Returns list of (cx, cy, area, conf, face_h)."""
+    """Detect faces using Haar cascades. Returns list of (cx, cy, area, conf, face_h).
+
+    Early-exit optimization: if the first cascade run (no equalize) finds
+    well-confirmed faces, skip the equalized pass and later cascades.
+    """
     import cv2
     if frame is None or frame.size == 0:
         return []
@@ -369,6 +373,7 @@ def _detect_faces_haar(frame, cascades, scale=0.5):
 
     all_faces = {}
     merge_dist = 50
+    _HIGH_CONF_AREA = 800  # ~3% of a 540x960 frame → confident detection
 
     for use_eq in [False, True]:
         detect_gray = cv2.equalizeHist(gray) if use_eq else gray
@@ -397,6 +402,11 @@ def _detect_faces_haar(frame, cascades, scale=0.5):
                     all_faces[(center_x // merge_dist, center_y // merge_dist)] = (
                         center_x, center_y, area, score, face_h
                     )
+
+            # Early exit: if we already have high-confidence face detections,
+            # skip remaining cascade passes for this frame
+            if all_faces and max(v[3] for v in all_faces.values()) > _HIGH_CONF_AREA:
+                return list(all_faces.values())
 
     return list(all_faces.values())
 

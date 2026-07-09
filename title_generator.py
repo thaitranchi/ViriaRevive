@@ -64,6 +64,61 @@ def _ask_ollama(transcript: str, model: str = DEFAULT_MODEL, language: str = Non
     return None
 
 
+# Template categories keyed by theme — each has a keyword cue to match against
+_TEMPLATE_CATEGORIES = {
+    "clutch": {
+        "cues": ["clutch", "ace", "1v", "last", "win", "round", "match point"],
+        "templates": [
+            "This {topic} Clutch Was Insane",
+            "Watch This {topic} 1v5 Ace",
+            "UNBELIEVABLE {topic} Comeback",
+            "Nobody Expected {topic} to End Like This",
+            "This {topic} Clutch",
+        ],
+    },
+    "gameplay": {
+        "cues": ["gameplay", "play", "move", "shot", "kill", "combo", "mechanic"],
+        "templates": [
+            "INSANE {topic} Gameplay",
+            "This {topic} Play Was CRACKED",
+            "Pro {topic} Player Goes Crazy",
+            "Insane {topic} Play",
+            "{topic} Gameplay OP",
+        ],
+    },
+    "viral": {
+        "cues": ["moment", "viral", "crazy", "insane", "unreal", "epic"],
+        "templates": [
+            "This Is Why {topic} Went Viral",
+            "I Can't Believe {topic} Actually Worked",
+            "You Won't Believe What Happened With {topic}",
+            "{topic} Will Blow Your Mind",
+            "{topic} Went Viral",
+            "UNBELIEVABLE {topic} Moment",
+        ],
+    },
+    "general": {
+        "cues": [],
+        "templates": [
+            "This {topic} Clutch Was Insane",
+            "INSANE {topic} Gameplay",
+            "Pro {topic} Player Goes Crazy",
+            "Watch This {topic} Ace",
+            "{topic} Was Insane",
+        ],
+    },
+}
+
+# Short fallback templates for when title exceeds 55 chars
+_SHORT_TEMPLATES = [
+    "{topic} Clutch",
+    "{topic} Gameplay OP",
+    "Insane {topic} Play",
+    "{topic} Went Viral",
+    "{topic} Was Insane",
+]
+
+
 def _heuristic_title(transcript: str) -> str:
     """Fallback: generate a clickbait-style title from transcript keywords."""
     if not transcript:
@@ -73,36 +128,29 @@ def _heuristic_title(transcript: str) -> str:
     words = re.sub(r'[^\w\s]', '', transcript).lower().split()
     # Filter out common short filler words, sort by length
     interesting_words = [w for w in words if len(w) > 4]
-    if not interesting_words: interesting_words = words[:5]
+    if not interesting_words:
+        interesting_words = words[:5]
     key_phrase = random.choice(interesting_words) if interesting_words else "This"
 
-    # Clickbait templates — {topic} gets replaced with the key phrase
-    templates = [
-        "This {topic} Clutch Was Insane",
-        "INSANE {topic} Gameplay",
-        "Pro {topic} Player Goes Crazy",
-        "UNBELIEVABLE {topic} Moment",
-        "Watch This {topic} 1v5 Ace",
-        "Nobody Expected {topic} to Go Like This",
-        "{topic} Will Blow Your Mind",
-        "You Won't Believe What Happened With {topic}",
-        "This Is Why {topic} Went Viral",
-        "I Can't Believe {topic} Actually Worked",
-    ]
+    # Score each template category based on keyword overlap with transcript
+    transcript_lower = transcript.lower()
+    best_cat = "general"
+    best_score = 0
+    for cat_name, cat_data in _TEMPLATE_CATEGORIES.items():
+        if not cat_data["cues"]:
+            continue
+        score = sum(2 if cue in transcript_lower else 0 for cue in cat_data["cues"])
+        if score > best_score:
+            best_score = score
+            best_cat = cat_name
 
     topic = key_phrase.title()
+    templates = _TEMPLATE_CATEGORIES[best_cat]["templates"]
     title = random.choice(templates).format(topic=topic)
 
-    # If title is too long, use shorter templates
+    # If title is too long, use short templates
     if len(title) > 55:
-        short_templates = [
-            "{topic} Clutch",
-            "{topic} Gameplay OP",
-            "Insane {topic} Play",
-            "{topic} Went Viral",
-            "{topic} Was Insane",
-        ]
-        title = random.choice(short_templates).format(topic=topic)
+        title = random.choice(_SHORT_TEMPLATES).format(topic=topic)
 
     # Final safety: truncate at word boundary
     if len(title) > 60:
@@ -175,10 +223,15 @@ def generate_titles_batch(
                 return idx, title
         return idx, _heuristic_title(transcript)
 
-    # Run 1 request at a time (Ollama processes sequentially; concurrency causes hangs)
-    workers = 1
+    # Use limited parallelism — Ollama queues requests per model, but HTTP connections
+    # don't share a Python-level lock, so concurrent submission is safe and faster.
+    import time
+    workers = 3
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(_gen_one, (i, t)): i for i, t in enumerate(transcripts)}
+        futures = {}
+        for i, t in enumerate(transcripts):
+            futures[pool.submit(_gen_one, (i, t))] = i
+            time.sleep(0.05)  # small stagger to avoid hammering Ollama's queue
         for future in as_completed(futures):
             try:
                 idx, title = future.result()

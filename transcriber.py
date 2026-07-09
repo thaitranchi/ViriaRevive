@@ -109,11 +109,10 @@ def find_sentence_boundary(words: list, clip_duration: float,
     that ends on a natural sentence boundary — so the speaker finishes their
     thought instead of being cut off mid-sentence.
 
-    Strategy (in priority order):
-      1. Look for sentence-ending punctuation (.!?) near the end of the clip
-      2. Look for a long natural pause (>0.5s gap between words)
-      3. Look for soft punctuation (comma, colon, semicolon)
-      4. If nothing found, return None (keep original duration)
+    Strategy: score each candidate boundary within the search range, picking
+    the highest-scoring one. Boundaries closer to the original end are
+    preferred (distance-based decay), with punctuation taking priority
+    over pauses.
 
     Args:
         words: list of {'text': str, 'start': float, 'end': float}
@@ -133,76 +132,54 @@ def find_sentence_boundary(words: list, clip_duration: float,
     min_time = clip_duration * min_keep    # don't cut before this
     max_time = clip_duration + max_extend  # don't extend past this
 
-    # ── Pass 1: sentence-ending punctuation (.!?) ──
-    # Search backward from the end — prefer the latest sentence end
-    if is_cancelled():
-        return None
-    best_sentence_end = None
-    for w in reversed(words):
+    # ── Single pass: score every candidate boundary ──
+    best_score = 0.0
+    best_end = None
+    best_type = ""
+
+    for i in range(len(words) - 1, -1, -1):
         if is_cancelled():
             return None
+        w = words[i]
         if w["end"] < min_time:
             break
         if w["end"] > max_time:
             continue
+
+        # Distance from original clip end: 1.0 at clip_duration, 0.5 at boundaries
+        dist = abs(w["end"] - clip_duration)
+        dist_range = max(clip_duration - min_time, max_time - clip_duration)
+        dist_weight = 1.0 - 0.5 * (dist / max(1.0, dist_range))
+
         text = w["text"].rstrip()
+
         if text and text[-1] in _SENTENCE_ENDERS:
-            best_sentence_end = w["end"]
-            break  # take the latest one within range
+            score = 1.0 * dist_weight
+            if score > best_score:
+                best_score = score
+                best_end = w["end"] + 0.3
+                best_type = "sentence end"
 
-    if best_sentence_end is not None:
-        # Add a small pad (0.3s) after the last word for natural breathing room
-        result = best_sentence_end + 0.3
-        print(f"    [sentence] Snapped to sentence end at {result:.1f}s "
-              f"(was {clip_duration}s)")
-        return result
+        elif i < len(words) - 1:
+            gap = words[i + 1]["start"] - w["end"]
+            if gap >= _PAUSE_THRESHOLD:
+                score = 0.8 * dist_weight
+                if score > best_score:
+                    best_score = score
+                    best_end = w["end"] + 0.2
+                    best_type = "natural pause"
 
-    # ── Pass 2: long natural pause between words ──
-    if is_cancelled():
-        return None
-    best_pause_end = None
-    for i in range(len(words) - 1, 0, -1):
-        if is_cancelled():
-            return None
-        word_end = words[i - 1]["end"]
-        next_start = words[i]["start"]
-        if word_end < min_time:
-            break
-        if word_end > max_time:
-            continue
-        gap = next_start - word_end
-        if gap >= _PAUSE_THRESHOLD:
-            best_pause_end = word_end
-            break
-
-    if best_pause_end is not None:
-        result = best_pause_end + 0.2
-        print(f"    [sentence] Snapped to natural pause at {result:.1f}s "
-              f"(was {clip_duration}s, gap={gap:.2f}s)")
-        return result
-
-    # ── Pass 3: soft punctuation (comma, colon, etc.) ──
-    if is_cancelled():
-        return None
-    best_soft_end = None
-    for w in reversed(words):
-        if is_cancelled():
-            return None
-        if w["end"] < min_time:
-            break
-        if w["end"] > max_time:
-            continue
-        text = w["text"].rstrip()
         if text and text[-1] in _SOFT_ENDERS:
-            best_soft_end = w["end"]
-            break
+            score = 0.6 * dist_weight
+            if score > best_score:
+                best_score = score
+                best_end = w["end"] + 0.25
+                best_type = "soft break"
 
-    if best_soft_end is not None:
-        result = best_soft_end + 0.25
-        print(f"    [sentence] Snapped to soft break at {result:.1f}s "
-              f"(was {clip_duration}s)")
-        return result
+    if best_end is not None:
+        print(f"    [sentence] Snapped to {best_type} at {best_end:.1f}s "
+              f"(was {clip_duration}s, score={best_score:.2f})")
+        return best_end
 
-    # ── No good boundary found ──
     print(f"    [sentence] No natural boundary found near {clip_duration}s, keeping as-is")
     return None

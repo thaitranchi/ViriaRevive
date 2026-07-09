@@ -74,16 +74,19 @@ def find_viral_moments(
         audio = None
 
     if audio is None:
-        energies = np.zeros(total_seconds, dtype=float)
+        energies = np.zeros(total_seconds * 2, dtype=float)
     else:
         # --- Audio RMS energy (500ms windows — captures gaming action bursts) ---
+        if is_cancelled():
+            raise CancelledError("Audio analysis cancelled")
         window_ms = 500
-        energies_list = []
-        for i in range(0, len(audio), window_ms):
-            if is_cancelled():
-                raise CancelledError("Audio analysis cancelled")
-            energies_list.append(audio[i : i + window_ms].rms)
-        energies = np.array(energies_list, dtype=float)
+        window_samples = int(audio.frame_rate * window_ms / 1000)
+        raw = np.frombuffer(audio.raw_data, dtype=np.int16).astype(np.float64)
+        # Pad to fit whole windows
+        if len(raw) % window_samples != 0:
+            raw = np.pad(raw, (0, window_samples - len(raw) % window_samples))
+        windows = raw.reshape(-1, window_samples)
+        energies = np.sqrt(np.mean(windows ** 2, axis=1))
 
     if len(energies) == 0:
         return _fallback_moments(total_seconds, num_clips, clip_duration, min_gap)
@@ -95,12 +98,9 @@ def find_viral_moments(
     # --- Volume variance (dynamic = interesting) ---
     # Gaming: shorter 5s window catches action bursts (gunshots, explosions)
     var_window = 5
-    variance = np.array(
-        [
-            np.std(energies[max(0, i - var_window // 2) : i + var_window // 2])
-            for i in range(len(energies))
-        ]
-    )
+    from numpy.lib.stride_tricks import sliding_window_view
+    padded = np.pad(energies, (var_window // 2, var_window // 2), mode="edge")
+    variance = sliding_window_view(padded, var_window).std(axis=1)
 
     # --- Scene change density ---
     logger.info("Analyzing scene changes...") # type: ignore
@@ -122,15 +122,20 @@ def find_viral_moments(
         + 0.50 * norm(scene_density[: len(smoothed)])
     )
 
-    # --- Pick top N non-overlapping peaks ---
+    # --- Pick top N non-overlapping peaks (NMS-style with temporal diversity) ---
     # combined[i] corresponds to time i * 0.5 seconds (500ms windows)
     half = clip_duration // 2
+    half_idx = int(half * 2)
+    min_gap_idx = int(min_gap * 2)
+    suppress_radius = half_idx + min_gap_idx
+
+    # Apply temporal diversity bonus: boost regions farther from already-picked peaks
+    scores = combined.copy()
     clips = []
-    combined = combined.copy()
     for _ in range(num_clips):
-        if combined.max() <= 0:
+        if scores.max() <= 0:
             break
-        peak = int(np.argmax(combined))
+        peak = int(np.argmax(scores))
         peak_sec = peak * 0.5
         start = max(0.0, peak_sec - half)
         end = min(float(total_seconds), start + clip_duration)
@@ -138,13 +143,15 @@ def find_viral_moments(
             start = max(0.0, end - clip_duration)
 
         clips.append(
-            {"start": start, "end": end, "duration": end - start, "score": float(combined[peak])}
+            {"start": start, "end": end, "duration": end - start, "score": float(scores[peak])}
         )
 
-        # mask out neighbourhood (convert seconds to window indices)
-        lo = max(0, int((peak_sec - clip_duration - min_gap) * 2))
-        hi = min(len(combined), int((peak_sec + clip_duration + min_gap) * 2))
-        combined[lo:hi] = 0
+        # Gaussian suppression instead of hard zero — leaves residual for diversity bonus
+        lo = max(0, peak - suppress_radius)
+        hi = min(len(scores), peak + suppress_radius + 1)
+        idx_range = np.arange(lo, hi)
+        dist = np.abs(idx_range - peak) / max(1, suppress_radius)
+        scores[idx_range] *= (1.0 - 0.85 * np.exp(-4.0 * dist ** 2))
 
     clips.sort(key=lambda c: c["start"])
 
@@ -160,9 +167,36 @@ def find_viral_moments(
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 
+# LRU cache for scene density results — keyed by (path, st_mtime, st_size)
+_scene_cache: dict[tuple, tuple] = {}
+_scene_cache_max = 8
+
+
 def _scene_change_density(video_path: Path, length: int) -> "np.ndarray":  # noqa: F821
-    """Count scene changes per second using ffmpeg."""
+    """Count scene changes per second using ffmpeg. Results are cached per video file."""
     import numpy as np
+
+    try:
+        st = video_path.stat()
+        cache_key = (video_path, st.st_mtime, st.st_size)
+    except OSError:
+        cache_key = (video_path, 0, 0)
+
+    cached = _scene_cache.get(cache_key)
+    if cached is not None:
+        cached_arr, cached_len = cached
+        if cached_len == length:
+            return cached_arr.copy()
+        if cached_len > 0:
+            # Resample cached density to match new length
+            resampled = np.interp(
+                np.linspace(0, cached_len - 1, length),
+                np.arange(cached_len),
+                cached_arr,
+            )
+            _scene_cache[cache_key] = (resampled, length)
+            return resampled
+
     try:
         cmd = [
             "ffmpeg",
@@ -193,6 +227,12 @@ def _scene_change_density(video_path: Path, length: int) -> "np.ndarray":  # noq
             lo = max(0, int(ts) - win // 2)
             hi = min(length + 1, int(ts) + win // 2)
             density[lo:hi] += 1
+
+        # Store in LRU cache
+        if len(_scene_cache) >= _scene_cache_max:
+            oldest = next(iter(_scene_cache))
+            del _scene_cache[oldest]
+        _scene_cache[cache_key] = (density.copy(), length)
         return density
 
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):

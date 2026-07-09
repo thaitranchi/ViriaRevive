@@ -356,6 +356,10 @@ def _sanitize_word_times(words: list) -> list:
     return cleaned
 
 
+_SENTENCE_BOUNDARY = {'.', '!', '?', '…'}
+_CLAUSE_BOUNDARY = {',', ':', ';', '—', '-'}
+
+
 def _group_phrases(
     words: list, max_words: int = 4, max_dur: float = 2.5, max_gap: float = 0.8
 ) -> list:
@@ -363,17 +367,45 @@ def _group_phrases(
         return []
     if len(words) == 1:
         return [{"words": words, "start": words[0]["start"], "end": words[0]["end"]}]
-    phrases, cur = [], [words[0]]
-    for w in words[1:]:
-        prev = cur[-1]
-        if len(cur) >= max_words or w["start"] - prev["end"] > max_gap or w["end"] - cur[0]["start"] > max_dur:
+
+    # Split at sentence boundaries first (., !, ?, …)
+    sentence_groups = _split_at_boundary(words, _SENTENCE_BOUNDARY)
+
+    # Within each sentence, split at clause boundaries (,, :, ;, —, -)
+    clause_groups = []
+    for sg in sentence_groups:
+        clause_groups.extend(_split_at_boundary(sg, _CLAUSE_BOUNDARY))
+
+    # Greedy grouping within each clause
+    phrases = []
+    for cg in clause_groups:
+        cur = [cg[0]]
+        for w in cg[1:]:
+            prev = cur[-1]
+            if len(cur) >= max_words or w["start"] - prev["end"] > max_gap or w["end"] - cur[0]["start"] > max_dur:
+                phrases.append({"words": cur, "start": cur[0]["start"], "end": cur[-1]["end"]})
+                cur = [w]
+            else:
+                cur.append(w)
+        if cur:
             phrases.append({"words": cur, "start": cur[0]["start"], "end": cur[-1]["end"]})
-            cur = [w]
-        else:
-            cur.append(w)
-    if cur:
-        phrases.append({"words": cur, "start": cur[0]["start"], "end": cur[-1]["end"]})
     return phrases
+
+
+def _split_at_boundary(words: list, boundary_set: set) -> list:
+    """Split a word list at punctuation boundaries, keeping the boundary word in the preceding group."""
+    groups, cur = [], []
+    for w in words:
+        cur.append(w)
+        text = w.get("text", "").rstrip()
+        if text and text[-1] in boundary_set:
+            groups.append(cur)
+            cur = []
+    if cur:
+        groups.append(cur)
+    if not groups:
+        groups = [words]
+    return groups
 
 
 def _ass_header(w: int, h: int, s: dict, margin_v: int = 60) -> str:

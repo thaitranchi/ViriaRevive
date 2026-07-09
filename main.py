@@ -227,6 +227,8 @@ def process(
         candidate_lock = threading.Lock()
         candidates: list[dict] = []
 
+        _candidate_wavs: list[Path] = []
+
         def _process_candidate(args):
             idx, m = args
             if is_cancelled():
@@ -242,9 +244,10 @@ def process(
                     ).strip()
 
                 if crop:
+                    # Lower sample count for candidate visual check (binary person detection)
                     detections, _, _ = detect_all_persons(
                         video_path, m["start"], m["end"], 1920, 1080,
-                        sample_count=20, yolo_device=YOLO_DEVICE,
+                        sample_count=10, yolo_device=YOLO_DEVICE,
                     )
                     if detections:
                         hits = sum(1 for _, persons in detections if persons)
@@ -256,11 +259,13 @@ def process(
 
                 with candidate_lock:
                     candidates.append(m)
+                    _candidate_wavs.append(wav)
                 print(f"  [candidate {idx}/{len(moments)}] done")
                 on_progress("detect", 35 + int((idx - 1) / max(1, len(moments)) * 35),
                             f"AI candidate {idx}/{len(moments)}")
-            finally:
+            except Exception:
                 wav.unlink(missing_ok=True)
+                raise
 
         worker_count = max(1, get_gpu_count() or 1)
         with ThreadPoolExecutor(max_workers=worker_count) as pool:
@@ -359,12 +364,29 @@ def process(
                 print(f"[!] Crop detection failed for clip {clip_num}: {e}")
                 crop_params = None
 
-        # 3b. extract wav for whisper (use cached if available)
+        # 3b. extract wav for whisper (try candidate cache first, then cached clip wav)
         wav = SUBTITLES_DIR / f"{stem}_c{clip_num}.wav"
         extended_end = min(end + sentence_buffer, int(vid_duration))
+        _wav_from_cache = False
         if not wav.exists():
-            if not extract_audio_clip(video_path, start, extended_end, wav):
-                return None
+            # Check if any candidate WAV covers this range
+            for cw in _candidate_wavs:
+                cw_stem = cw.stem
+                cw_idx_str = cw_stem.replace(f"{stem}_candidate", "")
+                try:
+                    cw_idx = int(cw_idx_str) - 1
+                    if 0 <= cw_idx < len(moments):
+                        cm = moments[cw_idx]
+                        if abs(cm["start"] - start) < 1.0 and cm["end"] >= extended_end - 1.0:
+                            shutil.copy2(cw, wav)
+                            _wav_from_cache = True
+                            print(f"  [cache] Reusing candidate WAV for clip {clip_num}")
+                            break
+                except (ValueError, IndexError):
+                    pass
+            if not _wav_from_cache:
+                if not extract_audio_clip(video_path, start, extended_end, wav):
+                    return None
         else:
             print(f"  [cache] Using cached audio for clip {clip_num}")
 
@@ -471,6 +493,10 @@ def process(
             p = _process_one_clip(idx, m)
             if p:
                 done.append(p)
+
+    # Clean up candidate WAVs now that all clips are processed
+    for cw in _candidate_wavs:
+        cw.unlink(missing_ok=True)
 
     on_progress("clips", 100, f"{len(done)} clips created")
 

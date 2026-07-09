@@ -258,31 +258,62 @@ def _build_crop_vf(crop_params: tuple, duration: float) -> str:
             return f"crop={cw}:{ch}:0:0"
 
         # Downsample keyframes to max 15 to keep expression manageable.
-        # IMPORTANT: Always keep keyframes where position changes (transitions).
-        # Only drop keyframes that repeat the same position as their predecessor.
+        # Uses error-bounded simplification (Ramer-Douglas-Peucker style):
+        # keeps keyframes where removal would cause largest position error,
+        # preserving detail during fast movement and reducing during stable segments.
         if len(keyframes) > 15:
-            # First pass: mark all transition keyframes (position changes)
-            must_keep = {0, len(keyframes) - 1}  # always keep first and last
+            target = 15
+            # Always keep first, last, and any transition keyframes
+            must_keep = {0, len(keyframes) - 1}
             for i in range(1, len(keyframes)):
                 prev_x, prev_y = keyframes[i - 1][1], keyframes[i - 1][2]
                 cur_x, cur_y = keyframes[i][1], keyframes[i][2]
                 if cur_x != prev_x or cur_y != prev_y:
                     must_keep.add(i)
-                    if i > 0:
-                        must_keep.add(i - 1)  # keep the frame before transition too
 
-            if len(must_keep) <= 15:
-                # We can fit all transitions — fill remaining slots evenly
-                remaining = 15 - len(must_keep)
-                optional = [i for i in range(len(keyframes)) if i not in must_keep]
-                if optional and remaining > 0:
-                    step = max(1, len(optional) / remaining)
-                    extras = {optional[int(j * step)] for j in range(min(remaining, len(optional)))}
-                    must_keep |= extras
-                keyframes = [keyframes[i] for i in sorted(must_keep)]
-            else:
-                # More than 15 transitions — keep them all, they're all important
-                keyframes = [keyframes[i] for i in sorted(must_keep)]
+            if len(must_keep) < target:
+                # Fill remaining slots using error-bounded selection:
+                # compute the error that removing each optional keyframe would
+                # introduce (linear interpolation deviation), keep highest-error ones.
+                optional = sorted(set(range(len(keyframes))) - must_keep)
+                if optional:
+                    errors = []
+                    for idx in optional:
+                        # Find neighbors in must_keep set
+                        left = max(i for i in must_keep if i < idx) if any(i < idx for i in must_keep) else None
+                        right = min(i for i in must_keep if i > idx) if any(i > idx for i in must_keep) else None
+                        if left is not None and right is not None:
+                            # Linear interpolation between left and right at idx time
+                            t_frac = (keyframes[idx][0] - keyframes[left][0]) / max(1e-6, keyframes[right][0] - keyframes[left][0])
+                            interp_x = keyframes[left][1] + t_frac * (keyframes[right][1] - keyframes[left][1])
+                            interp_y = keyframes[left][2] + t_frac * (keyframes[right][2] - keyframes[left][2])
+                            err = abs(keyframes[idx][1] - interp_x) + abs(keyframes[idx][2] - interp_y)
+                        else:
+                            err = 0
+                        errors.append((err, idx))
+                    errors.sort(key=lambda e: -e[0])  # highest error first
+                    needed = target - len(must_keep)
+                    for _, idx in errors[:needed]:
+                        must_keep.add(idx)
+            elif len(must_keep) > target:
+                # Too many transitions — reduce by keeping the largest-magnitude ones
+                # Keep first, last, and fill with highest-error transitions
+                first_last = {0, len(keyframes) - 1}
+                transitions = sorted(must_keep - first_last)
+                if transitions:
+                    errors = []
+                    for i, idx in enumerate(transitions):
+                        left = transitions[i - 1] if i > 0 else 0
+                        right = transitions[i + 1] if i < len(transitions) - 1 else len(keyframes) - 1
+                        t_frac = (keyframes[idx][0] - keyframes[left][0]) / max(1e-6, keyframes[right][0] - keyframes[left][0])
+                        interp_x = keyframes[left][1] + t_frac * (keyframes[right][1] - keyframes[left][1])
+                        interp_y = keyframes[left][2] + t_frac * (keyframes[right][2] - keyframes[left][2])
+                        err = abs(keyframes[idx][1] - interp_x) + abs(keyframes[idx][2] - interp_y)
+                        errors.append((err, idx))
+                    errors.sort(key=lambda e: -e[0])
+                    must_keep = first_last | {idx for _, idx in errors[:target - len(first_last)]}
+
+            keyframes = [keyframes[i] for i in sorted(must_keep)]
 
         # Build step-function x and y expressions
         x_expr = _build_lerp_expr([t for t, x, y in keyframes], [x for t, x, y in keyframes])
