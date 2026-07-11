@@ -5,13 +5,29 @@ from __future__ import annotations
 import logging
 import re
 import shutil
+import subprocess
 import sys
 import threading
 from dataclasses import dataclass
 
-from subprocess_utils import run as _run
+from subprocess_utils import CancelledError
 
 logger = logging.getLogger(__name__)
+
+
+
+def _run_ffmpeg_direct(args: list[str], **kwargs) -> subprocess.CompletedProcess:
+    """Run ffmpeg subprocess directly, bypassing the global cancel flag.
+
+    Unlike :func:`subprocess_utils.run`, this does **not** check
+    ``_cancel_flag``, so probe operations are never interrupted by a
+    prior cancellation request.
+    """
+    kwargs.setdefault(
+        "creationflags",
+        subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+    )
+    return subprocess.run(args, **kwargs)
 
 # ── GPU discovery ─────────────────────────────────────────────────────────
 
@@ -159,7 +175,7 @@ def _run_ffmpeg_list(flag: str) -> str:
     if not _ffmpeg_available():
         return ""
     try:
-        r = _run(
+        r = _run_ffmpeg_direct(
             ["ffmpeg", "-hide_banner", flag],
             capture_output=True,
             text=True,
@@ -225,7 +241,7 @@ def _hardware_encode_works(codec: str) -> bool:
         return False
 
     try:
-        r = _run(
+        r = _run_ffmpeg_direct(
             [
                 "ffmpeg", "-hide_banner", "-y",
                 "-f", "lavfi", "-i", "testsrc2=duration=0.5:size=640x360:rate=15",
@@ -262,7 +278,7 @@ def probe_ffmpeg(encoder_pref: str = "auto") -> HwProfile:
     """Probe ffmpeg once per process; return cached HwProfile."""
     global _profile
     with _profile_lock:
-        if _profile is not None and encoder_pref in ("auto", None):
+        if _profile is not None:
             return _profile
 
     enc_out = _run_ffmpeg_list("-encoders")
@@ -291,9 +307,8 @@ def probe_ffmpeg(encoder_pref: str = "auto") -> HwProfile:
         active_encoder_label=_encoder_label(active),
         active_hwaccel=hwaccel,
     )
-    if encoder_pref in ("auto", None):
-        with _profile_lock:
-            _profile = profile
+    with _profile_lock:
+        _profile = profile
     return profile
 
 
@@ -342,7 +357,7 @@ def video_encode_args(
             codec = "libx264"
         elif key in _ENCODER_MAP and _ENCODER_MAP[key]:
             requested = _ENCODER_MAP[key]
-            codec = requested if requested == prof.active_encoder else prof.active_encoder
+            codec = requested if requested in prof.encoders else prof.active_encoder
         else:
             codec = prof.active_encoder
 
@@ -374,7 +389,7 @@ def video_encode_args(
             "-c:v", "h264_qsv",
             "-preset", qsv_preset,
             "-global_quality:v", cq,
-            "-pix_fmt", "yuv420p",
+            "-pix_fmt", "nv12",
         ]
         if gpu_index is not None and gpu_index >= 0:
             args += ["-engine:v", str(gpu_index)]
@@ -404,7 +419,7 @@ def video_encode_args(
             "-c:v", "hevc_qsv",
             "-preset", qsv_preset,
             "-global_quality:v", cq,
-            "-pix_fmt", "yuv420p",
+            "-pix_fmt", "nv12",
         ]
         if gpu_index is not None and gpu_index >= 0:
             args += ["-engine:v", str(gpu_index)]
@@ -558,7 +573,11 @@ def run_ffmpeg_with_encode_fallback(
     crf: str = "23",
 ):
     """Run ffmpeg; on failure, retry once with libx264 if a hardware encoder was used."""
-    r = run_fn(cmd)
+    try:
+        r = run_fn(cmd)
+    except CancelledError:
+        raise
+
     if r.returncode == 0:
         return r
 
