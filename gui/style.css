@@ -755,6 +755,8 @@ code { background: rgba(255,255,255,0.06); padding: 2px 8px; border-radius: 5px;
 .score-tag.ai b { color: var(--accent-light); }
 .score-tag.vis { border-color: rgba(0,206,201,0.2); }
 .score-tag.vis b { color: var(--accent-2); }
+.score-tag.vis2 { border-color: rgba(255,170,0,0.25); }
+.score-tag.vis2 b { color: #ffb000; }
 
 .result-card-actions {
     display: flex; gap: 6px; padding: 0 16px 14px;

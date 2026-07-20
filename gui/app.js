@@ -1534,7 +1534,8 @@ function _buildResultCard(clip, i) {
             </div>
             <div class="score-breakdown">
                 ${m.ai_score !== undefined ? `<span class="score-tag ai">AI <b>${(m.ai_score * 1).toFixed(1)}</b></span>` : ''}
-                ${m.visual_score !== undefined ? `<span class="score-tag vis">Visual <b>${(m.visual_score * 10).toFixed(1)}</b></span>` : ''}
+                ${m.vision_score !== undefined ? `<span class="score-tag vis">Vision <b>${(m.vision_score * 10).toFixed(1)}</b></span>` : ''}
+                ${m.visual_score !== undefined ? `<span class="score-tag vis2">Person <b>${(m.visual_score * 10).toFixed(1)}</b></span>` : ''}
             </div>
         </div>`;
     return card;
@@ -3458,6 +3459,11 @@ function populateSettings(s) {
     }
     setSelect('set-openrouter-model', s.openrouter_model || 'openai/gpt-4o-mini');
     setVal('set-ollama-model', s.ollama_detector_model || 'qwen2.5:3b');
+    const visionToggle = document.getElementById('set-vision-enabled');
+    if (visionToggle) visionToggle.checked = !!s.vision_enabled;
+    setVal('set-vision-model', s.vision_model || 'qwen3-vl:4b-instruct');
+    setVal('set-vision-frames', s.vision_frames || 4);
+    setVal('set-title-model', s.title_model || 'qcwind/qwen3-8b-instruct-Q4-K-M:latest');
     const debugToggle = document.getElementById('set-debug-logging');
     if (debugToggle) debugToggle.checked = !!s.debug_logging;
     const mode = s.shorts_mode || (s.crop_vertical !== false ? 'crop' : 'none');
@@ -3502,6 +3508,10 @@ function gatherSettings() {
         ai_provider: getVal('set-ai-provider') || 'gemini',
         ollama_detector_model: getVal('set-ollama-model') || 'qwen2.5:3b',
         openrouter_model: getVal('set-openrouter-model') || 'openai/gpt-4o-mini',
+        vision_enabled: document.getElementById('set-vision-enabled')?.checked || false,
+        vision_model: getVal('set-vision-model') || 'qwen3-vl:4b-instruct',
+        vision_frames: parseInt(getVal('set-vision-frames')) || 4,
+        title_model: getVal('set-title-model') || 'qcwind/qwen3-8b-instruct-Q4-K-M:latest',
         clips_path: getVal('set-clips-path') || '',
         debug_logging: document.getElementById('set-debug-logging')?.checked || false,
         shorts_mode: document.getElementById('set-shorts-enabled')?.checked ? 'crop' : 'none',

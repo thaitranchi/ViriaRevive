@@ -83,6 +83,17 @@ OLLAMA_DETECTOR_MODEL = "qwen2.5:3b"
 OLLAMA_DETECTOR_CANDIDATE_MULTIPLIER = 3
 OLLAMA_DETECTOR_TIMEOUT = 20
 
+# Vision analysis (Qwen3-VL) — opt-in multimodal highlight detection
+VISION_ENABLED = False
+VISION_MODEL = "qwen3-vl:4b-instruct"
+VISION_FRAMES_PER_MOMENT = 4
+VISION_FRAME_WIDTH = 640
+VISION_TIMEOUT = 30
+
+# Dedicated models for title/caption/SEO and translation
+TITLE_MODEL = "qcwind/qwen3-8b-instruct-Q4-K-M:latest"
+TRANSLATE_MODEL = "qwen3:4b-instruct"
+
 # Whisper
 WHISPER_MODEL = "base"
 WHISPER_LANGUAGE = None

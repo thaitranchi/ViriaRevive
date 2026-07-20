@@ -39,11 +39,17 @@ from config import (
     SENTENCE_BUFFER,
     SUBTITLE_STYLE,
     SUBTITLES_DIR,
+    TITLE_MODEL,
     TRANSLATE_TARGET,
     TRANSLATE_MODEL,
     VIDEO_CRF,
     VIDEO_ENCODER,
     VIDEO_DECODER,
+    VISION_ENABLED,
+    VISION_FRAMES_PER_MOMENT,
+    VISION_FRAME_WIDTH,
+    VISION_MODEL,
+    VISION_TIMEOUT,
     WHISPER_DEVICE,
     WHISPER_LANGUAGE,
     WHISPER_MODEL,
@@ -117,6 +123,11 @@ def process(
     ollama_model: str = OLLAMA_DETECTOR_MODEL,
     translate_to: str | None = None,
     translate_model: str = TRANSLATE_MODEL,
+    vision_enabled: bool = VISION_ENABLED,
+    vision_model: str = VISION_MODEL,
+    vision_frames: int = VISION_FRAMES_PER_MOMENT,
+    vision_frame_width: int = VISION_FRAME_WIDTH,
+    title_model: str = TITLE_MODEL,
     resume: bool = True,
     on_progress: ProgressCB = None,
 ) -> list[Path]:
@@ -261,6 +272,28 @@ def process(
                         m["visual_score"] = 0.0
                 else:
                     m["visual_score"] = 1.0
+
+                # Vision analysis (Qwen3-VL) — opt-in multimodal highlight signal
+                if vision_enabled:
+                    from vision_analyzer import analyze_moment, vision_ready
+                    if vision_ready(vision_model):
+                        try:
+                            vmeta = analyze_moment(
+                                video_path, m["start"], m["end"],
+                                model=vision_model,
+                                count=vision_frames,
+                                width=vision_frame_width,
+                                timeout=VISION_TIMEOUT,
+                            )
+                            if vmeta:
+                                m["vision_meta"] = vmeta
+                                m["vision_score"] = vmeta["highlight_score"]
+                                tag = "UI screen rejected" if vmeta["is_ui_screen"] else f"highlight={vmeta['highlight_score']:.2f}"
+                                print(f"  [vision {idx}] {tag} ocr={vmeta['ocr_text'][:30]!r}")
+                        except Exception as e:
+                            logger.debug("Vision analysis failed for candidate %s: %s", idx, e)
+                    else:
+                        print("[vision] Qwen3-VL unavailable; continuing without vision signal")
 
                 with candidate_lock:
                     candidates.append(m)
@@ -530,8 +563,10 @@ def process(
                     pass
         transcripts = [moments[_path_to_idx[p]].get("transcript", "") for p in done if p in _path_to_idx]
         if any(transcripts):
+            vision_contexts = [moments[_path_to_idx[p]].get("vision_meta") for p in done if p in _path_to_idx]
             all_titles = generate_titles_batch(
-                transcripts, model=ollama_model, language=title_language or language
+                transcripts, model=title_model, language=title_language or language,
+                vision_contexts=vision_contexts,
             )
         else:
             print("[title-gen] No transcripts found; using default titles")
@@ -596,6 +631,13 @@ def main():
     p.add_argument("--ollama-model",   default=OLLAMA_DETECTOR_MODEL, help=f"Ollama model name  (default {OLLAMA_DETECTOR_MODEL})")
     p.add_argument("--translate",      default=None, help="translate subtitles to language (es, fr, de, ja, ...)")
 
+    # ── Vision analysis (Qwen3-VL) ─────────────────────────────────────
+    p.add_argument("--vision",         action="store_true", help="enable Qwen3-VL vision analysis for highlight detection")
+    p.add_argument("--vision-model",   default=VISION_MODEL, help=f"Qwen3-VL model name  (default {VISION_MODEL})")
+    p.add_argument("--vision-frames",  type=int, default=VISION_FRAMES_PER_MOMENT, help=f"frames sampled per candidate  (default {VISION_FRAMES_PER_MOMENT})")
+    p.add_argument("--vision-width",   type=int, default=VISION_FRAME_WIDTH, help=f"frame width for vision  (default {VISION_FRAME_WIDTH})")
+    p.add_argument("--title-model",    default=TITLE_MODEL, help=f"Ollama model for title/caption generation  (default {TITLE_MODEL})")
+
     # ── New options ────────────────────────────────────────────────────
     p.add_argument("--auto-clips",     action="store_true", help="auto-compute clip count from video duration")
     p.add_argument("--effect",         default=None, help="video effect preset (cinematic, vibrant, moody, streamer, hdr, …)")
@@ -630,6 +672,11 @@ def main():
         ai_detector=a.ai_detector,
         ollama_model=a.ollama_model,
         translate_to=a.translate or TRANSLATE_TARGET,
+        vision_enabled=a.vision,
+        vision_model=a.vision_model,
+        vision_frames=a.vision_frames,
+        vision_frame_width=a.vision_width,
+        title_model=a.title_model,
         auto_clips=a.auto_clips,
         effect=a.effect,
         music_path=a.music,

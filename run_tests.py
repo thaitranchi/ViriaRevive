@@ -460,6 +460,167 @@ class TestConfig(unittest.TestCase):
         self.assertTrue(config.CLIPS_DIR.exists())
         self.assertTrue(config.SUBTITLES_DIR.exists())
 
+    def test_vision_constants(self):
+        import config
+        self.assertIsInstance(config.VISION_ENABLED, bool)
+        self.assertTrue(config.VISION_MODEL)
+        self.assertGreater(config.VISION_FRAMES_PER_MOMENT, 0)
+        self.assertTrue(config.TITLE_MODEL)
+        self.assertTrue(config.TRANSLATE_MODEL)
+
+
+class TestVisionAnalysis(unittest.TestCase):
+    """Tests for the Qwen3-VL vision integration (offline / mocked)."""
+
+    def test_model_exists_namespaced_tag(self):
+        from ollama_client import model_exists
+        import ollama_client
+        # Control list_models so the test is deterministic regardless of Ollama state.
+        original = ollama_client.list_models
+        ollama_client.list_models = lambda *a, **k: [
+            "qcwind/qwen3-8b-instruct-Q4-K-M:latest",
+            "qwen3-vl:4b-instruct",
+        ]
+        try:
+            # Fully-qualified and bare (suffix-stripped) forms both match.
+            self.assertTrue(model_exists("qcwind/qwen3-8b-instruct-Q4-K-M:latest"))
+            self.assertTrue(model_exists("qcwind/qwen3-8b-instruct-Q4-K-M"))
+            # A different family/model does not match.
+            self.assertFalse(model_exists("differentfamily/model:latest"))
+        finally:
+            ollama_client.list_models = original
+
+    def test_vision_score_candidate_rejects_ui_screen(self):
+        # UI screens must be hard-rejected without any network call.
+        import ollama_detector
+        result = ollama_detector.vision_score_candidate(
+            transcript="menu open",
+            moment={"start": 0, "end": 25, "score": 0.5},
+            clip_duration=25,
+            vision_meta={"is_ui_screen": True, "highlight_score": 0.95,
+                         "ocr_text": "", "scene": "main menu", "action": "",
+                         "reason": "loading screen", "objects": []},
+            model="qwen3-vl:4b-instruct",
+        )
+        self.assertIsNotNone(result)
+        self.assertLessEqual(result["viral_score"], 0.15)
+        self.assertIn("UI", result["reason"])
+
+    def test_vision_score_candidate_passes_through(self):
+        # Non-UI candidate routes to the LLM; we mock generate_json to avoid network.
+        import ollama_detector
+        original = ollama_detector.generate_json
+        ollama_detector.generate_json = lambda *a, **k: {
+            "viral_score": 0.8, "reason": "boss kill",
+            "better_start_offset": 0, "better_end_offset": 25,
+        }
+        try:
+            result = ollama_detector.vision_score_candidate(
+                transcript="we killed the boss",
+                moment={"start": 0, "end": 25, "score": 0.5},
+                clip_duration=25,
+                vision_meta={"is_ui_screen": False, "highlight_score": 0.9,
+                             "ocr_text": "Victory", "scene": "boss defeated",
+                             "action": "final blow", "reason": "epic", "objects": ["boss"]},
+                model="qwen3-vl:4b-instruct",
+            )
+        finally:
+            ollama_detector.generate_json = original
+        self.assertIsNotNone(result)
+        self.assertAlmostEqual(result["viral_score"], 0.8)
+
+    def test_analyze_moment_frames_normalizes(self):
+        import vision_analyzer
+        # Patch frame encoding + the network call so the test stays offline.
+        original_b64 = vision_analyzer._frames_to_b64
+        original_gen = vision_analyzer.generate_vision
+        vision_analyzer._frames_to_b64 = lambda frames: ["Zm9v"]
+        vision_analyzer.generate_vision = lambda *a, **k: {
+            "highlight_score": 1.7,  # out of range → clamped
+            "ocr_text": "Victory",
+            "scene": "boss room",
+            "objects": ["sword", "boss"],
+            "is_ui_screen": False,
+            "action": "attack",
+            "reason": "great moment",
+        }
+        try:
+            meta = vision_analyzer.analyze_moment_frames(
+                [__file__, __file__], model="qwen3-vl:4b-instruct", timeout=5,
+            )
+        finally:
+            vision_analyzer._frames_to_b64 = original_b64
+            vision_analyzer.generate_vision = original_gen
+        self.assertIsNotNone(meta)
+        self.assertEqual(meta["highlight_score"], 1.0)  # clamped to [0,1]
+        self.assertEqual(meta["ocr_text"], "Victory")
+        self.assertFalse(meta["is_ui_screen"])
+
+    def test_analyze_moment_frames_ui_clamped(self):
+        import vision_analyzer
+        original_b64 = vision_analyzer._frames_to_b64
+        original_gen = vision_analyzer.generate_vision
+        vision_analyzer._frames_to_b64 = lambda frames: ["Zm9v"]
+        vision_analyzer.generate_vision = lambda *a, **k: {
+            "highlight_score": 0.9, "is_ui_screen": True,
+            "ocr_text": "", "scene": "menu", "objects": [],
+            "action": "", "reason": "loading",
+        }
+        try:
+            meta = vision_analyzer.analyze_moment_frames(
+                [__file__], model="qwen3-vl:4b-instruct", timeout=5,
+            )
+        finally:
+            vision_analyzer._frames_to_b64 = original_b64
+            vision_analyzer.generate_vision = original_gen
+        self.assertIsNotNone(meta)
+        self.assertLessEqual(meta["highlight_score"], 0.15)
+
+    def test_title_generator_vision_enrichment(self):
+        import title_generator
+        captured = {}
+        orig_generate = title_generator.generate
+        orig_ensure = title_generator.ensure_model
+        def fake_generate(prompt, model=title_generator.DEFAULT_MODEL, timeout=30, options=None):
+            captured["prompt"] = prompt
+            return "Victory Clutch OP"
+        title_generator.generate = fake_generate
+        title_generator.ensure_model = lambda *a, **k: True
+        try:
+            title = title_generator.generate_title(
+                "we won the match", model="qwen3:8b-instruct",
+                vision_meta={"ocr_text": "Victory", "scene": "boss defeated",
+                             "action": "final blow", "objects": ["boss"]},
+            )
+        finally:
+            title_generator.generate = orig_generate
+            title_generator.ensure_model = orig_ensure
+        self.assertEqual(title, "Victory Clutch OP")
+        self.assertIn("Victory", captured["prompt"])
+        self.assertIn("boss defeated", captured["prompt"])
+
+    def test_title_generator_batch_vision_contexts(self):
+        import title_generator
+        seen = []
+        orig_generate = title_generator.generate
+        orig_ensure = title_generator.ensure_model
+        def fake_generate(prompt, model=title_generator.DEFAULT_MODEL, timeout=30, options=None):
+            seen.append(prompt)
+            return "Title"
+        title_generator.generate = fake_generate
+        title_generator.ensure_model = lambda *a, **k: True
+        try:
+            titles = title_generator.generate_titles_batch(
+                ["a", "b"], model="qwen3:8b-instruct",
+                vision_contexts=[{"ocr_text": "GG"}, None],
+            )
+        finally:
+            title_generator.generate = orig_generate
+            title_generator.ensure_model = orig_ensure
+        self.assertEqual(titles, ["Title", "Title"])
+        self.assertIn("GG", seen[0])
+        self.assertNotIn("on-screen text", seen[1])
+
 
 if __name__ == "__main__":
     verbose = "-v" in sys.argv

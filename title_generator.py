@@ -16,9 +16,27 @@ from ollama_client import (
 TIMEOUT = 30  # seconds per title request
 
 
-def _ask_ollama(transcript: str, model: str = DEFAULT_MODEL, language: str = None) -> str | None:
+def _ask_ollama(transcript: str, model: str = DEFAULT_MODEL, language: str = None,
+                vision_meta: dict | None = None) -> str | None:
     """Ask Ollama for a catchy short YouTube Shorts title."""
     lang_instruction = f" and reply in {language}" if language else ""
+    vision_block = ""
+    if vision_meta:
+        ocr = vision_meta.get("ocr_text", "").strip()
+        scene = vision_meta.get("scene", "").strip()
+        action = vision_meta.get("action", "").strip()
+        objects = vision_meta.get("objects") or []
+        obj_str = ", ".join(str(o) for o in objects[:8]) if objects else ""
+        if ocr or scene or action or obj_str:
+            vision_block = (
+                "\nVision context (from Qwen3-VL frame analysis — use it to make the title pop):\n"
+                f"- on-screen text (OCR): {ocr}\n"
+                f"- scene: {scene}\n"
+                f"- action: {action}\n"
+                f"- notable objects: {obj_str}\n"
+                "If the OCR text (e.g. 'Victory', 'GG', a weapon/character name) is punchy, "
+                "work it into the title naturally.\n"
+            )
     prompt = (
         "You are a viral gaming YouTube Shorts title expert. "
         f"Given a gameplay clip transcript, create ONE clickbait title that makes gamers NEED to watch{lang_instruction}.\n\n"
@@ -30,7 +48,8 @@ def _ask_ollama(transcript: str, model: str = DEFAULT_MODEL, language: str = Non
         "- NEVER just copy words from the transcript\n"
         "- Good examples: 'This 1v5 Clutch Was INSANE', 'He Got the Craziest Headshot Ever', "
         "'Unbelievable Game-Winning Play', 'This Player is Actually CRACKED'\n\n"
-        f'Transcript: "{transcript[:500]}"\n\n'
+        f'Transcript: "{transcript[:500]}"\n'
+        f"{vision_block}\n"
         "Reply with ONLY the title. Nothing else."
     )
     response = generate(
@@ -165,7 +184,8 @@ def _heuristic_title(transcript: str) -> str:
     return title
 
 
-def generate_title(transcript: str, model: str = DEFAULT_MODEL, language: str = None) -> str:
+def generate_title(transcript: str, model: str = DEFAULT_MODEL, language: str = None,
+                   vision_meta: dict | None = None) -> str:
     """Generate a title for a clip. Uses Ollama if available, else heuristic."""
     if not transcript:
         print("[title-gen] Skipped — empty transcript")
@@ -176,7 +196,7 @@ def generate_title(transcript: str, model: str = DEFAULT_MODEL, language: str = 
 
     # Try Ollama first — auto-pull model if needed
     if ensure_model(model):
-        result = _ask_ollama(clean_transcript, model, language)
+        result = _ask_ollama(clean_transcript, model, language, vision_meta=vision_meta)
         if result:
             print(f"[title-gen] LLM: {result}")
             return result
@@ -196,8 +216,12 @@ def generate_titles_batch(
     model: str = DEFAULT_MODEL,
     language: str = None,
     on_progress=None,
+    vision_contexts: list[dict | None] | None = None,
 ) -> list[str]:
     """Generate titles for multiple clips. Uses concurrent requests for speed.
+
+    *vision_contexts* is an optional list aligned with *transcripts* carrying
+    vision metadata (``vision_meta``) to enrich each title.
 
     on_progress(done, total, title) is called after each title is generated.
     """
@@ -217,8 +241,11 @@ def generate_titles_batch(
         idx, transcript = idx_transcript
         if not transcript:
             return idx, ""
+        vmeta = None
+        if vision_contexts and idx < len(vision_contexts):
+            vmeta = vision_contexts[idx]
         if model_ready:
-            title = _ask_ollama(transcript, model, language)
+            title = _ask_ollama(transcript, model, language, vision_meta=vmeta)
             if title:
                 return idx, title
         return idx, _heuristic_title(transcript)

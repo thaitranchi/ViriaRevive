@@ -1136,6 +1136,29 @@
                             <span class="setting-hint">Any model installed in Ollama (e.g. <code>qwen2.5:7b</code>, <code>llama3.1:8b</code>). Run <code>ollama pull &lt;model&gt;</code> first.</span>
                         </div>
                         <div class="setting-row">
+                            <label>Vision Analysis (Qwen3-VL)</label>
+                            <label class="toggle">
+                                <input type="checkbox" id="set-vision-enabled" onchange="gatherSettings()">
+                                <span class="toggle-slider"></span>
+                            </label>
+                            <span class="setting-hint">Enable multimodal highlight detection: samples frames per candidate and scores them with a vision model (OCR, scene, boss kills). Uses more VRAM/time.</span>
+                        </div>
+                        <div class="setting-row" id="vision-model-row">
+                            <label for="set-vision-model">Vision Model</label>
+                            <input type="text" id="set-vision-model" class="form-input" placeholder="qwen3-vl:4b-instruct" onchange="gatherSettings()">
+                            <span class="setting-hint">Vision model in Ollama (e.g. <code>qwen3-vl:4b-instruct</code>).</span>
+                        </div>
+                        <div class="setting-row" id="vision-frames-row">
+                            <label for="set-vision-frames">Frames / candidate</label>
+                            <input type="number" id="set-vision-frames" class="form-input" min="1" max="12" value="4" onchange="gatherSettings()">
+                            <span class="setting-hint">Frames sampled per candidate clip (default 4). More = better coverage, slower.</span>
+                        </div>
+                        <div class="setting-row" id="title-model-row">
+                            <label for="set-title-model">Title / Caption Model</label>
+                            <input type="text" id="set-title-model" class="form-input" placeholder="qcwind/qwen3-8b-instruct-Q4-K-M:latest" onchange="gatherSettings()">
+                            <span class="setting-hint">Ollama model for titles/captions (e.g. <code>qwen3:8b-instruct</code>). Falls back to the Ollama model above.</span>
+                        </div>
+                        <div class="setting-row">
                             <label for="set-title-language">Title language</label>
                             <div class="input-with-presets">
                                 <input type="text" id="set-title-language" class="form-input" placeholder="Same as transcription"

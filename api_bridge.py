@@ -54,7 +54,14 @@ from config import (
     OLLAMA_DETECTOR_TIMEOUT,
     SUBTITLE_STYLE,
     SUBTITLES_DIR,
+    TITLE_MODEL,
+    TRANSLATE_MODEL,
     TRANSLATE_TARGET,
+    VISION_ENABLED,
+    VISION_MODEL,
+    VISION_FRAMES_PER_MOMENT,
+    VISION_FRAME_WIDTH,
+    VISION_TIMEOUT,
     VIDEO_CRF,
     VIDEO_ENCODER,
     VIDEO_DECODER,
@@ -67,6 +74,8 @@ import gemini_client
 from hwaccel import log_hardware_startup, probe_ffmpeg, get_hardware_summary, video_encode_args, get_gpu_count, select_least_loaded_gpu
 from detector import find_viral_moments
 from ollama_detector import detector_ready, rerank_moments
+from ollama_client import ollama_available
+from vision_analyzer import analyze_moment, vision_ready
 from transcriber import transcribe_clip, find_sentence_boundary
 from subtitler import generate_subtitles, get_available_styles
 from clipper import (
@@ -384,6 +393,12 @@ class ApiBridge:
             "whisper_model": WHISPER_MODEL,
             "whisper_language": WHISPER_LANGUAGE or "",
             "translate_target": TRANSLATE_TARGET or "",
+            "vision_enabled": VISION_ENABLED,
+            "vision_model": VISION_MODEL,
+            "vision_frames": VISION_FRAMES_PER_MOMENT,
+            "vision_frame_width": VISION_FRAME_WIDTH,
+            "title_model": TITLE_MODEL,
+            "translate_model": TRANSLATE_MODEL,
             "subtitle_style": SUBTITLE_STYLE,
             "ffmpeg_preset": FFMPEG_PRESET,
             "video_crf": VIDEO_CRF,
@@ -566,7 +581,10 @@ class ApiBridge:
         if not any(transcripts):
             return {"titles": [], "error": "No transcripts available — process clips first"}
 
-        titles, llm_available = self._batch_generate_titles(transcripts)
+        titles, llm_available = self._batch_generate_titles(
+            transcripts,
+            vision_contexts=[m.get("vision_meta") for m in self._moments],
+        )
         return {"titles": titles, "llm": llm_available}
 
     def generate_title_for_clip(self, clip_index):
@@ -712,7 +730,10 @@ class ApiBridge:
             def _on_progress(done, total, title):
                 self._js(f"window.onTitleProgress && window.onTitleProgress({done}, {total}, {json.dumps(title or '')})")
 
-            titles, llm_available = self._batch_generate_titles(transcripts, on_progress=_on_progress)
+            titles, llm_available = self._batch_generate_titles(
+                transcripts, on_progress=_on_progress,
+                vision_contexts=[m.get("vision_meta") for m in self._moments],
+            )
 
             renamed = 0 # type: ignore
             results = []
@@ -797,8 +818,12 @@ class ApiBridge:
         except Exception as e:
             print(f"  [!] Backfill failed for clip {clip_index + 1}: {e}")
 
-    def _batch_generate_titles(self, transcripts, on_progress=None):
-        """Helper to route batch title generation to the selected AI provider."""
+    def _batch_generate_titles(self, transcripts, on_progress=None, vision_contexts=None):
+        """Helper to route batch title generation to the selected AI provider.
+
+        *vision_contexts* is an optional list aligned with *transcripts*
+        containing vision metadata (``vision_meta``) used to enrich titles.
+        """
         ai_provider = self._user_settings.get("ai_provider", AI_PROVIDER)
         gemini_key = self._decrypt(config.GEMINI_API_KEY)
         use_gemini = ai_provider == "gemini" and gemini_client.is_available(gemini_key)
@@ -810,10 +835,11 @@ class ApiBridge:
             ) # type: ignore
             return titles, True
         else:
-            model = self._user_settings.get("ollama_detector_model", OLLAMA_DETECTOR_MODEL)
+            model = self._user_settings.get("title_model", TITLE_MODEL)
             llm_ready = ensure_model(model)
             titles = generate_titles_batch(
-                transcripts, model=model, language=lang, on_progress=on_progress
+                transcripts, model=model, language=lang,
+                on_progress=on_progress, vision_contexts=vision_contexts,
             )
             return titles, llm_ready
 
@@ -1504,6 +1530,21 @@ class ApiBridge:
             gemini_key = self._decrypt(config.GEMINI_API_KEY)
             use_gemini = ai_provider == "gemini" and gemini_client.is_available(gemini_key)
             candidate_count = num_clips
+
+            # ── Vision analysis (Qwen3-VL) — opt-in multimodal signal ──
+            vision_enabled = bool(settings.get("vision_enabled", False))
+            vision_model = settings.get("vision_model", VISION_MODEL)
+            vision_frames = int(settings.get("vision_frames", VISION_FRAMES_PER_MOMENT))
+            vision_frame_width = int(settings.get("vision_frame_width", VISION_FRAME_WIDTH))
+            ollama_vision_ready = False
+            if vision_enabled and not use_gemini:
+                self._push("detect", 3, "Checking vision model (Qwen3-VL)...")
+                ollama_vision_ready = vision_ready(vision_model)
+                if ollama_vision_ready:
+                    self._push("detect", 5, f"Vision model ready: {vision_model}")
+                else:
+                    print("[vision] Qwen3-VL unavailable; continuing without vision signal")
+
             if ai_detector != "off":
                 if use_gemini:
                     ai_ready = True
@@ -1562,7 +1603,29 @@ class ApiBridge:
                                 m["visual_score"] = 0.0
                         else:
                             m["visual_score"] = 1.0
-                        
+
+                        # Vision analysis (Qwen3-VL) — opt-in multimodal highlight signal
+                        if ollama_vision_ready:
+                            try:
+                                vmeta = analyze_moment(
+                                    video_path, start, end,
+                                    model=vision_model,
+                                    count=vision_frames,
+                                    width=vision_frame_width,
+                                    timeout=VISION_TIMEOUT,
+                                )
+                                if vmeta:
+                                    m["vision_meta"] = vmeta
+                                    m["vision_score"] = vmeta["highlight_score"]
+                                    if vmeta["is_ui_screen"]:
+                                        print(f"[vision] candidate {cand_idx}: UI screen rejected "
+                                              f"(ocr={vmeta['ocr_text'][:20]!r})")
+                                    else:
+                                        print(f"[vision] candidate {cand_idx}: highlight={vmeta['highlight_score']:.2f} "
+                                              f"ocr={vmeta['ocr_text'][:30]!r} action={vmeta['action'][:30]!r}")
+                            except Exception as e:
+                                logger.debug("Vision analysis failed for candidate %s: %s", cand_idx, e)
+
                         candidate_moments.append(m)
                     finally:
                         try:
@@ -1675,9 +1738,10 @@ class ApiBridge:
                 translate_to = settings.get("translate_target") or None
                 if translate_to and words:
                     from translator import translate_words as _tw
+                    translate_model = settings.get("translate_model", TRANSLATE_MODEL)
                     self._clip_push(clip_num, total, "transcribe", 95,
                                     f"Translating to {translate_to}...")
-                    words = _tw(words, translate_to)
+                    words = _tw(words, translate_to, model=translate_model)
 
                 # Update moment info for UI (thread-safe: each thread writes to its own slot)
                 m["end"] = end # type: ignore
