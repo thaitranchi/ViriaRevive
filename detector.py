@@ -30,6 +30,7 @@ def find_viral_moments(
     num_clips: int = 5,
     clip_duration: int = 30,
     min_gap: int = 15,
+    predictor: object = None,
 ) -> list:
     """Find viral moments using audio energy + scene change analysis (no AI)."""
     import numpy as np
@@ -157,6 +158,13 @@ def find_viral_moments(
 
     if not clips:
         clips = _fallback_moments(total_seconds, num_clips, clip_duration, min_gap)
+
+    # Apply predictor boost if available
+    if predictor is not None and clips:
+        try:
+            clips = predictor.adjust_moments(clips)
+        except Exception as e:
+            logger.debug("Predictor adjustment failed: %s", e)
 
     logger.info(f"Found {len(clips)} viral moments") # type: ignore
     for i, c in enumerate(clips):

@@ -19,6 +19,16 @@ SUBTITLES_DIR = BASE_DIR / "subtitles"
 MUSIC_DIR = BASE_DIR / "music"
 TOKENS_DIR = BASE_DIR / "tokens"
 
+# PostgreSQL connection (pgvector enabled)
+# Override via environment variable: VIRIA_DATABASE_URL
+# Default: local postgres on standard port, database "viria"
+DATABASE_URL = "postgresql://postgres:postgres@localhost:5432/viria"
+import os as _os
+DATABASE_URL = _os.environ.get("VIRIA_DATABASE_URL", DATABASE_URL)
+
+# Embedding model for vector search
+EMBEDDING_MODEL = "BAAI/bge-m3"
+
 for d in [DOWNLOADS_DIR, CLIPS_DIR, SUBTITLES_DIR, MUSIC_DIR, TOKENS_DIR]:
     d.mkdir(exist_ok=True)
 

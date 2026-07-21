@@ -32,6 +32,20 @@ def wait_for_file_unlock(path: Path, timeout: float = 5.0, interval: float = 0.5
     return False
 
 
+def extract_youtube_id(url: str) -> str | None:
+    """Extract YouTube video ID from various URL formats."""
+    import re
+    patterns = [
+        r"(?:v=|/v/|youtu\.be/|/embed/|/shorts/)([A-Za-z0-9_-]{11})",
+        r"^([A-Za-z0-9_-]{11})$",
+    ]
+    for p in patterns:
+        m = re.search(p, url)
+        if m:
+            return m.group(1)
+    return None
+
+
 def auto_clip_count(vid_duration: float, clip_duration: int) -> int:
     """Smart auto: scale clips based on video length."""
     vid_mins = vid_duration / 60

@@ -2151,6 +2151,180 @@ class ApiBridge:
             except Exception as e:
                 logger.error(f"Failed to load state file {STATE_FILE}: {e}")
 
+    # ── Database methods ──────────────────────────────────────────────────
+
+    def update_performance_stats(self, video_id: str) -> dict:
+        """Fetch current stats for an uploaded video and store in DB.
+
+        Called on-demand from the frontend dashboard.
+        """
+        try:
+            from data_collector import update_video_stats
+            svc, svc_err = get_youtube_service()
+            if not svc:
+                return {"success": False, "error": svc_err}
+            ok = update_video_stats(svc, video_id)
+            return {"success": ok}
+        except Exception as e:
+            logger.error("update_performance_stats failed: %s", e)
+            return {"success": False, "error": str(e)}
+
+    def collect_channel_data(self) -> dict:
+        """Fetch channel metadata from YouTube and store in DB."""
+        try:
+            from data_collector import collect_channel_metadata
+            svc, svc_err = get_youtube_service()
+            if not svc:
+                return {"success": False, "error": svc_err}
+            db_id = collect_channel_metadata(svc)
+            return {"success": db_id is not None, "channel_db_id": db_id}
+        except Exception as e:
+            logger.error("collect_channel_data failed: %s", e)
+            return {"success": False, "error": str(e)}
+
+    def collect_comments(self, video_id: str, max_results: int = 100) -> dict:
+        """Fetch comments for a video and store in DB."""
+        try:
+            from data_collector import collect_comments
+            svc, svc_err = get_youtube_service()
+            if not svc:
+                return {"success": False, "error": svc_err}
+            count = collect_comments(svc, video_id, max_results=max_results)
+            return {"success": True, "count": count}
+        except Exception as e:
+            logger.error("collect_comments failed: %s", e)
+            return {"success": False, "error": str(e)}
+
+    def get_channel_dashboard(self) -> list[dict]:
+        """Return channel + video stats for the dashboard view."""
+        try:
+            from database import get_session
+            from database.models import Channel, Video
+            from sqlalchemy import select, desc
+            with get_session() as session:
+                channels = session.execute(
+                    select(Channel).order_by(desc(Channel.last_fetched))
+                ).scalars().all()
+                results = []
+                for ch in channels:
+                    videos = session.execute(
+                        select(Video).where(Video.channel_id == ch.id)
+                        .order_by(desc(Video.created_at)).limit(20)
+                    ).scalars().all()
+                    results.append({
+                        "id": ch.id,
+                        "channel_id": ch.channel_id,
+                        "title": ch.title,
+                        "subscribers": ch.subscriber_count,
+                        "total_views": ch.total_views,
+                        "last_fetched": str(ch.last_fetched) if ch.last_fetched else None,
+                        "videos": [
+                            {
+                                "video_id": v.video_id,
+                                "title": v.title[:80],
+                                "views": v.view_count,
+                                "likes": v.like_count,
+                                "comments": v.comment_count,
+                                "created_at": str(v.created_at) if v.created_at else None,
+                            }
+                            for v in videos
+                        ],
+                    })
+                return results
+        except Exception as e:
+            logger.error("get_channel_dashboard failed: %s", e)
+            return []
+
+    def embed_pipeline_run(self, pipeline_run_id: int) -> dict:
+        """Generate embeddings for all clips in a pipeline run."""
+        try:
+            from embedder import embed_pipeline_run
+            count = embed_pipeline_run(pipeline_run_id)
+            return {"success": True, "count": count}
+        except Exception as e:
+            logger.error("embed_pipeline_run failed: %s", e)
+            return {"success": False, "error": str(e)}
+
+    def find_similar_clips(self, text: str, limit: int = 10) -> list[dict]:
+        """Embed a query text and find similar clips via L2 distance."""
+        try:
+            from embedder import generate_text_embedding
+            from database import get_session
+            from database.repository import find_similar_clips as _find_similar
+
+            query_vec = generate_text_embedding(text)
+            if query_vec is None:
+                return []
+            with get_session() as session:
+                results = _find_similar(session, query_vec, limit=limit)
+                return [
+                    {
+                        "clip_id": r.clip_id,
+                        "model_name": r.model_name,
+                        "created_at": str(r.created_at),
+                    }
+                    for r in results
+                ]
+        except Exception as e:
+            logger.error("find_similar_clips failed: %s", e)
+            return []
+
+    def get_predictor_summary(self) -> dict:
+        """Return historical stats from the viral predictor."""
+        try:
+            from predictor import ViralPredictor
+            p = ViralPredictor()
+            p.refresh_stats()
+            return p.summary
+        except Exception as e:
+            logger.error("get_predictor_summary failed: %s", e)
+            return {}
+
+    def predict_boost_for_clip(self, score: float = 0.5, duration: float = 25.0,
+                                person_presence: float = 0.0) -> dict:
+        """Return the boost factor the predictor would apply."""
+        try:
+            from predictor import ViralPredictor
+            p = ViralPredictor()
+            p.refresh_stats()
+            boost = p.predict_boost({
+                "score": score,
+                "duration": duration,
+                "person_presence": person_presence,
+            })
+            return {"boost": round(boost, 3), "summary": p.summary}
+        except Exception as e:
+            logger.error("predict_boost_for_clip failed: %s", e)
+            return {"boost": 1.0, "summary": {}}
+
+    def recommend_clip_params(self, transcript: str) -> dict:
+        """Recommend clip duration/style/crop based on past successful clips."""
+        try:
+            from recommender import recommend_clip_params as _recommend
+            return _recommend(transcript)
+        except Exception as e:
+            logger.error("recommend_clip_params failed: %s", e)
+            return {"clip_duration": 25, "subtitle_style": "tiktok",
+                    "person_crop": True, "confidence": 0.0}
+
+    def recommend_title_suggestions(self, transcript: str, limit: int = 5) -> list[dict]:
+        """Find titles from similar past clips."""
+        try:
+            from recommender import recommend_title_suggestions as _suggest
+            return _suggest(transcript, limit=limit)
+        except Exception as e:
+            logger.error("recommend_title_suggestions failed: %s", e)
+            return []
+
+    def recommend_content_for_channel(self, channel_id: str, limit: int = 5) -> list[dict]:
+        """Recommend unprocessed videos to process next."""
+        try:
+            from recommender import recommend_content_for_channel as _content
+            return _content(channel_id, limit=limit)
+        except Exception as e:
+            logger.error("recommend_content_for_channel failed: %s", e)
+            return []
+
     # ── Progress push helpers ────────────────────────────────────────────
 
     def _push(self, stage, pct, msg):

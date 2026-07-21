@@ -17,3 +17,11 @@ keyring>=24.0.0
 torch>=2.0.0
 torchvision>=0.15.0
 torchaudio>=2.0.0
+
+# Database (PostgreSQL)
+psycopg2-binary>=2.9.9
+sqlalchemy>=2.0.0
+alembic>=1.13.0
+
+# Embeddings (BAAI BGE-M3 via sentence-transformers)
+sentence-transformers>=3.0.0

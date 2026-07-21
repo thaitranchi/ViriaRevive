@@ -57,7 +57,7 @@ from config import (
 )
 from hwaccel import log_hardware_startup, get_gpu_count, select_least_loaded_gpu
 from pipeline_cache import PipelineCache
-from utils import auto_clip_count
+from utils import auto_clip_count, extract_youtube_id
 from subprocess_utils import run as _run, is_cancelled, CancelledError, reset_cancel
 
 
@@ -176,7 +176,7 @@ def process(
     from translator import translate_words
     from clipper import extract_clip, extract_audio_clip, validate_shorts_output
     from cropper import get_crop_params_dynamic, detect_all_persons
-    from uploader import upload_to_youtube, build_schedule
+    from uploader import upload_to_youtube, build_schedule, get_youtube_service, is_connected
 
     if on_progress is None:
         on_progress = _default_progress
@@ -197,6 +197,18 @@ def process(
     cache = PipelineCache(stem)
 
     on_progress("download", 100, f"Downloaded: {video_path.name}")
+
+    # ── Collect YouTube metadata (best-effort) ──────────────────────────
+    try:
+        yt_id = extract_youtube_id(url)
+        if yt_id and is_connected():
+            svc, svc_err = get_youtube_service()
+            if svc:
+                from data_collector import collect_channel_metadata, collect_video_metadata
+                collect_channel_metadata(svc)
+                collect_video_metadata(svc, yt_id)
+    except Exception:
+        logger.debug("YouTube data collection failed (non-fatal)", exc_info=True)
 
     # ── Video duration + auto clips ─────────────────────────────────────
     vid_duration = _get_video_duration(video_path)
@@ -227,8 +239,21 @@ def process(
         elif ai_detector == "on":
             print("[ai-detector] Ollama detector requested but unavailable; using heuristic detector")
 
+    _predictor = None
+    try:
+        from predictor import ViralPredictor
+        _predictor = ViralPredictor()
+        _predictor.refresh_stats()
+        if _predictor.summary["total_clips"] >= 3:
+            print(f"[predictor] Loaded ({_predictor.summary['total_clips']} historical clips)")
+        else:
+            _predictor = None
+    except Exception:
+        _predictor = None
+
     moments = find_viral_moments(
-        video_path, num_clips=candidate_count, clip_duration=clip_duration, min_gap=MIN_GAP
+        video_path, num_clips=candidate_count, clip_duration=clip_duration, min_gap=MIN_GAP,
+        predictor=_predictor,
     )
     if not moments:
         print("[!] Nothing found – try a longer video or lower --clips")
@@ -544,13 +569,10 @@ def process(
 
     on_progress("clips", 100, f"{len(done)} clips created")
 
-    # ── 4. Generate AI Titles ───────────────────────────────────────────
-    all_titles = []
+    # Build path→idx mapping for both DB storage and title generation
+    _path_to_idx = {}
+    _prefix = f"{stem}_viral"
     if done:
-        on_progress("titles", 0, "Generating AI titles...")
-        # Only collect transcripts for moments that actually completed
-        _path_to_idx = {}
-        _prefix = f"{stem}_viral"
         for p in done:
             name = p.name
             if name.endswith(".mp4") and name.startswith(_prefix):
@@ -561,6 +583,78 @@ def process(
                         _path_to_idx[p] = idx
                 except ValueError:
                     pass
+
+    # ── 4a. Store pipeline results in DB + generate embeddings ──────────
+    _pipeline_run_id = None
+    if done and vid_duration > 0:
+        try:
+            _vid_id_for_db = extract_youtube_id(url)
+            from database import get_session
+            from database.repository import (
+                get_video_by_youtube_id, upsert_video,
+                create_pipeline_run, create_clip, create_clip_transcript,
+                complete_pipeline_run,
+            )
+            with get_session() as session:
+                video_db = None
+                if _vid_id_for_db:
+                    video_db = get_video_by_youtube_id(session, _vid_id_for_db)
+                if video_db is None:
+                    video_db = upsert_video(
+                        session,
+                        video_id=_vid_id_for_db or f"local_{stem}",
+                        channel_id=1,
+                        title=stem,
+                        duration_sec=int(vid_duration),
+                    )
+                config_snap = {
+                    "num_clips": num_clips, "clip_duration": clip_duration,
+                    "style": style, "crop": crop, "ai_detector": ai_detector,
+                }
+                run = create_pipeline_run(session, video_db.id, config_snap)
+                _pipeline_run_id = run.id
+
+                for p in done:
+                    if p in _path_to_idx:
+                        idx = _path_to_idx[p]
+                        m = moments[idx]
+                        clip = create_clip(
+                            session, run.id, idx,
+                            m.get("start", 0), m.get("end", 0),
+                            m.get("duration", clip_duration),
+                            heuristic_score=m.get("score"),
+                            ai_score=m.get("ai_score"),
+                            final_score=m.get("ai_score") or m.get("score"),
+                            vision_score=m.get("vision_score"),
+                            person_presence=m.get("visual_score"),
+                            subtitle_style=style,
+                            crop_params={"enabled": crop},
+                        )
+                        transcript = m.get("transcript", "")
+                        if transcript:
+                            create_clip_transcript(
+                                session, clip.id, 0, m.get("duration", clip_duration), transcript,
+                            )
+
+            # Generate embeddings for the run (best-effort, outside session)
+            if _pipeline_run_id:
+                try:
+                    from embedder import embed_pipeline_run
+                    n = embed_pipeline_run(_pipeline_run_id)
+                    if n:
+                        print(f"[embedder] Generated {n} embedding(s)")
+                except Exception:
+                    logger.debug("Embedding failed (non-fatal)", exc_info=True)
+
+                with get_session() as session:
+                    complete_pipeline_run(session, _pipeline_run_id, "completed")
+        except Exception:
+            logger.debug("DB pipeline storage failed (non-fatal)", exc_info=True)
+
+    # ── 4b. Generate AI Titles ──────────────────────────────────────────
+    all_titles = []
+    if done:
+        on_progress("titles", 0, "Generating AI titles...")
         transcripts = [moments[_path_to_idx[p]].get("transcript", "") for p in done if p in _path_to_idx]
         if any(transcripts):
             vision_contexts = [moments[_path_to_idx[p]].get("vision_meta") for p in done if p in _path_to_idx]
@@ -572,9 +666,35 @@ def process(
             print("[title-gen] No transcripts found; using default titles")
         on_progress("titles", 100, f"{len(all_titles)} titles generated")
 
+        # Enhance AI titles with recommendations from past successful clips
+        try:
+            from recommender import recommend_title_suggestions
+            for i, t in enumerate(transcripts):
+                if t.strip():
+                    suggestions = recommend_title_suggestions(t, limit=3)
+                    if suggestions:
+                        print(f"  [recommender] Title inspo for clip {i+1}:")
+                        for s in suggestions:
+                            print(f"    · \"{s['title']}\" ({s['views']} views, sim={s['similarity_score']:.2f})")
+        except Exception:
+            logger.debug("Title recommendation failed (non-fatal)", exc_info=True)
+
     print(f"\n══ Done! {len(done)} clips ══")
     for p in done:
         print(f"  → {p}")
+
+    # ── Content recommendation (post-pipeline) ──────────────────────────
+    try:
+        yt_id = extract_youtube_id(url)
+        if yt_id:
+            from recommender import recommend_content_for_channel
+            recs = recommend_content_for_channel(yt_id, limit=3)
+            if recs:
+                print("\n[next] Recommended videos to process:")
+                for r in recs:
+                    print(f"  → {r['title'][:60]} (score={r['expected_score']:.2f})")
+    except Exception:
+        logger.debug("Content recommendation failed (non-fatal)", exc_info=True)
 
     # ── 5. Upload / schedule ─────────────────────────────────────────────
     if upload and done:
@@ -591,12 +711,21 @@ def process(
                 idx = 0
             pct = int((i + 1) / len(sched) * 100)
             on_progress("upload", pct, f"Uploading clip {i + 1}/{len(sched)}...")
-            upload_to_youtube(
+            result = upload_to_youtube(
                 item["path"],
                 title=all_titles[idx - 1] if (all_titles and 0 <= idx - 1 < len(all_titles)) else f"{stem} – Viral Clip #{idx}",
                 description=f"Viral clip from {stem}\n\n#shorts #viral",
                 scheduled_time=item["scheduled_time"],
             )
+            # Update video stats after upload (best-effort)
+            if result and is_connected():
+                try:
+                    from data_collector import update_video_stats
+                    svc, _ = get_youtube_service()
+                    if svc:
+                        update_video_stats(svc, result["id"])
+                except Exception:
+                    logger.debug("Stats update failed (non-fatal)", exc_info=True)
         on_progress("upload", 100, "Upload complete")
 
     return done
