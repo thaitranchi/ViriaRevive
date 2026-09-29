@@ -29,7 +29,15 @@ def _enable_vector_extension() -> None:
     The DDL runs inside a savepoint: a rejected ``CREATE EXTENSION`` aborts the
     enclosing transaction, which would make every following statement in this
     migration fail with "current transaction is aborted".
+
+    Offline (``alembic upgrade --sql``) there is no server to ask, so we emit
+    the CREATE EXTENSION and assume it will succeed. Falling back there would
+    make the generated script declare float[] and immediately alter it away.
     """
+    if op.get_context().as_sql:
+        op.execute("CREATE EXTENSION IF NOT EXISTS vector")
+        return
+
     try:
         conn = op.get_bind()
         with conn.begin_nested():

@@ -144,6 +144,10 @@ def upgrade() -> None:
     conn = op.get_bind()
 
     if _is_offline():
+        # CREATE EXTENSION is already emitted by the initial-schema migration
+        # when the column is created as vector(1024) directly, but a script
+        # replayed against a pre-pgvector database needs it, and it is
+        # idempotent. The ALTER is a no-op once the column is already vector.
         op.execute(CREATE_EXTENSION)
         op.execute(ALTER_TO_VECTOR)
         op.execute(HNSW_INDEX_DDL)
