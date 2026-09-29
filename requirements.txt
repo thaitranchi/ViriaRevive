@@ -22,6 +22,10 @@ torchaudio>=2.0.0
 psycopg2-binary>=2.9.9
 sqlalchemy>=2.0.0
 alembic>=1.13.0
+# Server side needs the pgvector extension (PostgreSQL 13+); the client half of
+# the binding is this package. Without it the app stores embeddings as float[]
+# and ranks neighbours in Python.
+pgvector>=0.3.6
 
 # Embeddings (BAAI BGE-M3 via sentence-transformers)
 sentence-transformers>=3.0.0

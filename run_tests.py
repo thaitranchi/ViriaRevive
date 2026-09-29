@@ -469,6 +469,486 @@ class TestConfig(unittest.TestCase):
         self.assertTrue(config.TRANSLATE_MODEL)
 
 
+class TestVectorLayer(unittest.TestCase):
+    """Tests for the pgvector column typing, DDL, and Python similarity path."""
+
+    def setUp(self):
+        from sqlalchemy.schema import CreateTable
+        self.CreateTable = CreateTable
+        import database.vector as vector
+        self.vector = vector
+        self.vector.reset_backend_cache()
+
+    def tearDown(self):
+        self.vector.reset_backend_cache()
+
+    def test_default_column_type_is_vector(self):
+        import database.models as models
+
+        col_type = models.ClipEmbedding.__table__.c.embedding.type
+        self.assertEqual(str(col_type).upper(), f"VECTOR({self.vector.VECTOR_DIM})")
+
+    def test_array_fallback_renders_float_array(self):
+        # Without the extension the column must render as float[] so DDL
+        # matches a plain Postgres server.
+        from sqlalchemy.dialects import postgresql
+        import database.models as models
+
+        ddl = str(
+            self.CreateTable(models.ClipEmbedding.__table__).compile(
+                dialect=postgresql.dialect()
+            )
+        ).upper()
+        self.vector.force_array_type(True)
+        try:
+            fallback = str(
+                self.CreateTable(models.ClipEmbedding.__table__).compile(
+                    dialect=postgresql.dialect()
+                )
+            ).upper()
+            self.assertIn("FLOAT[]", fallback)
+            self.assertNotIn("VECTOR(", fallback)
+        finally:
+            self.vector.force_array_type(False)
+        self.assertIn("VECTOR(1024)", ddl)
+
+    def test_ddl_follows_force_array_flag(self):
+        # The whole point of the TypeDecorator: the flag can flip *after* the
+        # model class exists and the rendered DDL still follows it.
+        from sqlalchemy import create_engine
+        from sqlalchemy.dialects import postgresql
+        import database.models as models
+
+        dialect = postgresql.dialect()
+        table = models.ClipEmbedding.__table__
+
+        self.assertIn("VECTOR(1024)", str(self.CreateTable(table).compile(dialect=dialect)).upper())
+
+        self.vector.force_array_type(True)
+        try:
+            self.assertIn(
+                "FLOAT[]", str(self.CreateTable(table).compile(dialect=dialect)).upper()
+            )
+        finally:
+            self.vector.force_array_type(False)
+
+    def test_savepoint_keeps_transaction_usable_after_ddl_failure(self):
+        # A denied CREATE EXTENSION aborts the PostgreSQL transaction; without a
+        # savepoint every later statement in the caller's block would fail.
+        class Conn:
+            def __init__(self):
+                self.saved = False
+                self.rolled_back = False
+
+            def begin_nested(self):
+                conn = self
+
+                class _Ctx:
+                    def __enter__(_self):
+                        conn.saved = True
+
+                    def __exit__(_self, exc_type, *a):
+                        if exc_type is not None:
+                            conn.rolled_back = True
+                        return False
+
+                return _Ctx()
+
+            def execute(self, stmt, *a, **k):
+                raise RuntimeError("permission denied to create extension")
+
+        conn = Conn()
+        self.assertFalse(self.vector.ensure_vector_extension(conn))
+        self.assertTrue(conn.saved)
+        self.assertTrue(conn.rolled_back)
+
+    def test_savepoint_is_optional(self):
+        # Connections without savepoint support still run the statement.
+        class Minimal:
+            def __init__(self):
+                self.executed = []
+
+            def execute(self, stmt, *a, **k):
+                self.executed.append(stmt)
+                return _FakeResult([(1,)])
+
+        conn = Minimal()
+        self.assertTrue(self.vector.ensure_vector_extension(conn))
+        self.assertTrue(conn.executed)
+
+    def test_embedding_column_is_vector_false_without_table(self):
+        class NoTable:
+            def execute(self, stmt, *a, **k):
+                return _FakeResult([])
+
+        self.assertFalse(self.vector.embedding_column_is_vector(NoTable()))
+        self.assertFalse(self.vector.table_exists(NoTable()))
+
+    def test_alembic_revision_reads_version(self):
+        class Stamped:
+            def __init__(self, row):
+                self.row = row
+
+            def execute(self, stmt, *a, **k):
+                return _FakeResult(self.row)
+
+        self.assertEqual(self.vector.alembic_revision(Stamped([("b7e2f1a4c9d0",)])), "b7e2f1a4c9d0")
+        self.assertIsNone(self.vector.alembic_revision(Stamped([])))
+        self.assertIsNone(self.vector.alembic_revision(_DeadConn()))
+
+    def test_use_sql_cosine_tracks_flag(self):
+        self.assertTrue(self.vector.use_sql_cosine())
+        self.vector.force_array_type(True)
+        try:
+            self.assertFalse(self.vector.use_sql_cosine())
+        finally:
+            self.vector.force_array_type(False)
+
+    def test_index_is_not_declared_on_model(self):
+        # Declared at import time it would freeze the wrong column type; init_db
+        # and the Alembic migration create it instead.
+        import database.models as models
+
+        self.assertEqual(list(models.ClipEmbedding.__table__.indexes), [])
+
+    def test_hnsw_ddl_uses_cosine_ops(self):
+        ddl = self.vector.HNSW_INDEX_SQL
+        self.assertIn("USING hnsw", ddl)
+        self.assertIn("vector_cosine_ops", ddl)
+        self.assertIn("ef_construction", ddl)
+        self.assertIn("IF NOT EXISTS", ddl)
+
+    def test_ivfflat_ddl_present_as_fallback(self):
+        ddl = self.vector.IVFFLAT_INDEX_SQL
+        self.assertIn("USING ivfflat", ddl)
+        self.assertIn("vector_cosine_ops", ddl)
+
+    def test_ef_search_sql_is_parameterised(self):
+        sql = self.vector.hnsw_ef_search_sql(150)
+        self.assertIn("150", sql)
+        self.assertNotIn("%d", sql)
+
+    @unittest.skipIf(not _has_module("numpy"), "numpy not installed")
+    def test_cosine_similarity_identical_vectors(self):
+        v = [1.0, 2.0, 3.0]
+        self.assertAlmostEqual(self.vector.cosine_similarity(v, v), 1.0, places=6)
+
+    @unittest.skipIf(not _has_module("numpy"), "numpy not installed")
+    def test_cosine_similarity_orthogonal(self):
+        self.assertAlmostEqual(
+            self.vector.cosine_similarity([1.0, 0.0], [0.0, 1.0]), 0.0, places=6
+        )
+
+    @unittest.skipIf(not _has_module("numpy"), "numpy not installed")
+    def test_cosine_similarity_unnormalized(self):
+        # Scale must not matter — that is the point of cosine over L2.
+        a = [1.0, 2.0, 3.0]
+        b = [10.0, 20.0, 30.0]
+        self.assertAlmostEqual(self.vector.cosine_similarity(a, b), 1.0, places=6)
+
+    def test_cosine_similarity_zero_vector_is_zero(self):
+        self.assertEqual(self.vector.cosine_similarity([0.0, 0.0], [1.0, 1.0]), 0.0)
+
+    def test_cosine_similarity_mismatched_length_is_zero(self):
+        self.assertEqual(self.vector.cosine_similarity([1.0, 2.0], [1.0]), 0.0)
+
+    def test_cosine_similarity_none_inputs(self):
+        self.assertEqual(self.vector.cosine_similarity(None, [1.0]), 0.0)
+        self.assertEqual(self.vector.cosine_similarity([1.0], None), 0.0)
+
+    def test_create_ann_index_falls_back_to_ivfflat(self):
+        # hnsw needs pgvector >= 0.5. On an older server we must still get an
+        # index rather than silently running sequential scans.
+        class OldPgvectorConn:
+            def __init__(self):
+                self.executed = []
+
+            def execute(self, stmt, *a, **k):
+                sql = str(stmt)
+                self.executed.append(sql)
+                if "hnsw" in sql.lower():
+                    raise RuntimeError("hnsw not supported")
+                return _FakeResult([])
+
+        conn = OldPgvectorConn()
+        self.assertTrue(self.vector.create_ann_indexes(conn))
+        joined = " ".join(conn.executed)
+        self.assertIn("hnsw", joined)
+        self.assertIn("ivfflat", joined)
+
+    def test_create_ann_index_reports_failure_when_both_fail(self):
+        class DeadConn:
+            def execute(self, stmt, *a, **k):
+                raise RuntimeError("no indexes available")
+
+        self.assertFalse(self.vector.create_ann_indexes(DeadConn()))
+
+    def test_create_ann_index_uses_savepoint_per_attempt(self):
+        class Conn:
+            def __init__(self):
+                self.saved = 0
+                self.rolled_back = 0
+
+            def begin_nested(self):
+                conn = self
+
+                class _Ctx:
+                    def __enter__(_self):
+                        conn.saved += 1
+
+                    def __exit__(_self, exc_type, *a):
+                        if exc_type is not None:
+                            conn.rolled_back += 1
+                        return False
+
+                return _Ctx()
+
+            def execute(self, stmt, *a, **k):
+                if "hnsw" in str(stmt).lower():
+                    raise RuntimeError("hnsw not supported")
+                return _FakeResult([])
+
+        conn = Conn()
+        self.assertTrue(self.vector.create_ann_indexes(conn))
+        self.assertEqual(conn.saved, 2)
+        self.assertEqual(conn.rolled_back, 1)
+
+    def test_has_ann_index_detects_hnsw(self):
+        class HasHnsw:
+            def execute(self, stmt, *a, **k):
+                return _FakeResult([(1,)])
+
+        self.assertTrue(self.vector.has_ann_index(HasHnsw()))
+
+    def test_has_ann_index_false_when_absent(self):
+        class NoIndex:
+            def execute(self, stmt, *a, **k):
+                return _FakeResult([])
+
+        self.assertFalse(self.vector.has_ann_index(NoIndex()))
+
+    def test_ensure_extension_returns_false_when_blocked(self):
+        class BlockedConn:
+            def execute(self, stmt, *a, **k):
+                raise RuntimeError("permission denied")
+
+        self.assertFalse(self.vector.ensure_vector_extension(BlockedConn()))
+
+    def test_probe_returns_none_when_db_unreachable(self):
+        class DeadConn:
+            def execute(self, *a, **k):
+                raise OSError("connection refused")
+
+        self.assertIsNone(self.vector.probe_vector_support(DeadConn()))
+
+    def test_probe_detects_missing_extension(self):
+        class NoExtConn:
+            def execute(self, stmt, *a, **k):
+                return _FakeResult([])
+
+        self.assertFalse(self.vector.probe_vector_support(NoExtConn()))
+
+    def test_probe_detects_present_extension(self):
+        class HasExtConn:
+            def execute(self, stmt, *a, **k):
+                return _FakeResult([(1,)])
+
+        self.assertTrue(self.vector.probe_vector_support(HasExtConn()))
+
+    def test_vector_backend_defaults_false_without_db(self):
+        # No server on this machine → the flag must be False, not True or None.
+        self.assertFalse(self.vector.vector_backend())
+
+    def test_cosine_distance_sql_matches_column_type(self):
+        # SQL cosine distance is used exactly when the column is vector(N);
+        # otherwise the search falls back to the Python scan.
+        import database.repository as repo
+
+        query = [0.0] * self.vector.VECTOR_DIM
+        self.assertIsNotNone(repo._cosine_distance_sql(query))
+        self.vector.force_array_type(True)
+        try:
+            self.assertIsNone(repo._cosine_distance_sql(query))
+        finally:
+            self.vector.force_array_type(False)
+
+    def test_find_similar_clips_empty_query_returns_nothing(self):
+        # Guard against a zero-length query reaching Postgres or the scan.
+        from database.repository import find_similar_clips
+
+        self.assertEqual(find_similar_clips(None, [], limit=5), [])
+
+
+class _FakeResult:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def first(self):
+        return self._rows[0] if self._rows else None
+
+    def scalar(self):
+        return self._rows[0][0] if self._rows else None
+
+
+class _DeadConn:
+    """Connection double that raises on every statement."""
+
+    def execute(self, *a, **k):
+        raise OSError("connection refused")
+
+    def exec_driver_sql(self, *a, **k):
+        raise OSError("connection refused")
+
+
+class TestVectorSql(unittest.TestCase):
+    """Tests for the SQL the vector layer emits. No database required."""
+
+    def test_cosine_distance_expr_uses_cosine_operator(self):
+        from sqlalchemy.dialects import postgresql
+
+        import database.repository as repo
+        from database.models import ClipEmbedding
+
+        if not self._sql_cosine_available():
+            self.skipTest("pgvector package not installed")
+
+        expr = repo._cosine_distance_sql([0.0] * 1024)
+        self.assertIsNotNone(expr)
+        sql = str(expr.compile(dialect=postgresql.dialect()))
+        self.assertIn("<=>", sql)
+
+    def test_find_similar_clips_orders_by_distance(self):
+        from sqlalchemy import select
+        from sqlalchemy.dialects import postgresql
+
+        import database.repository as repo
+        from database.models import ClipEmbedding
+
+        if not self._sql_cosine_available():
+            self.skipTest("pgvector package not installed")
+
+        d = repo._cosine_distance_sql([0.0] * 1024)
+        stmt = select(ClipEmbedding).order_by(d).limit(3)
+        sql = str(stmt.compile(dialect=postgresql.dialect())).upper()
+        self.assertIn("ORDER BY CLIP_EMBEDDINGS.EMBEDDING <=>", sql)
+        self.assertIn("LIMIT", sql)
+
+    def test_with_stats_joins_uploads_in_one_query(self):
+        from sqlalchemy import select
+        from sqlalchemy.dialects import postgresql
+        from sqlalchemy.orm import joinedload
+
+        from database.models import Clip, ClipEmbedding
+
+        opts = [joinedload(ClipEmbedding.clip).joinedload(Clip.upload)]
+        sql = str(
+            select(ClipEmbedding).options(*opts).compile(dialect=postgresql.dialect())
+        ).lower()
+        self.assertIn("left outer join clip_uploads", sql)
+
+    def test_upsert_clip_upload_accepts_stats(self):
+        import inspect
+
+        from database.repository import upsert_clip_upload
+
+        params = inspect.signature(upsert_clip_upload).parameters
+        for name in ("view_count", "like_count", "comment_count"):
+            self.assertIn(name, params)
+
+    @staticmethod
+    def _sql_cosine_available():
+        from database.vector import use_sql_cosine
+        return use_sql_cosine()
+
+
+class TestRecommenderScoring(unittest.TestCase):
+    """Tests for the pure scoring helpers in recommender.py."""
+
+    def setUp(self):
+        import recommender
+        self.rec = recommender
+
+    def test_engagement_rate_positive(self):
+        row = {"views": 1000, "likes": 50, "comments": 20}
+        self.assertAlmostEqual(self.rec._engagement_rate(row), 0.07, places=6)
+
+    def test_engagement_rate_zero_views(self):
+        self.assertEqual(self.rec._engagement_rate({"views": 0, "likes": 5}), 0.0)
+
+    def test_engagement_rate_clamped(self):
+        # Impossible engagement (more likes than views) must clamp, not blow up.
+        row = {"views": 10, "likes": 999, "comments": 999}
+        self.assertEqual(self.rec._engagement_rate(row), 1.0)
+
+    def test_engagement_rate_missing_keys(self):
+        self.assertEqual(self.rec._engagement_rate({}), 0.0)
+
+    def test_score_candidates_sorts_by_similarity_then_engagement(self):
+        cands = [
+            {"clip_id": 1, "similarity": 0.5, "views": 100, "likes": 1, "comments": 0},
+            {"clip_id": 2, "similarity": 0.9, "views": 100, "likes": 1, "comments": 0},
+            {"clip_id": 3, "similarity": 0.9, "views": 100, "likes": 50, "comments": 10},
+        ]
+        ranked = self.rec._score_candidates(cands)
+        self.assertEqual([r["clip_id"] for r in ranked], [3, 2, 1])
+
+    def test_score_candidates_adds_engagement_field(self):
+        ranked = self.rec._score_candidates([
+            {"clip_id": 1, "similarity": 0.5, "views": 100, "likes": 10, "comments": 0},
+        ])
+        self.assertAlmostEqual(ranked[0]["engagement"], 0.1, places=6)
+
+    def test_score_candidates_empty(self):
+        self.assertEqual(self.rec._score_candidates([]), [])
+
+    def test_recommend_clip_params_defaults_without_history(self):
+        # No DB reachable → falls back to the documented defaults.
+        result = self.rec.recommend_clip_params("some transcript")
+        self.assertEqual(result["clip_duration"], 25)
+        self.assertEqual(result["subtitle_style"], "tiktok")
+        self.assertEqual(result["confidence"], 0.0)
+        self.assertEqual(result["source_clips"], 0)
+
+    def test_recommend_clip_params_blank_transcript(self):
+        result = self.rec.recommend_clip_params("   ")
+        self.assertEqual(result["source_clips"], 0)
+
+    def test_recommend_title_suggestions_empty_without_db(self):
+        self.assertEqual(self.rec.recommend_title_suggestions("hello"), [])
+
+    def test_recommend_content_unknown_channel(self):
+        self.assertEqual(self.rec.recommend_content_for_channel("UC_nonexistent"), [])
+
+    def test_predictor_no_db_returns_neutral(self):
+        # With no reachable database the predictor must not invent stats, and
+        # must hand back a neutral multiplier rather than a bogus boost.
+        from predictor import ViralPredictor
+
+        p = ViralPredictor()
+        p.refresh_stats()
+        self.assertEqual(p._averages, {})
+        self.assertEqual(p.predict_boost({"score": 0.9, "duration": 25}), 1.0)
+        self.assertEqual(p.adjust_moments([{"score": 0.8}])[0]["score"], 0.8)
+
+    def test_min_views_threshold_is_positive(self):
+        # Guards against a regression that would let brand-new uploads (0 views)
+        # dominate the recommendations.
+        self.assertGreater(self.rec.MIN_VIEWS_FOR_SIGNAL, 0)
+
+
+class TestEmbedderGuards(unittest.TestCase):
+    """Tests for embedder input guards (no model load)."""
+
+    def test_blank_text_returns_none(self):
+        import embedder
+        self.assertIsNone(embedder.generate_text_embedding(""))
+        self.assertIsNone(embedder.generate_text_embedding("   \n"))
+
+    def test_dimension_constant_is_positive(self):
+        from database.vector import VECTOR_DIM
+        self.assertEqual(VECTOR_DIM, 1024)
+
+
 class TestVisionAnalysis(unittest.TestCase):
     """Tests for the Qwen3-VL vision integration (offline / mocked)."""
 

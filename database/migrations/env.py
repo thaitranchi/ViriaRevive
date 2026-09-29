@@ -6,7 +6,9 @@ from alembic import context
 
 config = context.config
 
-if config.config_file_name is not None:
+# When database.init_db() drives the migration inside a running process, logging
+# is already configured; fileConfig() would discard the existing handlers.
+if config.config_file_name is not None and not config.attributes.get("viria_inprocess"):
     fileConfig(config.config_file_name)
 
 from database import Base

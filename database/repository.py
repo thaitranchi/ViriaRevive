@@ -1,10 +1,12 @@
-import math
 from datetime import datetime
 from typing import Optional
 
 from sqlalchemy import select, func
 from sqlalchemy.orm import Session, joinedload
 
+from config import EMBEDDING_MODEL as DEFAULT_EMBEDDING_MODEL
+
+from database import vector
 from database.models import (
     Channel,
     Video,
@@ -17,10 +19,6 @@ from database.models import (
     ClipEmbedding,
     UserPreference,
 )
-
-
-def _l2_distance(a: list[float], b: list[float]) -> float:
-    return math.sqrt(sum((x - y) ** 2 for x, y in zip(a, b)))
 
 
 # ── Channel CRUD ──────────────────────────────────────────────────────────
@@ -272,6 +270,9 @@ def upsert_clip_upload(
     privacy_status: Optional[str] = None,
     scheduled_at: Optional[datetime] = None,
     uploaded_at: Optional[datetime] = None,
+    view_count: Optional[int] = None,
+    like_count: Optional[int] = None,
+    comment_count: Optional[int] = None,
 ) -> ClipUpload:
     stmt = select(ClipUpload).where(ClipUpload.clip_id == clip_id)
     upload = session.execute(stmt).scalar_one_or_none()
@@ -292,6 +293,12 @@ def upsert_clip_upload(
         upload.scheduled_at = scheduled_at
     if uploaded_at is not None:
         upload.uploaded_at = uploaded_at
+    if view_count is not None:
+        upload.view_count = view_count
+    if like_count is not None:
+        upload.like_count = like_count
+    if comment_count is not None:
+        upload.comment_count = comment_count
     session.flush()
     return upload
 
@@ -318,26 +325,84 @@ def create_clip_embedding(
     session: Session,
     clip_id: int,
     embedding: list[float],
-    model_name: str = "BAAI/bge-m3",
+    model_name: Optional[str] = None,
 ) -> ClipEmbedding:
     emb = ClipEmbedding(
         clip_id=clip_id,
         embedding=embedding,
-        model_name=model_name,
+        model_name=model_name or DEFAULT_EMBEDDING_MODEL,
     )
     session.add(emb)
     session.flush()
     return emb
 
 
+def _cosine_distance_sql(query_vec: list[float]):
+    """``embedding <=> :query`` cosine distance, or None on the float[] path.
+
+    Ordering by this expression lets Postgres satisfy the query from the HNSW
+    index instead of scanning every embedding.
+    """
+    return vector.cosine_distance_expr(ClipEmbedding.embedding, query_vec)
+
+
 def find_similar_clips(
     session: Session,
     embedding: list[float],
     limit: int = 10,
-) -> list[ClipEmbedding]:
-    all_embeddings = list(session.execute(select(ClipEmbedding)).scalars().all())
-    all_embeddings.sort(key=lambda e: _l2_distance(e.embedding, embedding))
-    return all_embeddings[:limit]
+    with_stats: bool = False,
+    min_similarity: Optional[float] = None,
+) -> list[tuple[ClipEmbedding, float]]:
+    """Find clips whose transcript embedding is closest to ``embedding``.
+
+    Uses pgvector's cosine distance (HNSW-indexed) when available, otherwise
+    falls back to a Python scan. The fallback is exact but reads the whole
+    table, so it is only appropriate for the thousands-of-rows scale.
+
+    Args:
+        embedding: Query vector, already normalized by the embedder.
+        limit: Max rows to return.
+        with_stats: Eager-load the clip and its upload stats.
+        min_similarity: Drop hits below this cosine similarity (0..1).
+
+    Returns:
+        List of ``(ClipEmbedding, similarity)`` pairs, most similar first.
+    """
+    if not embedding:
+        return []
+
+    distance = _cosine_distance_sql(embedding)
+    opts = [joinedload(ClipEmbedding.clip).joinedload(Clip.upload)] if with_stats else []
+
+    if distance is None:
+        # float[] fallback: exact but a full scan. Filter and cap in SQL so we
+        # still avoid materialising every 1024-float array into Python.
+        # Over-fetch, then apply the threshold in Python: an approximate vector
+        # bound would need the raw norms, which are not stored.
+        rows = list(session.execute(select(ClipEmbedding).options(*opts)).scalars().all())
+        scored = [
+            (row, vector.cosine_similarity(row.embedding, embedding)) for row in rows
+        ]
+        if min_similarity is not None:
+            scored = [s for s in scored if s[1] >= min_similarity]
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return scored[:limit]
+
+    stmt = select(ClipEmbedding, distance.label("distance")).options(*opts)
+    if min_similarity is not None:
+        # similarity = 1 - distance
+        stmt = stmt.where(distance <= 1.0 - min_similarity)
+    stmt = stmt.order_by(distance).limit(limit)
+
+    return [
+        (row, 1.0 - float(dist))
+        for row, dist in session.execute(stmt).all()
+    ]
+
+
+def count_embeddings(session: Session) -> int:
+    """Number of embedded clips. Drives the GUI's vector-store status card."""
+    return session.execute(select(func.count(ClipEmbedding.id))).scalar() or 0
 
 
 # ── User Preference ───────────────────────────────────────────────────────

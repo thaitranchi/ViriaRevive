@@ -8,7 +8,15 @@ logger = logging.getLogger(__name__)
 
 
 def _ensure_db():
-    from database import get_session
+    """Session context manager that creates the schema on first use.
+
+    Raises when the database is unreachable so callers' existing error handling
+    takes over — the collector is always best-effort.
+    """
+    from database import ensure_schema, get_session
+
+    if not ensure_schema():
+        raise RuntimeError("database unreachable")
     return get_session()
 
 

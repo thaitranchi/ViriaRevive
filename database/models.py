@@ -17,6 +17,8 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from database import Base
+from database.vector import embedding_column_type
+from config import EMBEDDING_MODEL as DEFAULT_EMBEDDING_MODEL
 
 
 class Channel(Base):
@@ -199,13 +201,19 @@ class ClipEmbedding(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     clip_id: Mapped[int] = mapped_column(ForeignKey("clips.id"), unique=True, nullable=False)
-    embedding: Mapped[list[float]] = mapped_column(ARRAY(Float))
-    model_name: Mapped[str] = mapped_column(String(64), default="BAAI/bge-m3")
+    # vector(1024) when pgvector is installed, float[] otherwise.
+    embedding: Mapped[list[float]] = mapped_column(embedding_column_type())
+    model_name: Mapped[str] = mapped_column(String(64), default=DEFAULT_EMBEDDING_MODEL)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
 
     clip: Mapped["Clip"] = relationship(back_populates="embedding")
+
+    # The HNSW index is created by database.init_db() (fresh installs) and by
+    # Alembic migration b7e2f1a4c9d0 (existing ones). Declaring it here would
+    # bake in the column type at import time, before we know whether the server
+    # has pgvector — and Postgres rejects hnsw indexes on float[].
 
 
 class UserPreference(Base):

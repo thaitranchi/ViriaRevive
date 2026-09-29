@@ -21,9 +21,12 @@ class ViralPredictor:
     def refresh_stats(self) -> None:
         """Query DB for historical averages and cache them."""
         try:
-            from database import get_session
+            from database import ensure_schema, get_session
             from database.models import Clip, ClipUpload
             from sqlalchemy import select, func
+
+            if not ensure_schema():
+                return
 
             with get_session() as session:
                 # Average final score across all clips
@@ -69,6 +72,7 @@ class ViralPredictor:
             )
         except Exception as e:
             logger.debug("Failed to refresh predictor stats: %s", e)
+            self._averages = {}
 
     def predict_boost(self, clip_features: Optional[dict] = None) -> float:
         """Return a score multiplier based on historical patterns.
@@ -83,7 +87,9 @@ class ViralPredictor:
         if not self._averages:
             self.refresh_stats()
 
-        if self._averages["total_clips"] < 3:
+        # Too little history to say anything — including none at all when the
+        # database is unreachable, which leaves _averages empty.
+        if self._averages.get("total_clips", 0) < 3:
             return 1.0
 
         boost = 1.0
@@ -119,7 +125,10 @@ class ViralPredictor:
         moments: list[dict],
     ) -> list[dict]:
         """Apply predictor boost to each moment's score in-place."""
-        if self._averages["total_clips"] < 3:
+        if not self._averages:
+            self.refresh_stats()
+
+        if self._averages.get("total_clips", 0) < 3:
             return moments
 
         for m in moments:

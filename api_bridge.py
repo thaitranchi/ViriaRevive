@@ -2246,7 +2246,10 @@ class ApiBridge:
             return {"success": False, "error": str(e)}
 
     def find_similar_clips(self, text: str, limit: int = 10) -> list[dict]:
-        """Embed a query text and find similar clips via L2 distance."""
+        """Embed a query text and find similar clips by cosine distance.
+
+        Ranked by the pgvector HNSW index when available.
+        """
         try:
             from embedder import generate_text_embedding
             from database import get_session
@@ -2261,13 +2264,63 @@ class ApiBridge:
                     {
                         "clip_id": r.clip_id,
                         "model_name": r.model_name,
+                        "similarity": round(sim, 4),
                         "created_at": str(r.created_at),
                     }
-                    for r in results
+                    for r, sim in results
                 ]
         except Exception as e:
             logger.error("find_similar_clips failed: %s", e)
             return []
+
+    def get_vector_store_status(self) -> dict:
+        """Report the vector backend so the GUI can show index health."""
+        from database.vector import VECTOR_DIM
+
+        status = {
+            "pgvector": False,
+            "ann_index": False,
+            "index_kind": None,
+            "embedding_count": 0,
+            "vector_dim": VECTOR_DIM,
+            "model_name": config.EMBEDDING_MODEL,
+            "database_reachable": False,
+        }
+        try:
+            from sqlalchemy import text
+
+            from database import get_engine, vector
+
+            with get_engine().connect() as conn:
+                status["database_reachable"] = True
+                probe = vector.probe_vector_support(conn)
+                status["pgvector"] = bool(probe)
+                status["ann_index"] = vector.has_ann_index(conn)
+                if status["ann_index"]:
+                    row = conn.execute(
+                        text(
+                            "SELECT indexdef FROM pg_indexes "
+                            "WHERE tablename = 'clip_embeddings' "
+                            "AND (indexdef ILIKE '%hnsw%' OR indexdef ILIKE '%ivfflat%') "
+                            "LIMIT 1"
+                        )
+                    ).first()
+                    if row:
+                        ddl = row[0].upper()
+                        status["index_kind"] = "hnsw" if "HNSW" in ddl else "ivfflat"
+        except Exception as e:
+            logger.debug("Vector status probe failed: %s", e)
+
+        try:
+            from database import get_session
+            from database.repository import count_embeddings
+
+            with get_session() as session:
+                status["embedding_count"] = count_embeddings(session)
+        except Exception as e:
+            logger.debug("Embedding count failed: %s", e)
+
+        return status
 
     def get_predictor_summary(self) -> dict:
         """Return historical stats from the viral predictor."""

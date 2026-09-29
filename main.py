@@ -589,12 +589,14 @@ def process(
     if done and vid_duration > 0:
         try:
             _vid_id_for_db = extract_youtube_id(url)
-            from database import get_session
+            from database import get_session, ensure_schema
             from database.repository import (
                 get_video_by_youtube_id, upsert_video,
                 create_pipeline_run, create_clip, create_clip_transcript,
                 complete_pipeline_run,
             )
+            if not ensure_schema():
+                raise RuntimeError("database unreachable")
             with get_session() as session:
                 video_db = None
                 if _vid_id_for_db:

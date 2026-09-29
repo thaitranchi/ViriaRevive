@@ -15,8 +15,35 @@ down_revision: Union[str, Sequence[str], None] = None
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
+from config import EMBEDDING_MODEL as DEFAULT_EMBEDDING_MODEL
+from database.vector import embedding_column_type, force_array_type
+
+
+def _enable_vector_extension() -> None:
+    """Make sure the ``vector`` type exists before declaring the column.
+
+    Runs first so a fresh install gets vector(1024) directly. If the server
+    refuses (no superuser on a managed instance) the column falls back to
+    float[] for this migration too, and b7e2f1a4c9d0 will retry later.
+
+    The DDL runs inside a savepoint: a rejected ``CREATE EXTENSION`` aborts the
+    enclosing transaction, which would make every following statement in this
+    migration fail with "current transaction is aborted".
+    """
+    try:
+        conn = op.get_bind()
+        with conn.begin_nested():
+            conn.execute(
+                sa.text("CREATE EXTENSION IF NOT EXISTS vector"),
+            )
+    except Exception as exc:
+        print(f"[migration] vector extension unavailable ({exc}); using float[]")
+        force_array_type(True)
+
 
 def upgrade() -> None:
+    _enable_vector_extension()
+
     op.create_table(
         "channels",
         sa.Column("id", sa.Integer(), primary_key=True),
@@ -177,8 +204,10 @@ def upgrade() -> None:
         "clip_embeddings",
         sa.Column("id", sa.Integer(), primary_key=True),
         sa.Column("clip_id", sa.Integer(), unique=True, nullable=False),
-        sa.Column("embedding", sa.ARRAY(sa.Float()), nullable=False),
-        sa.Column("model_name", sa.String(64), nullable=False, server_default="BAAI/bge-m3"),
+        # Fresh installs use pgvector's vector(1024); the b7e2f1a4c9d0 migration
+        # converts pre-existing float[] columns.
+        sa.Column("embedding", embedding_column_type(), nullable=False),
+        sa.Column("model_name", sa.String(64), nullable=False, server_default=DEFAULT_EMBEDDING_MODEL),
         sa.Column(
             "created_at",
             sa.DateTime(timezone=True),
