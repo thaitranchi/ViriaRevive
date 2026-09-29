@@ -18,7 +18,10 @@ music/
 tokens/
 build/
 dist/
+# *.spec is ignored to keep ad-hoc build specs out, but viria.spec is the
+# checked-in PyInstaller recipe build.bat depends on.
 *.spec
+!viria.spec
 *.pt
 *.wav
 *.jpg
